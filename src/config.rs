@@ -8,6 +8,143 @@ use anyhow::{bail, Result};
 use clap::Parser;
 
 // ---------------------------------------------------------------------------
+// SpacetimeDB CLI config auto-detection
+// ---------------------------------------------------------------------------
+
+/// Values pulled from `~/.config/spacetime/cli.toml`.
+#[derive(Debug, Default)]
+struct SpacetimeCliConfig {
+    token: Option<String>,
+    host: Option<String>,
+    port: Option<u16>,
+    uses_tls: bool,
+}
+
+/// Try to read and parse `~/.config/spacetime/cli.toml`.
+///
+/// Returns `None` when the file does not exist or cannot be parsed.
+fn read_spacetime_cli_config() -> Option<SpacetimeCliConfig> {
+    let home = std::env::var("HOME").ok()?;
+    let path = std::path::Path::new(&home).join(".config/spacetime/cli.toml");
+    let content = std::fs::read_to_string(&path).ok()?;
+    parse_spacetime_cli_toml(&content)
+}
+
+/// Parse the simplified TOML format used by the SpacetimeDB CLI.
+///
+/// The file looks like:
+/// ```toml
+/// default_server = "local"
+/// spacetimedb_token = "eyJ..."
+///
+/// [[server_configs]]
+/// nickname = "local"
+/// host = "127.0.0.1:3000"
+/// protocol = "http"
+/// ```
+fn parse_spacetime_cli_toml(content: &str) -> Option<SpacetimeCliConfig> {
+    let mut default_server: Option<String> = None;
+    let mut token: Option<String> = None;
+
+    // Collected server configs: (nickname, host, protocol)
+    let mut servers: Vec<(String, String, String)> = Vec::new();
+
+    let mut in_server = false;
+    let mut cur_nick = String::new();
+    let mut cur_host = String::new();
+    let mut cur_proto = String::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if line == "[[server_configs]]" {
+            if in_server {
+                servers.push((cur_nick.clone(), cur_host.clone(), cur_proto.clone()));
+            }
+            in_server = true;
+            cur_nick.clear();
+            cur_host.clear();
+            cur_proto.clear();
+            continue;
+        }
+
+        if let Some((key, val)) = parse_toml_string_kv(line) {
+            if in_server {
+                match key {
+                    "nickname" => cur_nick = val,
+                    "host"     => cur_host = val,
+                    "protocol" => cur_proto = val,
+                    _ => {}
+                }
+            } else {
+                match key {
+                    "default_server"    => default_server = Some(val),
+                    "spacetimedb_token" => token = Some(val),
+                    _ => {}
+                }
+            }
+        }
+    }
+    // Flush the last server section.
+    if in_server && !cur_nick.is_empty() {
+        servers.push((cur_nick, cur_host, cur_proto));
+    }
+
+    // Locate the server matching `default_server`.
+    let want = default_server.as_deref().unwrap_or("local");
+    let server = servers.iter().find(|(nick, _, _)| nick == want);
+
+    let (host, port, uses_tls) = if let Some((_, host_str, protocol)) = server {
+        let (h, p) = split_host_port(host_str, 3000);
+        (Some(h), Some(p), protocol == "https")
+    } else {
+        (None, None, false)
+    };
+
+    Some(SpacetimeCliConfig { token, host, port, uses_tls })
+}
+
+/// Parse `key = "value"` (or `key = value`) from a single TOML line.
+fn parse_toml_string_kv(line: &str) -> Option<(&str, String)> {
+    let eq = line.find('=')?;
+    let key = line[..eq].trim();
+    let raw = line[eq + 1..].trim();
+    let val = if raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2 {
+        raw[1..raw.len() - 1].to_string()
+    } else {
+        raw.to_string()
+    };
+    Some((key, val))
+}
+
+/// Split `"host:port"` into `(host, port)`, with `default_port` as fallback.
+fn split_host_port(addr: &str, default_port: u16) -> (String, u16) {
+    // Handle bracketed IPv6 like `[::1]:3000`.
+    if addr.starts_with('[') {
+        if let Some(close) = addr.find(']') {
+            let host = &addr[..=close];
+            let rest = &addr[close + 1..];
+            if let Some(p_str) = rest.strip_prefix(':') {
+                if let Ok(p) = p_str.parse::<u16>() {
+                    return (host.to_string(), p);
+                }
+            }
+            return (host.to_string(), default_port);
+        }
+    }
+    // Regular host:port — use the last `:` so IPv6 literals without brackets work too.
+    if let Some(pos) = addr.rfind(':') {
+        if let Ok(p) = addr[pos + 1..].parse::<u16>() {
+            return (addr[..pos].to_string(), p);
+        }
+    }
+    (addr.to_string(), default_port)
+}
+
+// ---------------------------------------------------------------------------
 // CLI argument definition
 // ---------------------------------------------------------------------------
 
@@ -224,6 +361,10 @@ pub struct Config {
 impl Config {
     /// Build a [`Config`] from parsed CLI arguments.
     ///
+    /// When `--host`/`--port` are at their defaults and/or `--token` is not
+    /// supplied, values are sourced from `~/.config/spacetime/cli.toml` (the
+    /// SpacetimeDB CLI config) if that file exists.
+    ///
     /// # Errors
     /// Returns an error if the port is 0 or the host is empty.
     pub fn from_cli(cli: Cli) -> Result<Self> {
@@ -234,17 +375,40 @@ impl Config {
             bail!("--port must be a non-zero port number");
         }
 
-        let scheme = if cli.tls { "https" } else { "http" };
-        let ws_scheme = if cli.tls { "wss" } else { "ws" };
+        // Detect whether the user left host/port at their defaults so we can
+        // transparently apply values from the SpacetimeDB CLI config file.
+        let using_default_server = cli.host == "localhost" && cli.port == 3000 && !cli.tls;
+        let cli_cfg = read_spacetime_cli_config();
 
-        let server_url = format!("{}://{}:{}", scheme, cli.host, cli.port);
-        let ws_url = format!("{}://{}:{}", ws_scheme, cli.host, cli.port);
+        // Host / port / TLS: CLI arg takes priority; fall back to CLI config.
+        let (host, port, tls) = if using_default_server {
+            if let Some(ref cc) = cli_cfg {
+                (
+                    cc.host.as_deref().unwrap_or("localhost").to_string(),
+                    cc.port.unwrap_or(3000),
+                    cc.uses_tls,
+                )
+            } else {
+                (cli.host.clone(), cli.port, cli.tls)
+            }
+        } else {
+            (cli.host.clone(), cli.port, cli.tls)
+        };
+
+        // Auth token: explicit `--token` wins, then CLI config, then None.
+        let auth_token = cli.token.or_else(|| cli_cfg.and_then(|cc| cc.token));
+
+        let scheme = if tls { "https" } else { "http" };
+        let ws_scheme = if tls { "wss" } else { "ws" };
+
+        let server_url = format!("{}://{}:{}", scheme, host, port);
+        let ws_url = format!("{}://{}:{}", ws_scheme, host, port);
 
         Ok(Self {
             server_url,
             ws_url,
             database: cli.database,
-            auth_token: cli.token,
+            auth_token,
             theme: ThemeColors::for_theme(cli.theme),
             theme_name: cli.theme,
             log_level: cli.log_level,
@@ -285,9 +449,12 @@ mod tests {
 
     #[test]
     fn test_config_http() {
-        let cfg = Config::from_cli(make_cli("localhost", 3000, None, false)).unwrap();
-        assert_eq!(cfg.server_url, "http://localhost:3000");
-        assert_eq!(cfg.ws_url, "ws://localhost:3000");
+        // Use an explicit non-default host so that CLI config auto-detection
+        // (which only fires when the host is at its default "localhost") does
+        // not interfere with the expected URL in this test.
+        let cfg = Config::from_cli(make_cli("test.local", 3000, None, false)).unwrap();
+        assert_eq!(cfg.server_url, "http://test.local:3000");
+        assert_eq!(cfg.ws_url, "ws://test.local:3000");
         assert!(!cfg.uses_tls());
     }
 

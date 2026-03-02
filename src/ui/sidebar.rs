@@ -155,6 +155,21 @@ fn render_tree(area: Rect, buf: &mut Buffer, app: &AppState, focused: bool) {
     }
 }
 
+// ── Database name display helper ──────────────────────────────────────────────
+
+/// Return a display-friendly version of a database identifier.
+///
+/// SpacetimeDB 2.0 returns 256-bit hex identity strings (64 chars) as database
+/// references.  We truncate these for display; human-readable names pass through
+/// unchanged.
+fn display_db_name(db: &str) -> String {
+    if db.len() >= 32 && db.chars().all(|c| c.is_ascii_hexdigit()) {
+        format!("{}…", &db[..12])
+    } else {
+        db.to_string()
+    }
+}
+
 // ── Tree item model ───────────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -188,7 +203,8 @@ fn build_items(app: &AppState) -> Vec<TreeItem> {
 
         let is_selected_db = app.selected_database_idx == Some(di);
         let arrow = if is_selected_db { "▼" } else { "▶" };
-        let label = format!("  {arrow} {db}");
+        let display = display_db_name(db);
+        let label = format!("  {arrow} {display}");
 
         items.push(TreeItem {
             label,

@@ -212,13 +212,31 @@ impl SpacetimeClient {
 
     /// List all databases visible to the authenticated identity.
     ///
-    /// SpacetimeDB endpoint: `GET /v1/databases`
-    /// Falls back to querying `st_module` via SQL if the HTTP endpoint is
-    /// unavailable (older server versions).
+    /// SpacetimeDB 2.0 endpoint: `GET /v1/identity/{hex_identity}/databases`
+    ///
+    /// The identity is extracted directly from the JWT bearer token without
+    /// making an additional network request.  The response contains database
+    /// *identities* (hex strings), which are valid database references for all
+    /// other API endpoints.
     #[instrument(skip(self))]
     pub async fn list_databases(&self) -> Result<Vec<String>> {
-        let url = format!("{}/v1/databases", self.base_url);
-        debug!("Listing databases");
+        // Extract the caller's identity from the JWT payload.
+        let identity = self
+            .auth_token
+            .as_deref()
+            .and_then(extract_identity_from_jwt)
+            .ok_or_else(|| {
+                anyhow!(
+                    "No auth token configured or cannot parse identity from JWT.\n\
+                     Run `spacetime server login` or pass --token."
+                )
+            })?;
+
+        let url = format!("{}/v1/identity/{}/databases", self.base_url, identity);
+        debug!(
+            "Listing databases for identity {}…",
+            &identity[..identity.len().min(12)]
+        );
 
         let resp = self
             .get(&url)
@@ -226,66 +244,29 @@ impl SpacetimeClient {
             .await
             .context("List databases request failed")?;
 
-        match resp.status() {
-            StatusCode::OK => {
-                let raw: Value =
-                    resp.json().await.context("Failed to decode databases response")?;
-                extract_database_names(raw)
-            }
-            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED => {
-                // Older SpacetimeDB — fall back to the identity endpoint.
-                warn!("GET /v1/databases not available, trying identity endpoint");
-                self.list_databases_fallback().await
-            }
-            status => {
-                let body = resp.text().await.unwrap_or_default();
-                bail!("List databases HTTP {status}: {body}");
-            }
-        }
-    }
-
-    /// Fallback: fetch databases from `GET /v1/identity/<id>/databases`.
-    ///
-    /// We first obtain the caller's identity via `GET /v1/identity/public-key`
-    /// (or any available identity endpoint), then list their databases.
-    async fn list_databases_fallback(&self) -> Result<Vec<String>> {
-        // Try the /v1/identity endpoint to discover the caller identity.
-        let id_url = format!("{}/v1/identity", self.base_url);
-        let resp = self
-            .get(&id_url)
-            .send()
-            .await
-            .context("Identity request failed")?;
-
-        if !resp.status().is_success() {
-            // Give up and return an empty list rather than crashing.
-            warn!("Could not determine identity; returning empty database list");
-            return Ok(Vec::new());
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("List databases HTTP {status}: {body}");
         }
 
-        let raw: Value = resp.json().await.context("Failed to decode identity response")?;
-        let identity = raw
-            .get("identity")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("Identity response missing 'identity' field"))?;
-
-        let db_url = format!("{}/v1/identity/{}/databases", self.base_url, identity);
-        let db_resp = self
-            .get(&db_url)
-            .send()
-            .await
-            .context("Identity databases request failed")?;
-
-        if !db_resp.status().is_success() {
-            warn!("Could not list databases for identity {}", identity);
-            return Ok(Vec::new());
-        }
-
-        let raw: Value = db_resp
+        let raw: Value = resp
             .json()
             .await
-            .context("Failed to decode identity databases response")?;
-        extract_database_names(raw)
+            .context("Failed to decode databases response")?;
+
+        // Response: {"identities": ["hex1", "hex2", ...]}
+        let identities = raw
+            .get("identities")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(identities)
     }
 
     /// Ping the server and return `true` if it responds.
@@ -310,6 +291,72 @@ impl SpacetimeClient {
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
+}
+
+// ---------------------------------------------------------------------------
+// JWT helpers
+// ---------------------------------------------------------------------------
+
+/// Extract the `hex_identity` field from a JWT bearer token.
+///
+/// Splits the token on `.`, base64url-decodes the payload (middle part), and
+/// parses the resulting JSON without requiring any external JWT crate.
+pub fn extract_identity_from_jwt(token: &str) -> Option<String> {
+    let mut parts = token.splitn(3, '.');
+    let _header = parts.next()?;
+    let payload_b64 = parts.next()?;
+    let payload_bytes = base64url_decode(payload_b64)?;
+    let json: Value = serde_json::from_slice(&payload_bytes).ok()?;
+    json.get("hex_identity")?.as_str().map(String::from)
+}
+
+/// Decode a base64url-encoded string (no padding required) into raw bytes.
+fn base64url_decode(input: &str) -> Option<Vec<u8>> {
+    // Translate base64url alphabet → standard base64.
+    let mut s = input.replace('-', "+").replace('_', "/");
+    // Restore padding.
+    match s.len() % 4 {
+        2 => s.push_str("=="),
+        3 => s.push('='),
+        _ => {}
+    }
+    base64_decode(s.as_bytes())
+}
+
+/// Minimal, allocation-efficient standard base64 decoder.
+fn base64_decode(input: &[u8]) -> Option<Vec<u8>> {
+    let decode_byte = |c: u8| -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            b'=' => Some(0), // padding — value is discarded
+            _ => None,
+        }
+    };
+
+    let mut result = Vec::with_capacity(input.len() * 3 / 4);
+    let mut i = 0;
+
+    while i + 4 <= input.len() {
+        let a = decode_byte(input[i])?;
+        let b = decode_byte(input[i + 1])?;
+        let c = decode_byte(input[i + 2])?;
+        let d = decode_byte(input[i + 3])?;
+
+        result.push((a << 2) | (b >> 4));
+        if input[i + 2] != b'=' {
+            result.push((b << 4) | (c >> 2));
+        }
+        if input[i + 3] != b'=' {
+            result.push((c << 6) | d);
+        }
+        i += 4;
+    }
+
+    Some(result)
 }
 
 // ---------------------------------------------------------------------------

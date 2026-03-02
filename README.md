@@ -196,7 +196,7 @@ Please [open an issue](https://github.com/RazieLDG/spacetimedb-tui/issues/new) a
 
 ## 📄 License
 
-MIT License — Copyright © 2025 **Beyond Horizons Industries**
+MIT License — Copyright © 2026 **Beyond Horizons Industries**
 
 See [LICENSE](./LICENSE) for the full text.
 

@@ -191,7 +191,7 @@ See [LICENSE](./LICENSE) for the full text.
 
 <div align="center">
 
-Built by [Alice AI](https://github.com/RazieLDG) · Beyond Horizons Industries
+Built by [Alice AI](https://aliceos.ai) · Beyond Horizons Industries
 
 *Exploring the SpacetimeDB universe, one terminal at a time.* 🛸
 

@@ -256,17 +256,47 @@ impl SpacetimeClient {
             .context("Failed to decode databases response")?;
 
         // Response: {"identities": ["hex1", "hex2", ...]}
-        let identities = raw
+        let identities: Vec<String> = raw
             .get("identities")
             .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(str::to_owned))
-                    .collect()
-            })
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
             .unwrap_or_default();
 
-        Ok(identities)
+        // Resolve each identity to its friendly name(s) via
+        // GET /v1/database/:identity/names → {"names": ["db-name"]}
+        // Fall back to the raw identity string if the endpoint fails.
+        let mut names: Vec<String> = Vec::new();
+        for id in &identities {
+            match self.get_database_names(id).await {
+                Ok(db_names) if !db_names.is_empty() => names.extend(db_names),
+                _ => names.push(id.clone()),
+            }
+        }
+
+        Ok(names)
+    }
+
+    /// Resolve a database identity to its registered name(s).
+    ///
+    /// SpacetimeDB 2.0 endpoint: `GET /v1/database/{identity}/names`
+    async fn get_database_names(&self, identity: &str) -> Result<Vec<String>> {
+        let url = format!("{}/v1/database/{}/names", self.base_url, identity);
+        let resp = self
+            .get(&url)
+            .send()
+            .await
+            .context("get_database_names request failed")?;
+        if !resp.status().is_success() {
+            bail!("HTTP {}", resp.status());
+        }
+        let raw: Value = resp.json().await.context("Failed to decode names response")?;
+        // Response: {"names": ["db-name"]}
+        let names = raw
+            .get("names")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+            .unwrap_or_default();
+        Ok(names)
     }
 
     /// Ping the server and return `true` if it responds.
@@ -365,10 +395,9 @@ fn base64_decode(input: &[u8]) -> Option<Vec<u8>> {
 
 /// Parse the raw SQL response value into a [`QueryResult`].
 ///
-/// SpacetimeDB wraps the result set in an array:
-/// ```json
-/// [{"schema": [...], "rows": [...], "total_duration_micros": 42}]
-/// ```
+/// Handles two schema formats returned by different SpacetimeDB versions:
+/// - v1 (legacy): `"schema": [{"name": "col", "algebraic_type": ...}]`
+/// - v9 (current): `"schema": {"elements": [{"name": {"some": "col"}, "algebraic_type": ...}]}`
 fn parse_query_result(raw: Value) -> Result<QueryResult> {
     // The server may return either an array of result sets or a single object.
     let obj = match raw {
@@ -385,20 +414,30 @@ fn parse_query_result(raw: Value) -> Result<QueryResult> {
         other => bail!("Unexpected SQL response shape: {other}"),
     };
 
-    // Schema is an array of {name, algebraic_type} objects.
-    let schema = obj
-        .get("schema")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow!("SQL response missing 'schema' array"))?;
+    // schema can be an array (v1) or {"elements": [...]} object (v9).
+    let schema_val = obj.get("schema").ok_or_else(|| anyhow!("SQL response missing 'schema'"))?;
+    let elements: &[Value] = if let Some(arr) = schema_val.as_array() {
+        arr
+    } else if let Some(arr) = schema_val.get("elements").and_then(|e| e.as_array()) {
+        arr
+    } else {
+        bail!("SQL response 'schema' has unexpected format: {schema_val}");
+    };
 
-    let schema_elements: Vec<SchemaElement> = schema
+    let schema_elements: Vec<SchemaElement> = elements
         .iter()
         .map(|col| {
+            // name can be a plain string (v1) or {"some": "col_name"} (v9).
             let name = col
                 .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+                .and_then(|n| {
+                    if let Some(some_val) = n.get("some") {
+                        some_val.as_str().map(str::to_string)
+                    } else {
+                        n.as_str().map(str::to_string)
+                    }
+                })
+                .unwrap_or_default();
             let algebraic_type = col.get("algebraic_type").cloned().unwrap_or(Value::Null);
             SchemaElement { name, algebraic_type }
         })
@@ -407,13 +446,7 @@ fn parse_query_result(raw: Value) -> Result<QueryResult> {
     let rows: Vec<Vec<Value>> = obj
         .get("rows")
         .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .map(|row| {
-                    row.as_array().cloned().unwrap_or_default()
-                })
-                .collect()
-        })
+        .map(|arr| arr.iter().map(|row| row.as_array().cloned().unwrap_or_default()).collect())
         .unwrap_or_default();
 
     let total_duration_micros = obj
@@ -421,16 +454,194 @@ fn parse_query_result(raw: Value) -> Result<QueryResult> {
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
-    Ok(QueryResult {
-        schema: schema_elements,
-        rows,
-        total_duration_micros,
-    })
+    Ok(QueryResult { schema: schema_elements, rows, total_duration_micros })
 }
 
-/// Parse the raw schema response into a [`SchemaResponse`].
+/// Parse the raw v9 schema response into a [`SchemaResponse`].
+///
+/// The v9 format stores column definitions in a shared `typespace` rather
+/// than inline in each table, so we resolve `product_type_ref` references
+/// manually after parsing the table list.
 fn parse_schema_response(raw: Value) -> Result<SchemaResponse> {
-    serde_json::from_value(raw).context("Failed to deserialise schema response")
+    // ── Typespace ──────────────────────────────────────────────────────────
+    let typespace = raw.get("typespace").cloned().unwrap_or(Value::Null);
+    let typespace_types: Vec<Value> = typespace
+        .get("types")
+        .and_then(|t| t.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // ── Tables ─────────────────────────────────────────────────────────────
+    let tables_raw = raw
+        .get("tables")
+        .and_then(|t| t.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut tables: Vec<crate::api::types::TableInfo> = Vec::new();
+    for t in &tables_raw {
+        let table_name = t.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if table_name.is_empty() {
+            continue;
+        }
+
+        let product_type_ref = t
+            .get("product_type_ref")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+
+        // table_type: {"User": []} → "user", {"System": []} → "system"
+        let table_type = extract_enum_tag(t.get("table_type"), "user");
+        // table_access: {"Public": []} → "public", {"Private": []} → "private"
+        let table_access = extract_enum_tag(t.get("table_access"), "public");
+
+        // Resolve columns from typespace via product_type_ref.
+        let columns = resolve_columns(&typespace_types, product_type_ref as usize);
+
+        let indexes = t
+            .get("indexes")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let constraints = t
+            .get("constraints")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        tables.push(crate::api::types::TableInfo {
+            table_name,
+            product_type_ref,
+            table_type,
+            table_access,
+            columns,
+            indexes,
+            constraints,
+        });
+    }
+
+    // ── Reducers ───────────────────────────────────────────────────────────
+    let reducers_raw = raw
+        .get("reducers")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let reducers: Vec<crate::api::types::ReducerInfo> = reducers_raw
+        .iter()
+        .filter_map(|r| {
+            let name = r.get("name")?.as_str()?.to_string();
+            // params can be {"elements": [...]} (v9) or a flat array (legacy).
+            let params = extract_params(r.get("params"));
+            Some(crate::api::types::ReducerInfo { name, params })
+        })
+        .collect();
+
+    Ok(SchemaResponse { typespace, tables, reducers })
+}
+
+/// Extract the lowercase string key from a SpacetimeDB enum value.
+///
+/// Handles `{"User": []}`, `"user"` (plain string), and missing values.
+fn extract_enum_tag(val: Option<&Value>, default: &str) -> String {
+    match val {
+        Some(Value::String(s)) => s.to_lowercase(),
+        Some(Value::Object(o)) => o
+            .keys()
+            .next()
+            .map(|k| k.to_lowercase())
+            .unwrap_or_else(|| default.to_string()),
+        _ => default.to_string(),
+    }
+}
+
+/// Resolve column definitions for a table by looking up `product_type_ref`
+/// in the shared typespace types array.
+///
+/// Expected typespace entry shape:
+/// ```json
+/// {"Product": {"elements": [{"name": {"some": "col"}, "algebraic_type": {...}}]}}
+/// ```
+fn resolve_columns(
+    typespace_types: &[Value],
+    type_ref: usize,
+) -> Vec<crate::api::types::ColumnInfo> {
+    let type_val = match typespace_types.get(type_ref) {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    let elements = type_val
+        .get("Product")
+        .and_then(|p| p.get("elements"))
+        .and_then(|e| e.as_array());
+
+    let Some(elements) = elements else {
+        return Vec::new();
+    };
+
+    elements
+        .iter()
+        .enumerate()
+        .map(|(i, elem)| {
+            // name is {"some": "col_name"} or a plain string.
+            let col_name = elem
+                .get("name")
+                .and_then(|n| {
+                    if let Some(some_val) = n.get("some") {
+                        some_val.as_str().map(str::to_string)
+                    } else {
+                        n.as_str().map(str::to_string)
+                    }
+                })
+                .unwrap_or_else(|| format!("col_{i}"));
+
+            let col_type = elem.get("algebraic_type").cloned().unwrap_or(Value::Null);
+            crate::api::types::ColumnInfo {
+                col_id: i as u32,
+                col_name,
+                col_type,
+                is_autoinc: false,
+            }
+        })
+        .collect()
+}
+
+/// Extract reducer parameters from a v9 `params` field.
+///
+/// v9: `"params": {"elements": [{"name": {"some": "p"}, "algebraic_type": {...}}]}`
+/// Legacy: `"params": [{"name": "p", "algebraic_type": {...}}]`
+fn extract_params(params_val: Option<&Value>) -> Vec<crate::api::types::ReducerParam> {
+    let elements: &[Value] = match params_val {
+        Some(Value::Array(arr)) => arr,
+        Some(obj @ Value::Object(_)) => {
+            match obj.get("elements").and_then(|e| e.as_array()) {
+                Some(arr) => arr,
+                None => return Vec::new(),
+            }
+        }
+        _ => return Vec::new(),
+    };
+
+    elements
+        .iter()
+        .filter_map(|elem| {
+            let name = elem
+                .get("name")
+                .and_then(|n| {
+                    if let Some(some_val) = n.get("some") {
+                        some_val.as_str().map(str::to_string)
+                    } else {
+                        n.as_str().map(str::to_string)
+                    }
+                })
+                .unwrap_or_default();
+            if name.is_empty() {
+                return None;
+            }
+            let algebraic_type = elem.get("algebraic_type").cloned().unwrap_or(Value::Null);
+            Some(crate::api::types::ReducerParam { name, algebraic_type })
+        })
+        .collect()
 }
 
 /// Parse a newline-delimited JSON log stream into `Vec<LogEntry>`.
@@ -563,5 +774,127 @@ mod tests {
         let entries = parse_ndjson_logs(text).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].message, "ok");
+    }
+
+    // ── SpacetimeDB v9 format tests ─────────────────────────────────────
+
+    #[test]
+    fn test_parse_query_result_v9_schema_elements() {
+        // v9 format: schema is {"elements": [...]} and names are {"some": "col"}
+        let raw = json!([{
+            "schema": {
+                "elements": [
+                    {"name": {"some": "table_id"}, "algebraic_type": {"U32": []}},
+                    {"name": {"some": "table_name"}, "algebraic_type": {"String": []}}
+                ]
+            },
+            "rows": [[1, "st_table"], [2, "st_column"]],
+            "total_duration_micros": 42,
+            "stats": {}
+        }]);
+        let result = parse_query_result(raw).unwrap();
+        assert_eq!(result.schema.len(), 2);
+        assert_eq!(result.schema[0].name, "table_id");
+        assert_eq!(result.schema[1].name, "table_name");
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.total_duration_micros, 42);
+    }
+
+    #[test]
+    fn test_parse_schema_response_v9() {
+        // Real v9 schema format with typespace column resolution
+        let raw = json!({
+            "typespace": {
+                "types": [
+                    {
+                        "Product": {
+                            "elements": [
+                                {"name": {"some": "agent_id"}, "algebraic_type": {"U64": []}},
+                                {"name": {"some": "session_id"}, "algebraic_type": {"U64": []}}
+                            ]
+                        }
+                    }
+                ]
+            },
+            "tables": [
+                {
+                    "name": "agent_activity",
+                    "product_type_ref": 0,
+                    "primary_key": [0],
+                    "indexes": [],
+                    "constraints": [],
+                    "sequences": [],
+                    "table_type": {"User": []},
+                    "table_access": {"Public": []}
+                }
+            ],
+            "reducers": [
+                {
+                    "name": "set_status",
+                    "params": {
+                        "elements": [
+                            {"name": {"some": "agent_id"}, "algebraic_type": {"U64": []}}
+                        ]
+                    }
+                }
+            ],
+            "types": [],
+            "misc_exports": []
+        });
+
+        let schema = parse_schema_response(raw).unwrap();
+
+        assert_eq!(schema.tables.len(), 1);
+        let tbl = &schema.tables[0];
+        assert_eq!(tbl.table_name, "agent_activity");
+        assert_eq!(tbl.table_type, "user");
+        assert_eq!(tbl.table_access, "public");
+        assert_eq!(tbl.columns.len(), 2);
+        assert_eq!(tbl.columns[0].col_name, "agent_id");
+        assert_eq!(tbl.columns[1].col_name, "session_id");
+
+        assert_eq!(schema.reducers.len(), 1);
+        assert_eq!(schema.reducers[0].name, "set_status");
+        assert_eq!(schema.reducers[0].params.len(), 1);
+        assert_eq!(schema.reducers[0].params[0].name, "agent_id");
+    }
+
+    #[test]
+    fn test_extract_enum_tag_object() {
+        assert_eq!(extract_enum_tag(Some(&json!({"User": []})), "unknown"), "user");
+        assert_eq!(extract_enum_tag(Some(&json!({"System": []})), "unknown"), "system");
+        assert_eq!(extract_enum_tag(Some(&json!({"Public": []})), "unknown"), "public");
+        assert_eq!(extract_enum_tag(Some(&json!({"Private": []})), "unknown"), "private");
+    }
+
+    #[test]
+    fn test_extract_enum_tag_string_fallback() {
+        assert_eq!(extract_enum_tag(Some(&json!("User")), "unknown"), "user");
+        assert_eq!(extract_enum_tag(None, "default"), "default");
+    }
+
+    #[test]
+    fn test_resolve_columns_some_name_pattern() {
+        let types = vec![json!({
+            "Product": {
+                "elements": [
+                    {"name": {"some": "id"}, "algebraic_type": {"U64": []}},
+                    {"name": {"some": "name"}, "algebraic_type": {"String": []}}
+                ]
+            }
+        })];
+        let cols = resolve_columns(&types, 0);
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].col_name, "id");
+        assert_eq!(cols[0].col_id, 0);
+        assert_eq!(cols[1].col_name, "name");
+        assert_eq!(cols[1].col_id, 1);
+    }
+
+    #[test]
+    fn test_resolve_columns_out_of_range() {
+        let types: Vec<Value> = vec![];
+        let cols = resolve_columns(&types, 99);
+        assert!(cols.is_empty());
     }
 }

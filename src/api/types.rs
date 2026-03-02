@@ -67,32 +67,43 @@ pub const SYSTEM_TABLES: &[&str] = &[
     "st_view",
 ];
 
-/// A single table entry inside a schema response.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// A single table entry inside a schema response (SpacetimeDB v9 format).
+///
+/// Not deserialized directly via serde — constructed manually in
+/// `client::parse_schema_response` so that column info can be resolved
+/// from the shared typespace.
+#[derive(Debug, Clone, Serialize)]
 pub struct TableInfo {
-    pub table_id: u32,
+    /// Human-readable table name (JSON field: `"name"`).
     pub table_name: String,
-    /// `"system"` or `"user"`.
-    #[serde(default)]
+    /// Index into `typespace.types` that holds this table's column product type.
+    pub product_type_ref: u32,
+    /// `"user"` or `"system"` (derived from `{"User":[]}` / `{"System":[]}`).
     pub table_type: String,
-    /// `"public"` or `"private"`.
-    #[serde(default)]
+    /// `"public"` or `"private"` (derived from `{"Public":[]}` / `{"Private":[]}`).
     pub table_access: String,
-    #[serde(default)]
+    /// Resolved column definitions (populated from typespace after parsing).
     pub columns: Vec<ColumnInfo>,
+    /// Raw index definitions.
     #[serde(default)]
-    pub indexes: Vec<IndexInfo>,
+    pub indexes: Vec<Value>,
+    /// Raw constraint definitions.
     #[serde(default)]
     pub constraints: Vec<Value>,
 }
 
 /// Metadata for a single column inside a `TableInfo`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+///
+/// Resolved from the typespace `Product.elements` list.
+#[derive(Debug, Clone, Serialize)]
 pub struct ColumnInfo {
+    /// Zero-based column position.
     pub col_id: u32,
+    /// Column name (resolved from `{"some": "name"}` pattern).
     pub col_name: String,
+    /// Algebraic type as a raw JSON value.
     pub col_type: Value,
-    #[serde(default)]
+    /// Whether a sequence auto-increments this column.
     pub is_autoinc: bool,
 }
 
@@ -110,15 +121,17 @@ pub struct IndexInfo {
 }
 
 /// Metadata for a single reducer.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+///
+/// Not deserialized directly — constructed manually in `parse_schema_response`
+/// to handle the v9 `{"elements":[…]}` param format and `{"some":"name"}` names.
+#[derive(Debug, Clone, Serialize)]
 pub struct ReducerInfo {
     pub name: String,
-    #[serde(default)]
     pub params: Vec<ReducerParam>,
 }
 
 /// A single parameter of a reducer.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ReducerParam {
     pub name: String,
     pub algebraic_type: Value,
@@ -126,18 +139,15 @@ pub struct ReducerParam {
 
 /// The full schema response for a database.
 ///
-/// SpacetimeDB returns a JSON object with a `typespace` (the type registry)
-/// and a list of `tables`.  Reducers are included when available.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// Constructed manually by `client::parse_schema_response` from the raw v9
+/// JSON to correctly resolve typespace references.
+#[derive(Debug, Clone, Serialize)]
 pub struct SchemaResponse {
     /// The algebraic type registry shared by all tables/reducers.
-    #[serde(default)]
     pub typespace: Value,
     /// All tables in the database.
-    #[serde(default)]
     pub tables: Vec<TableInfo>,
     /// All reducers exposed by the database module.
-    #[serde(default)]
     pub reducers: Vec<ReducerInfo>,
 }
 

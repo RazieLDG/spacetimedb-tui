@@ -13,11 +13,11 @@
 
 ## 📸 Screenshots
 
-| Database Browser | Table Viewer |
+| Database Browser | SQL Console |
 |:---:|:---:|
 | ![Database Browser](stdb1.jpg) | ![Table Viewer](stdb2.jpg) |
 
-| SQL Console | Module Inspector |
+| Metrics Viewer | Module Inspector |
 |:---:|:---:|
 | ![SQL Console](stdb3.jpg) | ![Module Inspector](stdb4.jpg) |
 

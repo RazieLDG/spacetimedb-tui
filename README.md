@@ -171,19 +171,6 @@ Built and tested against **SpacetimeDB 2.0** HTTP + WebSocket APIs.
 
 Contributions are welcome! Whether it's a bug fix, new feature, or documentation improvement.
 
-```bash
-# Fork and clone
-git clone https://github.com/<your-username>/spacetimedb-tui.git
-cd spacetimedb-tui
-
-# Run tests
-cargo test
-
-# Check formatting and lints
-cargo fmt --check
-cargo clippy -- -D warnings
-```
-
 ### Reporting Bugs
 
 Please [open an issue](https://github.com/RazieLDG/spacetimedb-tui/issues/new) and include:

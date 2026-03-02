@@ -1,0 +1,15 @@
+//! Application state module.
+//!
+//! The [`app_state`] sub-module contains [`AppState`], the single source of
+//! truth for all TUI state.  Import from here rather than from the sub-module
+//! directly.
+
+#![allow(dead_code)]
+
+pub mod app_state;
+
+// Re-export the most commonly used items.
+pub use app_state::{
+    AppState, ConnectionStatus, FocusPanel, MetricsSnapshot, SidebarFocus,
+    SqlHistoryEntry, Tab,
+};

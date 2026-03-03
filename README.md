@@ -15,11 +15,11 @@
 
 | Database Browser | SQL Console |
 |:---:|:---:|
-| ![Database Browser](stdb1.jpg) | ![Table Viewer](stdb2.jpg) |
+| ![Database Browser](images/stdb1.jpg) | ![Table Viewer](images/stdb2.jpg) |
 
 | Metrics Viewer | Module Inspector |
 |:---:|:---:|
-| ![SQL Console](stdb3.jpg) | ![Module Inspector](stdb4.jpg) |
+| ![SQL Console](images/stdb3.jpg) | ![Module Inspector](images/stdb4.jpg) |
 
 ---
 

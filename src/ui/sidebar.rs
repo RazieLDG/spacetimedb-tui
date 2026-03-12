@@ -27,8 +27,6 @@ const DB_FG: Color = Color::Rgb(97, 175, 239);
 const TABLE_FG: Color = Color::Rgb(200, 200, 200);
 const MUTED: Color = Color::Rgb(110, 110, 110);
 const SECTION_FG: Color = Color::Rgb(86, 182, 194);
-const BORDER_FOCUSED: Color = Color::Cyan;
-const BORDER_NORMAL: Color = Color::Rgb(40, 50, 65);
 const SEARCH_BG: Color = Color::Rgb(28, 40, 58);
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -126,7 +124,7 @@ fn render_tree(area: Rect, buf: &mut Buffer, app: &AppState, focused: bool) {
 
         // Fill row background
         for x in area.x..area.x + area.width {
-            buf.get_mut(x, y)
+            buf[(x, y)]
                 .set_char(' ')
                 .set_style(Style::default().bg(bg));
         }

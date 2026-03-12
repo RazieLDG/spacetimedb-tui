@@ -21,7 +21,6 @@ use crate::state::{AppState, FocusPanel};
 const ACCENT: Color = Color::Cyan;
 const BORDER_FOCUSED: Color = Color::Cyan;
 const BORDER_NORMAL: Color = Color::Rgb(40, 50, 65);
-const FG_PRIMARY: Color = Color::Rgb(220, 220, 220);
 const FG_MUTED: Color = Color::Rgb(110, 110, 110);
 const FG_VALUE: Color = Color::Rgb(229, 192, 123);
 const SUCCESS: Color = Color::Rgb(152, 195, 121);
@@ -219,7 +218,7 @@ fn render_extra_metrics(area: Rect, buf: &mut Buffer, app: &AppState) {
     // Fill background
     for y in inner.y..inner.y + inner.height {
         for x in inner.x..inner.x + inner.width {
-            buf.get_mut(x, y)
+            buf[(x, y)]
                 .set_char(' ')
                 .set_style(Style::default().bg(Color::Rgb(16, 20, 30)));
         }
@@ -227,14 +226,13 @@ fn render_extra_metrics(area: Rect, buf: &mut Buffer, app: &AppState) {
 
     let m = &app.metrics;
 
-    // Build key-value lines
-    let mut lines: Vec<Line> = Vec::new();
-
-    // Always-present fields
-    lines.push(kv_line("connected_clients", &m.connected_clients.to_string()));
-    lines.push(kv_line("total_reducer_calls", &m.total_reducer_calls.to_string()));
-    lines.push(kv_line("total_energy_used", &m.total_energy_used.to_string()));
-    lines.push(kv_line("memory_bytes", &format_bytes(m.memory_bytes)));
+    // Build key-value lines — always-present fields first
+    let mut lines: Vec<Line> = vec![
+        kv_line("connected_clients", &m.connected_clients.to_string()),
+        kv_line("total_reducer_calls", &m.total_reducer_calls.to_string()),
+        kv_line("total_energy_used", &m.total_energy_used.to_string()),
+        kv_line("memory_bytes", &format_bytes(m.memory_bytes)),
+    ];
 
     if let Some(ref ts) = m.sampled_at {
         lines.push(kv_line("sampled_at", &ts.to_rfc3339()));

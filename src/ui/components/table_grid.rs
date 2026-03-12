@@ -55,6 +55,8 @@ impl TableGridState {
     }
 
     /// Scroll right by one column.
+    ///
+    /// `col_count` is the total number of columns in the current data set.
     pub fn scroll_right(&mut self, col_count: usize) {
         if col_count > 0 {
             self.scroll_col = (self.scroll_col + 1).min(col_count.saturating_sub(1));
@@ -230,8 +232,8 @@ impl<'a> StatefulWidget for TableGrid<'a> {
         let visible_cols = {
             let mut cols: Vec<usize> = Vec::new();
             let mut x_used = 0u16;
-            for ci in state.scroll_col..n_cols {
-                let w = col_widths[ci] as u16 + 1; // +1 for separator
+            for (ci, &w_raw) in col_widths.iter().enumerate().skip(state.scroll_col) {
+                let w = w_raw as u16 + 1; // +1 for separator
                 if x_used + w > inner.width {
                     break;
                 }
@@ -264,7 +266,7 @@ impl<'a> StatefulWidget for TableGrid<'a> {
                 x += w as u16;
                 // Column separator
                 if x < inner.x + inner.width {
-                    buf.get_mut(x, header_y)
+                    buf[(x, header_y)]
                         .set_char('│')
                         .set_style(Style::default().fg(BORDER_NORMAL).bg(HEADER_BG));
                     x += 1;
@@ -272,7 +274,7 @@ impl<'a> StatefulWidget for TableGrid<'a> {
             }
             // Fill rest of header row
             while x < inner.x + inner.width {
-                buf.get_mut(x, header_y)
+                buf[(x, header_y)]
                     .set_char(' ')
                     .set_style(Style::default().bg(HEADER_BG));
                 x += 1;
@@ -286,13 +288,13 @@ impl<'a> StatefulWidget for TableGrid<'a> {
             for &ci in &visible_cols {
                 let w = col_widths[ci] as u16;
                 for _ in 0..w {
-                    buf.get_mut(x, sep_y)
+                    buf[(x, sep_y)]
                         .set_char('─')
                         .set_style(Style::default().fg(BORDER_NORMAL));
                     x += 1;
                 }
                 if x < inner.x + inner.width {
-                    buf.get_mut(x, sep_y)
+                    buf[(x, sep_y)]
                         .set_char('┼')
                         .set_style(Style::default().fg(BORDER_NORMAL));
                     x += 1;
@@ -300,7 +302,7 @@ impl<'a> StatefulWidget for TableGrid<'a> {
             }
             // Fill remainder
             while x < inner.x + inner.width {
-                buf.get_mut(x, sep_y)
+                buf[(x, sep_y)]
                     .set_char('─')
                     .set_style(Style::default().fg(BORDER_NORMAL));
                 x += 1;
@@ -356,7 +358,7 @@ impl<'a> StatefulWidget for TableGrid<'a> {
                 x += w as u16;
                 // Separator
                 if x < inner.x + inner.width {
-                    buf.get_mut(x, screen_y)
+                    buf[(x, screen_y)]
                         .set_char('│')
                         .set_style(Style::default().fg(BORDER_NORMAL).bg(row_bg));
                     x += 1;
@@ -364,7 +366,7 @@ impl<'a> StatefulWidget for TableGrid<'a> {
             }
             // Fill row remainder
             while x < inner.x + inner.width {
-                buf.get_mut(x, screen_y)
+                buf[(x, screen_y)]
                     .set_char(' ')
                     .set_style(Style::default().bg(row_bg));
                 x += 1;

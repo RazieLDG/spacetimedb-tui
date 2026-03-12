@@ -98,7 +98,7 @@ pub fn render_tables(
 fn render_info_bar(area: Rect, buf: &mut Buffer, app: &AppState) {
     // Fill background
     for x in area.x..area.x + area.width {
-        buf.get_mut(x, area.y)
+        buf[(x, area.y)]
             .set_char(' ')
             .set_style(Style::default().bg(BG_INFO));
     }
@@ -170,7 +170,7 @@ fn build_table_data(app: &AppState) -> Option<(Vec<String>, Vec<Vec<String>>, St
         .iter()
         .map(|row| {
             row.iter()
-                .map(|v| value_to_display(v))
+                .map(value_to_display)
                 .collect()
         })
         .collect();

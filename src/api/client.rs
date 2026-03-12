@@ -5,7 +5,7 @@
 //! `anyhow::Result<T>` so that callers can use the `?` operator freely.
 
 use anyhow::{anyhow, bail, Context, Result};
-use reqwest::{header, Client, StatusCode};
+use reqwest::{header, Client};
 use serde_json::Value;
 use tracing::{debug, instrument, warn};
 
@@ -61,12 +61,14 @@ impl SpacetimeClient {
     }
 
     /// Convenience constructor using host + port.
+    #[allow(dead_code)]
     pub fn from_host_port(host: &str, port: u16, auth_token: Option<String>) -> Result<Self> {
         let base_url = format!("http://{}:{}", host, port);
         Self::new(base_url, auth_token)
     }
 
     /// The WebSocket base URL derived from the HTTP base URL.
+    #[allow(dead_code)]
     pub fn ws_base_url(&self) -> String {
         self.base_url
             .replacen("http://", "ws://", 1)
@@ -74,6 +76,7 @@ impl SpacetimeClient {
     }
 
     /// Attach (or replace) the bearer auth token.
+    #[allow(dead_code)]
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
         self.auth_token = Some(token.into());
         self
@@ -103,6 +106,7 @@ impl SpacetimeClient {
     }
 
     /// Send a request and deserialise the JSON body into `T`.
+    #[allow(dead_code)]
     async fn send_json<T>(&self, req: reqwest::RequestBuilder) -> Result<T>
     where
         T: serde::de::DeserializeOwned,
@@ -318,6 +322,7 @@ impl SpacetimeClient {
     }
 
     /// Return the configured base URL.
+    #[allow(dead_code)]
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
@@ -668,6 +673,9 @@ fn parse_ndjson_logs(text: &str) -> Result<Vec<LogEntry>> {
 /// - `["name1", "name2"]`
 /// - `{"databases": ["name1", ...]}`
 /// - `{"databases": [{"database_identity": "...", "database_name": "name"}, ...]}`
+///
+/// Currently used in unit tests; available for future use in database listing.
+#[cfg_attr(not(test), allow(dead_code))]
 fn extract_database_names(raw: Value) -> Result<Vec<String>> {
     let arr = match raw {
         Value::Array(a) => a,

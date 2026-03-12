@@ -6,8 +6,6 @@
 /// 3. Set up the crossterm raw-mode terminal.
 /// 4. Run the async event loop via [`App`].
 /// 5. Restore the terminal on exit — even if the loop panics.
-// Suppress dead-code noise for items used only in sub-modules.
-#[allow(dead_code, unused_imports)]
 mod api;
 mod app;
 mod config;

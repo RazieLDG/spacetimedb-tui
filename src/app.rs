@@ -19,7 +19,10 @@ use tokio::sync::mpsc;
 use ratatui::widgets::Widget;
 
 use crate::{
-    api::SpacetimeClient,
+    api::{
+        ws::{WsConfig, WsEvent, WsHandle},
+        SpacetimeClient,
+    },
     config::Config,
     state::{
         AppState, ConnectionStatus, FocusPanel, SidebarFocus, SqlHistoryEntry, Tab,
@@ -80,6 +83,12 @@ pub struct App {
     pub tables_grid: TableGridState,
     /// Table grid state for the SQL results.
     pub sql_grid: TableGridState,
+    /// Active WebSocket subscription handle (set after database selection).
+    ws_handle: Option<WsHandle>,
+    /// WebSocket base URL (e.g. `ws://localhost:3000`).
+    ws_url: String,
+    /// Auth token for WebSocket connections.
+    auth_token: Option<String>,
 }
 
 impl App {
@@ -95,6 +104,9 @@ impl App {
             sql_input: InputState::new(),
             tables_grid: TableGridState::new(),
             sql_grid: TableGridState::new(),
+            ws_handle: None,
+            ws_url: config.ws_url.clone(),
+            auth_token: config.auth_token.clone(),
         }
     }
 
@@ -153,12 +165,12 @@ impl App {
             }
 
             // Drain async API events (non-blocking)
-            loop {
-                match self.event_rx.try_recv() {
-                    Ok(ev) => self.handle_app_event(ev).await,
-                    Err(_) => break,
-                }
+            while let Ok(ev) = self.event_rx.try_recv() {
+                self.handle_app_event(ev).await;
             }
+
+            // Drain WebSocket events (non-blocking)
+            self.drain_ws_events().await;
 
             // Expire notifications
             self.state.tick_notifications(Duration::from_secs(5));
@@ -173,6 +185,10 @@ impl App {
 
     // ── Key dispatch ──────────────────────────────────────────────────────
 
+    /// Dispatch a keyboard event to the appropriate handler.
+    ///
+    /// Uses explicit `return` statements to make early-exit control flow clear.
+    #[allow(clippy::needless_return)]
     async fn handle_key(&mut self, key: KeyEvent) {
         // ── Global always-active bindings ─────────────────────────────────
         if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -409,6 +425,30 @@ impl App {
                 return;
             }
 
+            // Horizontal scroll in table/SQL results (< / > or H / L)
+            KeyCode::Char('<') | KeyCode::Char('H') if matches!(self.state.current_tab, Tab::Query | Tab::Schema) => {
+                let grid = if self.state.current_tab == Tab::Query {
+                    &mut self.tables_grid
+                } else {
+                    &mut self.sql_grid
+                };
+                grid.scroll_left();
+                return;
+            }
+            KeyCode::Char('>') | KeyCode::Char('L') if matches!(self.state.current_tab, Tab::Query | Tab::Schema) => {
+                let col_count = self.state.query_result
+                    .as_ref()
+                    .map(|qr| qr.column_count())
+                    .unwrap_or(0);
+                let grid = if self.state.current_tab == Tab::Query {
+                    &mut self.tables_grid
+                } else {
+                    &mut self.sql_grid
+                };
+                grid.scroll_right(col_count);
+                return;
+            }
+
             // Search input (when in sidebar search mode)
             KeyCode::Backspace if self.state.focus == FocusPanel::Sidebar => {
                 self.state.search_query.pop();
@@ -551,8 +591,8 @@ impl App {
     }
 
     fn nav_end(&mut self) {
-        match self.state.focus {
-            FocusPanel::Main => match self.state.current_tab {
+        if self.state.focus == FocusPanel::Main {
+            match self.state.current_tab {
                 Tab::Query => {
                     if let Some(ref qr) = self.state.query_result {
                         let count = qr.row_count();
@@ -569,8 +609,7 @@ impl App {
                     self.state.log_follow = true;
                 }
                 _ => {}
-            },
-            _ => {}
+            }
         }
     }
 
@@ -761,6 +800,144 @@ impl App {
         });
     }
 
+    // ── WebSocket integration ─────────────────────────────────────────────
+
+    /// Connect a WebSocket subscription for the currently selected database.
+    ///
+    /// Closes any existing WebSocket connection before opening a new one.
+    async fn connect_ws(&mut self) {
+        // Close existing connection if any
+        if let Some(ref handle) = self.ws_handle {
+            handle.close().await;
+        }
+        self.ws_handle = None;
+
+        let db = match self.state.selected_database() {
+            Some(d) => d.to_string(),
+            None => return,
+        };
+
+        let config = WsConfig {
+            base_url: self.ws_url.clone(),
+            database: db,
+            auth_token: self.auth_token.clone(),
+            channel_capacity: 256,
+        };
+
+        match crate::api::ws::spawn_subscription(config) {
+            Ok(handle) => {
+                self.ws_handle = Some(handle);
+                tracing::info!("WebSocket subscription task spawned");
+            }
+            Err(e) => {
+                tracing::warn!("Failed to spawn WebSocket subscription: {e}");
+                let _ = self.event_tx.send(AppEvent::Notification(
+                    format!("WebSocket unavailable: {e}"),
+                ));
+            }
+        }
+    }
+
+    /// Drain all pending WebSocket events without blocking.
+    async fn drain_ws_events(&mut self) {
+        // Collect events first to avoid borrow issues
+        let mut events: Vec<WsEvent> = Vec::new();
+        if let Some(ref mut handle) = self.ws_handle {
+            while let Ok(ev) = handle.event_rx.try_recv() {
+                events.push(ev);
+            }
+        }
+        for ev in events {
+            self.handle_ws_event(ev).await;
+        }
+    }
+
+    /// Handle a single WebSocket event.
+    async fn handle_ws_event(&mut self, event: WsEvent) {
+        match event {
+            WsEvent::Connected => {
+                tracing::info!("WebSocket connected");
+                // Subscribe to all user tables after connection
+                self.ws_subscribe_all_tables().await;
+            }
+            WsEvent::ServerMessage(msg) => {
+                self.handle_ws_server_message(msg);
+            }
+            WsEvent::LogLine(entry) => {
+                let _ = self.event_tx.send(AppEvent::LogLine(entry));
+            }
+            WsEvent::Disconnected { reason } => {
+                tracing::warn!("WebSocket disconnected: {reason}");
+                let _ = self.event_tx.send(AppEvent::Notification(
+                    format!("WebSocket disconnected: {reason}"),
+                ));
+            }
+            WsEvent::Error(e) => {
+                tracing::warn!("WebSocket error: {e}");
+            }
+            WsEvent::RawText(text) => {
+                // Raw frames we can't decode as structured messages — log for diagnostics
+                tracing::debug!("WebSocket raw text frame ({} bytes)", text.len());
+            }
+        }
+    }
+
+    /// Send subscription queries for all user tables in the current schema.
+    async fn ws_subscribe_all_tables(&mut self) {
+        let queries: Vec<String> = self
+            .state
+            .tables
+            .iter()
+            .filter(|t| t.table_type != "system")
+            .map(|t| format!("SELECT * FROM {}", t.table_name))
+            .collect();
+
+        if queries.is_empty() {
+            return;
+        }
+
+        if let Some(ref handle) = self.ws_handle {
+            if let Err(e) = handle.subscribe(queries, 1).await {
+                tracing::warn!("WS subscribe failed: {e}");
+            }
+        }
+    }
+
+    /// Apply a decoded WebSocket server message to the application state.
+    fn handle_ws_server_message(&mut self, msg: crate::api::types::WsServerMessage) {
+        use crate::api::types::WsServerMessage;
+        match msg {
+            WsServerMessage::InitialSubscription { database_update, .. } => {
+                // Initial snapshot — update live data in state
+                for table_update in database_update.tables {
+                    tracing::debug!(
+                        "Initial subscription data for table '{}': {} rows",
+                        table_update.table_name,
+                        table_update.inserts.len()
+                    );
+                }
+                let _ = self.event_tx.send(AppEvent::Notification(
+                    "Live data subscription active".to_string(),
+                ));
+            }
+            WsServerMessage::TransactionUpdate { database_update, .. } => {
+                // Incremental update — log for now, future: apply to live data
+                let total_changes: usize = database_update
+                    .tables
+                    .iter()
+                    .map(|t| t.inserts.len() + t.deletes.len())
+                    .sum();
+                if total_changes > 0 {
+                    tracing::debug!("Transaction update: {total_changes} row changes");
+                }
+            }
+            WsServerMessage::IdentityToken { identity, .. } => {
+                tracing::info!("WebSocket identity confirmed: {identity}");
+            }
+            WsServerMessage::Unknown => {}
+        }
+    }
+
     // ── Async event handler ───────────────────────────────────────────────
 
     async fn handle_app_event(&mut self, ev: AppEvent) {
@@ -796,7 +973,12 @@ impl App {
                     self.state.selected_table_idx = Some(0);
                 }
                 self.state.current_schema = Some(schema);
-                self.state.set_notification("Schema loaded".to_string());
+                let table_count = self.state.tables.len();
+                let _ = self.event_tx.send(AppEvent::Notification(
+                    format!("Schema loaded — {table_count} tables"),
+                ));
+                // Establish WebSocket subscription for live data
+                self.connect_ws().await;
             }
 
             AppEvent::QueryResult { result, duration, sql } => {

@@ -30,6 +30,7 @@ pub enum WsEvent {
     /// A log line streamed from the server (log-follow mode).
     LogLine(LogEntry),
     /// Raw text frame that could not be decoded as a known message type.
+    /// The inner `String` is preserved for diagnostic logging.
     RawText(String),
     /// The WebSocket connection was successfully established.
     Connected,
@@ -98,6 +99,9 @@ impl WsConfig {
     }
 
     /// Build the full WebSocket URL for a log-follow connection.
+    ///
+    /// Used by [`spawn_log_follow`] for streaming live log output.
+    #[allow(dead_code)]
     pub fn log_follow_url(&self) -> Result<Url> {
         let raw = format!(
             "{}/v1/database/{}/logs?follow=true&num_lines=100",
@@ -162,6 +166,8 @@ pub fn spawn_subscription(config: WsConfig) -> Result<WsHandle> {
 /// Spawn a WebSocket log-follow task for `config.database`.
 ///
 /// Log lines are forwarded as [`WsEvent::LogLine`] events.
+/// Available for future integration with the Logs tab live streaming.
+#[allow(dead_code)]
 pub fn spawn_log_follow(config: WsConfig) -> Result<WsHandle> {
     let url = config.log_follow_url()?;
     let (cmd_tx, cmd_rx) = mpsc::channel::<WsCommand>(32);
@@ -185,8 +191,10 @@ fn build_ws_request(url: Url, auth_token: Option<&str>) -> Result<Request> {
         builder = builder.header("Authorization", value);
     }
 
-    // SpacetimeDB expects the `spacetimedb-protocol` header.
-    builder = builder.header("Sec-WebSocket-Protocol", "v1.bsatn.spacetimedb");
+    // Request JSON encoding so frames can be decoded with serde_json.
+    // SpacetimeDB 2.0 supports both "v1.bsatn.spacetimedb" (binary) and
+    // "v1.json.spacetimedb" (JSON).  We use JSON to avoid a BSATN decoder.
+    builder = builder.header("Sec-WebSocket-Protocol", "v1.json.spacetimedb");
 
     builder
         .body(())
@@ -302,6 +310,7 @@ async fn subscription_task(
 }
 
 /// Main loop for a log-follow WebSocket connection.
+#[allow(dead_code)]
 async fn log_follow_task(
     url: Url,
     auth_token: Option<String>,

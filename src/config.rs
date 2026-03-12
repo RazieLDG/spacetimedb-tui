@@ -245,6 +245,10 @@ impl std::fmt::Display for ThemeName {
 /// Using `u8` RGB triples rather than `ratatui::style::Color` directly so
 /// that `config.rs` does not need to depend on ratatui (keeping the layer
 /// boundary clean).  The UI layer converts these to `Color::Rgb(r, g, b)`.
+///
+/// Fields are not yet fully wired into the UI renderers; they are available
+/// for future theming support.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ThemeColors {
     // Backgrounds
@@ -340,6 +344,9 @@ impl ThemeColors {
 // ---------------------------------------------------------------------------
 
 /// Resolved application configuration, derived from [`Cli`].
+///
+/// Some fields (`theme`, `theme_name`) are reserved for future UI theming
+/// and are not yet consumed by the renderers.
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Full HTTP base URL, e.g. `http://localhost:3000`.
@@ -350,9 +357,11 @@ pub struct Config {
     pub database: Option<String>,
     /// Authentication token (may be `None` for unauthenticated access).
     pub auth_token: Option<String>,
-    /// Resolved colour theme.
+    /// Resolved colour theme (reserved for future UI theming).
+    #[allow(dead_code)]
     pub theme: ThemeColors,
     /// Theme name (for display / serialisation).
+    #[allow(dead_code)]
     pub theme_name: ThemeName,
     /// Tracing log level string.
     pub log_level: String,
@@ -422,6 +431,9 @@ impl Config {
     }
 
     /// Whether TLS is in use (inferred from the scheme in `server_url`).
+    ///
+    /// Used when constructing WebSocket URLs and for display in the status bar.
+    #[allow(dead_code)]
     pub fn uses_tls(&self) -> bool {
         self.server_url.starts_with("https://")
     }

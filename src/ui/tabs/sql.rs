@@ -27,7 +27,6 @@ const FG_MUTED: Color = Color::Rgb(110, 110, 110);
 const FG_PRIMARY: Color = Color::Rgb(220, 220, 220);
 const SUCCESS: Color = Color::Rgb(152, 195, 121);
 const ERROR_FG: Color = Color::Rgb(224, 108, 117);
-const WARNING: Color = Color::Rgb(229, 192, 123);
 const BORDER_FOCUSED: Color = Color::Cyan;
 const BORDER_NORMAL: Color = Color::Rgb(40, 50, 65);
 const HISTORY_BG: Color = Color::Rgb(20, 26, 38);
@@ -62,7 +61,7 @@ pub fn render_sql(
 
     // ── Layout ────────────────────────────────────────────────────────────
     // history (min 3) | input (3) | results (rest, min 3)
-    let history_h = inner.height.min(8).max(3);
+    let history_h = inner.height.clamp(3, 8);
     let input_h = 3u16;
     let results_h = inner.height.saturating_sub(history_h + input_h);
 
@@ -114,7 +113,7 @@ fn render_history(area: Rect, buf: &mut Buffer, app: &AppState) {
     // Fill background
     for y in inner.y..inner.y + inner.height {
         for x in inner.x..inner.x + inner.width {
-            buf.get_mut(x, y)
+            buf[(x, y)]
                 .set_char(' ')
                 .set_style(Style::default().bg(HISTORY_BG));
         }
@@ -150,7 +149,7 @@ fn render_history(area: Rect, buf: &mut Buffer, app: &AppState) {
 
         // Fill row
         for x in inner.x..inner.x + inner.width {
-            buf.get_mut(x, y)
+            buf[(x, y)]
                 .set_char(' ')
                 .set_style(Style::default().bg(bg));
         }
@@ -223,6 +222,7 @@ fn render_results(
             TableGrid::new(&headers, &rows)
                 .title(title)
                 .focused(focused)
+                .max_col_width(60)
                 .render(area, buf, grid_state);
         }
     }

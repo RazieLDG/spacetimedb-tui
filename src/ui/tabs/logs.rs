@@ -81,7 +81,7 @@ pub fn render_logs(area: Rect, buf: &mut Buffer, app: &AppState) {
 
 fn render_toolbar(area: Rect, buf: &mut Buffer, app: &AppState, paused: bool) {
     for x in area.x..area.x + area.width {
-        buf.get_mut(x, area.y)
+        buf[(x, area.y)]
             .set_char(' ')
             .set_style(Style::default().bg(Color::Rgb(20, 26, 38)));
     }
@@ -128,7 +128,7 @@ fn render_log_lines(area: Rect, buf: &mut Buffer, app: &AppState, paused: bool) 
     };
     for y in area.y..area.y + area.height {
         for x in area.x..area.x + area.width {
-            buf.get_mut(x, y)
+            buf[(x, y)]
                 .set_char(' ')
                 .set_style(Style::default().bg(bg));
         }

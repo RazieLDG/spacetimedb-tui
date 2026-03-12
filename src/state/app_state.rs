@@ -73,6 +73,7 @@ pub enum FocusPanel {
     /// The SQL input box at the bottom.
     SqlInput,
     /// A modal dialog (e.g. error popup, help overlay).
+    #[allow(dead_code)]
     Modal,
 }
 
@@ -120,11 +121,14 @@ pub struct ConnectionInfo {
     pub base_url: String,
     /// Current connection status.
     pub status: ConnectionStatus,
-    /// Server version string, if reported.
+    /// Server version string, if reported (populated when available).
+    #[allow(dead_code)]
     pub server_version: Option<String>,
-    /// Authenticated identity token, if present.
+    /// Authenticated identity token, if present (for display in status bar).
+    #[allow(dead_code)]
     pub auth_token: Option<String>,
     /// When the last successful connection was made.
+    #[allow(dead_code)]
     pub connected_at: Option<DateTime<Utc>>,
 }
 
@@ -139,6 +143,8 @@ impl ConnectionInfo {
         }
     }
 
+    /// Returns `true` when the connection is in the `Connected` state.
+    #[allow(dead_code)]
     pub fn is_connected(&self) -> bool {
         self.status == ConnectionStatus::Connected
     }
@@ -161,6 +167,8 @@ pub struct SqlHistoryEntry {
     /// How long the query took (round-trip including network).
     pub duration: Duration,
     /// Row count returned, or `None` if the query errored.
+    /// Available for display in the history panel and future export features.
+    #[allow(dead_code)]
     pub row_count: Option<usize>,
     /// Error message, if the query failed.
     pub error: Option<String>,
@@ -196,9 +204,11 @@ pub struct MetricsSnapshot {
 pub struct TableCache {
     /// The cached result set.
     pub result: QueryResult,
-    /// When the cache entry was populated.
+    /// When the cache entry was populated (used for cache expiry checks).
+    #[allow(dead_code)]
     pub fetched_at: Instant,
     /// Whether a refresh is currently in flight.
+    #[allow(dead_code)]
     pub loading: bool,
 }
 
@@ -260,8 +270,12 @@ pub struct AppState {
     /// Result of the most recently executed query.
     pub query_result: Option<QueryResult>,
     /// Scroll offset for the results table (row index of the top visible row).
+    /// Managed by `TableGridState`; kept here for persistence across tab switches.
+    #[allow(dead_code)]
     pub result_scroll_row: usize,
     /// Scroll offset for the results table (column index of the leftmost visible column).
+    /// Managed by `TableGridState`; kept here for persistence across tab switches.
+    #[allow(dead_code)]
     pub result_scroll_col: usize,
     /// Whether a query is currently in flight.
     pub query_loading: bool,
@@ -290,6 +304,7 @@ pub struct AppState {
     /// Whether log auto-scroll (follow mode) is enabled.
     pub log_follow: bool,
     /// Minimum log level to display.
+    /// Used by `visible_logs()` for filtering; UI key binding to change it is a future enhancement.
     pub log_filter_level: LogLevel,
 
     // ------------------------------------------------------------------
@@ -315,7 +330,7 @@ pub struct AppState {
     pub should_quit: bool,
     /// Whether the terminal was resized since the last render.
     pub needs_redraw: bool,
-    /// When the application was started.
+    /// When the application was started (used by `uptime()`).
     pub started_at: Instant,
 
     // ------------------------------------------------------------------
@@ -393,8 +408,15 @@ impl AppState {
     }
 
     /// Select the database at `idx`, resetting table selection.
+    ///
+    /// This is a no-op when `idx` is already the selected database, preventing
+    /// unnecessary state clears on repeated navigation to the same database.
     pub fn select_database(&mut self, idx: usize) {
         if idx < self.databases.len() {
+            // No-op if this database is already selected
+            if self.selected_database_idx == Some(idx) {
+                return;
+            }
             self.selected_database_idx = Some(idx);
             self.selected_table_idx = None;
             self.tables.clear();
@@ -459,9 +481,14 @@ impl AppState {
 
     // ------------------------------------------------------------------
     // SQL input helpers
+    //
+    // These methods mirror `InputState` in `ui/components/input.rs` and are
+    // used in tests and available for future refactoring that consolidates
+    // the dual-state design.
     // ------------------------------------------------------------------
 
     /// Append a character to the SQL input at the current cursor position.
+    #[allow(dead_code)]
     pub fn sql_insert_char(&mut self, ch: char) {
         let mut buf = [0u8; 4];
         let s = ch.encode_utf8(&mut buf);
@@ -470,6 +497,7 @@ impl AppState {
     }
 
     /// Delete the character immediately before the cursor (backspace).
+    #[allow(dead_code)]
     pub fn sql_backspace(&mut self) {
         if self.sql_cursor == 0 || self.sql_input.is_empty() {
             return;
@@ -487,6 +515,7 @@ impl AppState {
     }
 
     /// Delete the character at the cursor (delete key).
+    #[allow(dead_code)]
     pub fn sql_delete(&mut self) {
         if self.sql_cursor >= self.sql_input.len() {
             return;
@@ -501,6 +530,7 @@ impl AppState {
     }
 
     /// Move the cursor left by one character.
+    #[allow(dead_code)]
     pub fn sql_cursor_left(&mut self) {
         if self.sql_cursor == 0 {
             return;
@@ -516,6 +546,7 @@ impl AppState {
     }
 
     /// Move the cursor right by one character.
+    #[allow(dead_code)]
     pub fn sql_cursor_right(&mut self) {
         if self.sql_cursor >= self.sql_input.len() {
             return;
@@ -525,16 +556,19 @@ impl AppState {
     }
 
     /// Move the cursor to the beginning of the input.
+    #[allow(dead_code)]
     pub fn sql_cursor_home(&mut self) {
         self.sql_cursor = 0;
     }
 
     /// Move the cursor to the end of the input.
+    #[allow(dead_code)]
     pub fn sql_cursor_end(&mut self) {
         self.sql_cursor = self.sql_input.len();
     }
 
     /// Clear the SQL input and reset the cursor.
+    #[allow(dead_code)]
     pub fn sql_clear(&mut self) {
         self.sql_input.clear();
         self.sql_cursor = 0;
@@ -616,6 +650,9 @@ impl AppState {
     }
 
     /// Log entries that pass the current `log_filter_level`.
+    ///
+    /// Available for future use in the log viewer when level filtering UI is added.
+    #[allow(dead_code)]
     pub fn visible_logs(&self) -> impl Iterator<Item = &LogEntry> {
         let min_level = &self.log_filter_level;
         self.log_buffer.iter().filter(move |e| level_gte(&e.level, min_level))
@@ -673,6 +710,7 @@ impl AppState {
     }
 
     /// Store a query result in the table cache.
+    #[allow(dead_code)]
     pub fn cache_table_result(&mut self, database: &str, table_name: &str, result: QueryResult) {
         let key = Self::cache_key(database, table_name);
         self.table_cache.insert(
@@ -686,6 +724,7 @@ impl AppState {
     }
 
     /// Retrieve a cached result, if present and not older than `max_age`.
+    #[allow(dead_code)]
     pub fn get_cached_table(
         &self,
         database: &str,
@@ -703,6 +742,9 @@ impl AppState {
     // ------------------------------------------------------------------
 
     /// How long the application has been running.
+    ///
+    /// Available for display in the status bar or metrics tab.
+    #[allow(dead_code)]
     pub fn uptime(&self) -> Duration {
         self.started_at.elapsed()
     }
@@ -712,10 +754,14 @@ impl AppState {
 // Level ordering helper
 // ---------------------------------------------------------------------------
 
+/// Returns `true` when level `a` is at least as severe as `b`.
+#[allow(dead_code)]
 fn level_gte(a: &LogLevel, b: &LogLevel) -> bool {
     level_rank(a) >= level_rank(b)
 }
 
+/// Numeric severity rank for log level comparison.
+#[allow(dead_code)]
 fn level_rank(level: &LogLevel) -> u8 {
     match level {
         LogLevel::Trace => 0,

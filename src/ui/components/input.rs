@@ -254,10 +254,10 @@ impl<'a> Widget for InputWidget<'a> {
                 byte_pos += ch.len_utf8();
             }
 
-            // Handle cursor at end of text
+            // Handle cursor at end of text (cursor is past the last character)
             if byte_pos == cursor_pos && phase == 0 {
                 cursor_char = ' ';
-                phase = 1;
+                // phase would be set to 1 here but it's not read again after the loop
             }
 
             if !before_str.is_empty() {

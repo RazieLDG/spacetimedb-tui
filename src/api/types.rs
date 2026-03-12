@@ -108,6 +108,9 @@ pub struct ColumnInfo {
 }
 
 /// Metadata for a single index inside a `TableInfo`.
+///
+/// Available for future use in the module inspector's index display.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct IndexInfo {
     pub index_id: u32,
@@ -210,6 +213,7 @@ pub struct LogEntry {
 
 impl LogEntry {
     /// Format the entry as a single display line.
+    #[allow(dead_code)]
     pub fn display_line(&self) -> String {
         let ts = self
             .ts

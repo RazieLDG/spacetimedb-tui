@@ -187,6 +187,15 @@ pub struct TableGrid<'a> {
     /// that contain the query are tinted with a yellow background so
     /// search results are easy to spot at a glance.
     highlight_query: Option<&'a str>,
+    /// Per-cell pending edits keyed by `(data_row_idx, col_idx)` →
+    /// new value string. Rendered in place of the original cell
+    /// text with an amber background so the user can see which
+    /// edits haven't been flushed yet.
+    pending_edits: &'a [(usize, usize, String)],
+    /// When `Some`, an inline cell editor is open over
+    /// `(data_row_idx, col_idx)`. The cell is painted as an input
+    /// widget instead of plain text.
+    active_editor: Option<(usize, usize, &'a str, usize)>,
 }
 
 impl<'a> TableGrid<'a> {
@@ -198,7 +207,31 @@ impl<'a> TableGrid<'a> {
             focused: false,
             max_col_width: 40,
             highlight_query: None,
+            pending_edits: &[],
+            active_editor: None,
         }
+    }
+
+    /// Overlay a list of pending edits on the grid. Each entry is
+    /// `(data_row_idx, col_idx, new_value)`; the original cell text
+    /// is replaced during render and drawn with an amber tint.
+    pub fn pending_edits(mut self, edits: &'a [(usize, usize, String)]) -> Self {
+        self.pending_edits = edits;
+        self
+    }
+
+    /// Draw `(data_row_idx, col_idx)` as an inline text input with
+    /// `value` as its content and `cursor` as the byte-cursor
+    /// position. Used by spreadsheet edit mode.
+    pub fn active_editor(
+        mut self,
+        data_row: usize,
+        col: usize,
+        value: &'a str,
+        cursor: usize,
+    ) -> Self {
+        self.active_editor = Some((data_row, col, value, cursor));
+        self
     }
 
     pub fn title(mut self, t: impl Into<String>) -> Self {
@@ -488,19 +521,48 @@ impl<'a> StatefulWidget for TableGrid<'a> {
             let mut x = inner.x;
             for &ci in &visible_cols {
                 let w = col_widths[ci];
-                let cell_text = row.get(ci).map(|s| s.as_str()).unwrap_or("");
-                let cell = Self::render_cell(cell_text, w);
+                // Pending edit lookup: data row index `ri` + column `ci`.
+                let pending_value: Option<&str> = self
+                    .pending_edits
+                    .iter()
+                    .find(|(r, c, _)| *r == ri && *c == ci)
+                    .map(|(_, _, v)| v.as_str());
+
+                // Active inline editor takes precedence over pending
+                // display — the user is typing into this exact cell.
+                let editor_here: Option<(&str, usize)> = self
+                    .active_editor
+                    .filter(|(r, c, _, _)| *r == ri && *c == ci)
+                    .map(|(_, _, v, cur)| (v, cur));
+
+                let cell_text: String = if let Some((val, _)) = editor_here {
+                    val.to_string()
+                } else if let Some(v) = pending_value {
+                    v.to_string()
+                } else {
+                    row.get(ci).map(|s| s.to_string()).unwrap_or_default()
+                };
+                let cell = Self::render_cell(&cell_text, w);
 
                 // The "active cell" is the intersection of the selected
                 // row and selected column — it gets an extra-bright
                 // background so Ctrl+C targets are visible at a glance.
                 let is_cell_cursor = is_selected && ci == state.selected_col;
-                let cell_bg = if is_cell_cursor {
+                let cell_bg = if editor_here.is_some() {
+                    Color::Rgb(90, 80, 30) // bright amber while typing
+                } else if pending_value.is_some() {
+                    Color::Rgb(70, 55, 15) // muted amber for pending
+                } else if is_cell_cursor {
                     Color::Rgb(72, 100, 130)
                 } else {
                     row_bg
                 };
-                let style = Style::default().fg(row_fg).bg(cell_bg);
+                let cell_fg = if pending_value.is_some() || editor_here.is_some() {
+                    Color::Rgb(255, 220, 100) // yellow text for edits
+                } else {
+                    row_fg
+                };
+                let style = Style::default().fg(cell_fg).bg(cell_bg);
                 let span = if is_selected {
                     Span::styled(cell, style.add_modifier(Modifier::BOLD))
                 } else {
@@ -508,6 +570,29 @@ impl<'a> StatefulWidget for TableGrid<'a> {
                 };
                 let line = Line::from(span);
                 buf.set_line(x, screen_y, &line, w as u16);
+
+                // If this is the active inline editor, overlay a
+                // block cursor on top of the rendered cell text so
+                // the user knows where typing will land.
+                if let Some((val, cursor)) = editor_here {
+                    let before = &val[..cursor.min(val.len())];
+                    let display_col = unicode_width::UnicodeWidthStr::width(before) as u16;
+                    if (display_col as usize) < w {
+                        let cur_x = x + display_col;
+                        let cur_ch = val[cursor.min(val.len())..]
+                            .chars()
+                            .next()
+                            .unwrap_or(' ');
+                        buf[(cur_x, screen_y)]
+                            .set_char(cur_ch)
+                            .set_style(
+                                Style::default()
+                                    .fg(Color::Black)
+                                    .bg(Color::Rgb(255, 220, 100))
+                                    .add_modifier(Modifier::BOLD),
+                            );
+                    }
+                }
                 x += w as u16;
                 // Separator
                 if x < inner.x + inner.width {

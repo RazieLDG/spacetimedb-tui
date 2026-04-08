@@ -85,6 +85,19 @@ const SECTIONS: &[Section] = &[
             Binding { key: "U (shift-u)",     desc: "Update selected row (opens edit form)" },
             Binding { key: "d",               desc: "Delete selected row (asks for y/n confirm)" },
             Binding { key: "D (shift-d)",     desc: "Truncate table (typed-confirm: type the name)" },
+            Binding { key: "Ctrl+E",          desc: "Enter spreadsheet edit mode (cell-by-cell)" },
+        ],
+    },
+    Section {
+        title: "Spreadsheet edit mode (Tables tab)",
+        bindings: &[
+            Binding { key: "h / j / k / l",   desc: "Move cell cursor (Vim style)" },
+            Binding { key: "Enter / i",       desc: "Open inline editor on selected cell" },
+            Binding { key: "Enter",           desc: "Commit inline editor value to pending list" },
+            Binding { key: "Esc (in editor)", desc: "Cancel inline edit without committing" },
+            Binding { key: "s",               desc: "Save all pending edits (spawn UPDATE statements)" },
+            Binding { key: "u",               desc: "Revert pending edit on active cell" },
+            Binding { key: "Ctrl+E / Esc",    desc: "Exit edit mode (asks if pending edits > 0)" },
         ],
     },
     Section {

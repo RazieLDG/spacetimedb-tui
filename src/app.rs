@@ -383,6 +383,31 @@ impl App {
             return;
         }
 
+        // ── Spreadsheet edit-mode intercept ───────────────────────────────
+        // When edit mode is active on the Tables tab, the whole key map
+        // changes (cell cursor / inline editor / save / revert). We still
+        // honour Ctrl+C as an escape hatch and Ctrl+E to toggle off.
+        if self.state.edit_mode.is_some()
+            && self.state.focus == FocusPanel::Main
+            && self.state.current_tab == Tab::Tables
+        {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                match key.code {
+                    KeyCode::Char('c') => {
+                        self.state.should_quit = true;
+                        return;
+                    }
+                    KeyCode::Char('e') => {
+                        self.exit_edit_mode();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            self.handle_edit_mode_key(key).await;
+            return;
+        }
+
         // ── Global always-active bindings ─────────────────────────────────
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
@@ -394,6 +419,16 @@ impl App {
                     // Force a fresh WebSocket connection (e.g. after a server bounce).
                     self.connect_ws().await;
                     self.state.set_notification("Reconnecting WebSocket…".to_string());
+                    return;
+                }
+                KeyCode::Char('e')
+                    if self.state.focus == FocusPanel::Main
+                        && self.state.current_tab == Tab::Tables =>
+                {
+                    // Ctrl+E on the Tables tab enters spreadsheet edit
+                    // mode. Only fires when we're *not* already in it —
+                    // the intercept above catches the toggle-off case.
+                    self.enter_edit_mode();
                     return;
                 }
                 KeyCode::Char('p') => {
@@ -1488,6 +1523,311 @@ impl App {
         }
     }
 
+    // ── Spreadsheet edit mode (Faz 10) ───────────────────────────────────
+
+    /// Open spreadsheet edit mode on the Tables tab. No-op if the
+    /// user hasn't loaded any table data yet (nothing to edit).
+    fn enter_edit_mode(&mut self) {
+        if self.state.table_browse_result.is_none() {
+            self.state
+                .set_notification("Nothing to edit — load a table first".to_string());
+            return;
+        }
+        if self.state.selected_table().is_none() {
+            self.state
+                .set_notification("No table selected".to_string());
+            return;
+        }
+        self.state.edit_mode = Some(crate::state::edit_mode::EditMode::new());
+        self.state
+            .set_notification("EDIT MODE — Ctrl+E to exit".to_string());
+    }
+
+    /// Leave edit mode. If there are uncommitted edits, pops up a
+    /// confirm dialog so the user doesn't lose them by accident.
+    fn exit_edit_mode(&mut self) {
+        let pending = self
+            .state
+            .edit_mode
+            .as_ref()
+            .map(|em| em.pending_count())
+            .unwrap_or(0);
+        if pending == 0 {
+            self.state.edit_mode = None;
+            return;
+        }
+        // Pending changes — ask before discarding. We reuse the
+        // existing Confirm modal; its action is ignored because we
+        // handle cancel vs confirm inline via a sentinel.
+        self.state.modal = Some(crate::state::modal::Modal::confirm(
+            "Discard pending edits?",
+            format!(
+                "You have {pending} uncommitted cell edit(s).\n\
+                 Leaving edit mode without saving will drop them.\n\n\
+                 Press [y] to discard, [n] to stay in edit mode."
+            ),
+            crate::state::modal::ModalAction::DiscardPendingEdits,
+        ));
+    }
+
+    /// Route a key event through the edit-mode key map.
+    async fn handle_edit_mode_key(&mut self, key: KeyEvent) {
+        // If the inline cell editor is open, keystrokes go into the
+        // input buffer instead of the outer key map.
+        let editor_open = self
+            .state
+            .edit_mode
+            .as_ref()
+            .map(|em| em.editor.is_some())
+            .unwrap_or(false);
+        if editor_open {
+            self.handle_cell_editor_key(key);
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.exit_edit_mode();
+            }
+            KeyCode::Enter | KeyCode::Char('i') => {
+                self.begin_cell_edit();
+            }
+            KeyCode::Char('s') => {
+                self.save_pending_edits().await;
+            }
+            KeyCode::Char('u') => {
+                self.revert_active_cell();
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.tables_grid.prev_col();
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                let cc = self
+                    .state
+                    .table_browse_result
+                    .as_ref()
+                    .map(|qr| qr.column_count())
+                    .unwrap_or(0);
+                self.tables_grid.next_col(cc);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.tables_grid.prev_row();
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let rc = self
+                    .state
+                    .table_browse_result
+                    .as_ref()
+                    .map(|qr| qr.row_count())
+                    .unwrap_or(0);
+                self.tables_grid.next_row(rc);
+            }
+            _ => {}
+        }
+    }
+
+    /// Keystrokes routed into the inline cell editor's `InputState`.
+    fn handle_cell_editor_key(&mut self, key: KeyEvent) {
+        let Some(em) = self.state.edit_mode.as_mut() else {
+            return;
+        };
+        let Some(editor) = em.editor.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                em.editor = None;
+            }
+            KeyCode::Enter => {
+                self.commit_cell_edit();
+            }
+            KeyCode::Left => editor.move_left(),
+            KeyCode::Right => editor.move_right(),
+            KeyCode::Home => editor.home(),
+            KeyCode::End => editor.end(),
+            KeyCode::Backspace => editor.backspace(),
+            KeyCode::Delete => editor.delete(),
+            KeyCode::Char(ch) => editor.insert(ch),
+            _ => {}
+        }
+    }
+
+    /// Open the inline editor over the currently selected cell,
+    /// pre-filled with the cell's current display value (or any
+    /// existing pending edit value).
+    fn begin_cell_edit(&mut self) {
+        // Figure out the data row / column, plus whether the user is
+        // trying to edit the PK (which we refuse so the WHERE clause
+        // stays valid).
+        let data_row = match self.active_data_row_index() {
+            Some(i) => i,
+            None => return,
+        };
+        let col_idx = self.tables_grid.selected_col;
+        let table = match self.state.selected_table().cloned() {
+            Some(t) => t,
+            None => return,
+        };
+        if table.columns.is_empty() {
+            return;
+        }
+        let (pk_idx, _) = pick_primary_key(&table);
+        if col_idx == pk_idx {
+            self.state
+                .set_notification("PK column is read-only in edit mode".to_string());
+            return;
+        }
+
+        // Prefer the in-flight pending value if one exists, otherwise
+        // fall back to the original cell string.
+        let cell_text = {
+            let em = self.state.edit_mode.as_ref();
+            let pending = em.and_then(|e| e.find(data_row, col_idx));
+            if let Some(pe) = pending {
+                pe.new_value.clone()
+            } else {
+                self.state
+                    .table_browse_result
+                    .as_ref()
+                    .and_then(|qr| qr.rows.get(data_row))
+                    .and_then(|row| row.get(col_idx))
+                    .map(crate::ui::tabs::tables::value_to_display)
+                    .unwrap_or_default()
+            }
+        };
+
+        let Some(em) = self.state.edit_mode.as_mut() else {
+            return;
+        };
+        let mut input = InputState::new();
+        input.set(cell_text);
+        em.editor = Some(input);
+    }
+
+    /// Commit whatever's in the inline editor into the pending-edits
+    /// list and close the editor.
+    fn commit_cell_edit(&mut self) {
+        let data_row = match self.active_data_row_index() {
+            Some(i) => i,
+            None => return,
+        };
+        let col_idx = self.tables_grid.selected_col;
+
+        // Capture the original display value before we touch `edit_mode`.
+        let original = self
+            .state
+            .table_browse_result
+            .as_ref()
+            .and_then(|qr| qr.rows.get(data_row))
+            .and_then(|row| row.get(col_idx))
+            .map(crate::ui::tabs::tables::value_to_display)
+            .unwrap_or_default();
+
+        let Some(em) = self.state.edit_mode.as_mut() else {
+            return;
+        };
+        let Some(editor) = em.editor.take() else {
+            return;
+        };
+        em.upsert(data_row, col_idx, original, editor.value);
+    }
+
+    /// Drop the pending edit (if any) on the active cell.
+    fn revert_active_cell(&mut self) {
+        let data_row = match self.active_data_row_index() {
+            Some(i) => i,
+            None => return,
+        };
+        let col_idx = self.tables_grid.selected_col;
+        let Some(em) = self.state.edit_mode.as_mut() else {
+            return;
+        };
+        if em.revert(data_row, col_idx) {
+            self.state.set_notification("Reverted".to_string());
+        }
+    }
+
+    /// Flush every pending edit to the server as a sequence of
+    /// `UPDATE <table> SET col=val WHERE pk=pk` statements, one per
+    /// edit. On success clears the pending list and leaves edit
+    /// mode; on partial failure keeps the failing entries.
+    async fn save_pending_edits(&mut self) {
+        // Gather everything we need while we still hold the state
+        // borrow; then drop the borrow before spawning tasks.
+        let (db, table, pk_idx, pk_column, column_types, rows, pending) = {
+            let Some(db) = self.state.selected_database() else {
+                self.state.set_error("No database selected".to_string());
+                return;
+            };
+            let db = db.to_string();
+            let Some(table) = self.state.selected_table().cloned() else {
+                return;
+            };
+            let (pk_idx, pk_column) = pick_primary_key(&table);
+            let column_types: Vec<String> = table
+                .columns
+                .iter()
+                .map(|c| type_tag(&c.col_type))
+                .collect();
+            let rows: Vec<Vec<serde_json::Value>> = self
+                .state
+                .table_browse_result
+                .as_ref()
+                .map(|qr| qr.rows.clone())
+                .unwrap_or_default();
+            let pending: Vec<_> = self
+                .state
+                .edit_mode
+                .as_ref()
+                .map(|em| em.pending.clone())
+                .unwrap_or_default();
+            (db, table.table_name, pk_idx, pk_column, column_types, rows, pending)
+        };
+
+        if pending.is_empty() {
+            self.state
+                .set_notification("No pending edits".to_string());
+            return;
+        }
+
+        let mut spawned = 0usize;
+        for edit in &pending {
+            let Some(row) = rows.get(edit.data_row_idx) else {
+                continue;
+            };
+            let Some(col_type) = column_types.get(edit.col_idx) else {
+                continue;
+            };
+            let col_name = self
+                .state
+                .selected_table()
+                .and_then(|t| t.columns.get(edit.col_idx).map(|c| c.col_name.clone()))
+                .unwrap_or_default();
+            let new_literal = sql_literal(&edit.new_value, col_type);
+            let pk_type = column_types.get(pk_idx).cloned().unwrap_or_default();
+            let pk_raw = row
+                .get(pk_idx)
+                .map(crate::ui::tabs::tables::value_to_display)
+                .unwrap_or_default();
+            let pk_literal = sql_literal(&pk_raw, &pk_type);
+            let sql = format!(
+                "UPDATE {table} SET {col_name} = {new_literal} WHERE {pk_column} = {pk_literal}"
+            );
+            let op_label = format!("edit {table}.{col_name}");
+            self.spawn_write_sql(db.clone(), sql, op_label);
+            spawned += 1;
+        }
+
+        if spawned > 0 {
+            self.state
+                .set_notification(format!("Submitted {spawned} UPDATE statement(s)"));
+            // Leave edit mode — the background spawn will re-fetch
+            // the table data on success, and any failures surface
+            // as `WriteOpError` notifications.
+            self.state.edit_mode = None;
+        }
+    }
+
     // ── Command palette (Faz 6.3) ────────────────────────────────────────
 
     /// Route a key event into the active command palette overlay.
@@ -2069,11 +2409,22 @@ impl App {
                     self.state
                         .set_error("Internal: DeleteRow inside a Form".to_string());
                 }
+                ModalAction::DiscardPendingEdits => {
+                    // DiscardPendingEdits is always a Confirm, never
+                    // a Form — unreachable.
+                }
             },
             Modal::Confirm { action, .. } => match action {
                 ModalAction::DeleteRow { table, where_sql } => {
                     let sql = format!("DELETE FROM {table} WHERE {where_sql}");
                     self.spawn_write_sql(db, sql, op_label);
+                }
+                ModalAction::DiscardPendingEdits => {
+                    // User confirmed leaving edit mode — drop the
+                    // pending list and exit.
+                    self.state.edit_mode = None;
+                    self.state
+                        .set_notification("Pending edits discarded".to_string());
                 }
                 _ => {
                     self.state

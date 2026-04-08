@@ -152,6 +152,19 @@ impl<'a> Widget for StatusBar<'a> {
             ));
         }
 
+        // Spreadsheet edit mode indicator — always visible while edit
+        // mode is open, with a live pending-edit counter.
+        if let Some(ref em) = app.edit_mode {
+            left_spans.push(sep());
+            left_spans.push(Span::styled(
+                format!(" ✎ EDIT — {} pending ", em.pending_count()),
+                Style::default()
+                    .fg(Color::Rgb(255, 220, 100))
+                    .bg(BG)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+
         // ── Right section ─────────────────────────────────────────────────
         let mut right_spans: Vec<Span> = Vec::new();
 

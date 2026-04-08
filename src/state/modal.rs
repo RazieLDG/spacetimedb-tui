@@ -111,6 +111,10 @@ pub enum ModalAction {
     AddDatabaseAlias {
         database: String,
     },
+    /// Sentinel used by the spreadsheet edit-mode exit path — when
+    /// the user leaves edit mode with uncommitted changes we pop a
+    /// confirm dialog; accepting it drops the pending edits.
+    DiscardPendingEdits,
 }
 
 impl ModalAction {
@@ -125,6 +129,7 @@ impl ModalAction {
             ModalAction::DeleteDatabase { database } => format!("delete db {database}"),
             ModalAction::TruncateTable { table } => format!("truncate {table}"),
             ModalAction::AddDatabaseAlias { database } => format!("alias {database}"),
+            ModalAction::DiscardPendingEdits => "discard edits".to_string(),
         }
     }
 }

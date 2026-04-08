@@ -5,6 +5,7 @@
 //! directly.
 
 pub mod app_state;
+pub mod edit_mode;
 pub mod modal;
 pub mod palette;
 

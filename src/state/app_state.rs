@@ -452,6 +452,12 @@ pub struct AppState {
 
     /// Command palette overlay, when open. Toggled with Ctrl+P.
     pub palette: Option<crate::state::palette::CommandPalette>,
+
+    /// Spreadsheet edit-mode state for the Tables tab, when active.
+    /// Toggled with Ctrl+E. While `Some`, key bindings on the main
+    /// Tables pane route through the edit-mode key map instead of
+    /// the read-only data-grid bindings.
+    pub edit_mode: Option<crate::state::edit_mode::EditMode>,
 }
 
 impl AppState {
@@ -486,6 +492,7 @@ impl AppState {
             grid_search_editing: false,
             modal: None,
             palette: None,
+            edit_mode: None,
 
             sql_history: VecDeque::new(),
             history_cursor: None,

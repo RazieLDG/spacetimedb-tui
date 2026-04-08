@@ -74,19 +74,61 @@ pub fn render_tables(
     // ── Grid ──────────────────────────────────────────────────────────────
     match build_table_data(app) {
         Some((headers, rows, title)) => {
-            // Decorate the title with the live search prompt so the
-            // user has a visible cue of what they're typing into.
-            let display_title = match app.grid_search.as_deref() {
-                Some(q) if app.grid_search_editing => {
-                    format!("{title}  /{q}_")
+            // Decorate the title with either the live search prompt
+            // or the spreadsheet edit-mode indicator so the user
+            // always knows which mode they're in.
+            let display_title = if let Some(ref em) = app.edit_mode {
+                format!("{title}  [EDIT — {} pending]", em.pending_count())
+            } else {
+                match app.grid_search.as_deref() {
+                    Some(q) if app.grid_search_editing => {
+                        format!("{title}  /{q}_")
+                    }
+                    Some(q) if !q.is_empty() => format!("{title}  [/{q}]"),
+                    _ => title,
                 }
-                Some(q) if !q.is_empty() => format!("{title}  [/{q}]"),
-                _ => title,
             };
-            let widget = TableGrid::new(&headers, &rows)
+
+            // Flatten the pending edits into the `(row, col, value)`
+            // shape the grid widget consumes.
+            let pending_tuples: Vec<(usize, usize, String)> = app
+                .edit_mode
+                .as_ref()
+                .map(|em| {
+                    em.pending
+                        .iter()
+                        .map(|p| (p.data_row_idx, p.col_idx, p.new_value.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let mut widget = TableGrid::new(&headers, &rows)
                 .title(display_title)
                 .focused(focused)
-                .highlight_query(app.grid_search.as_deref());
+                .highlight_query(app.grid_search.as_deref())
+                .pending_edits(&pending_tuples);
+
+            // If the inline editor is open, tell the grid which
+            // cell to paint as an input box plus where the cursor
+            // sits inside the buffer.
+            if let Some(ref em) = app.edit_mode {
+                if let Some(ref editor) = em.editor {
+                    let data_row = crate::ui::components::table_grid::sorted_data_index(
+                        &rows,
+                        grid_state.sort_col,
+                        grid_state.sort_desc,
+                        grid_state.selected_row,
+                    )
+                    .unwrap_or(0);
+                    widget = widget.active_editor(
+                        data_row,
+                        grid_state.selected_col,
+                        &editor.value,
+                        editor.cursor,
+                    );
+                }
+            }
+
             widget.render(grid_area, buf, grid_state);
         }
         None => {

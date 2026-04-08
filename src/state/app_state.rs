@@ -451,6 +451,9 @@ pub struct AppState {
     /// any. While `Some`, the main key handler routes every event
     /// into the modal until the user accepts or cancels.
     pub modal: Option<crate::state::modal::Modal>,
+
+    /// Command palette overlay, when open. Toggled with Ctrl+P.
+    pub palette: Option<crate::state::palette::CommandPalette>,
 }
 
 impl AppState {
@@ -484,6 +487,7 @@ impl AppState {
             grid_search: None,
             grid_search_editing: false,
             modal: None,
+            palette: None,
 
             sql_history: VecDeque::new(),
             history_cursor: None,

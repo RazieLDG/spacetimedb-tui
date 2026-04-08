@@ -11,6 +11,7 @@ mod app;
 mod config;
 mod state;
 mod ui;
+mod user_config;
 
 use std::io;
 

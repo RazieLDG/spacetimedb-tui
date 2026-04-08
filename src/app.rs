@@ -94,6 +94,13 @@ pub struct App {
     pub event_tx: mpsc::UnboundedSender<AppEvent>,
     /// Receiver half — consumed by the event loop.
     event_rx: mpsc::UnboundedReceiver<AppEvent>,
+    /// Persistent user preferences from `~/.config/spacetimedb-tui/`.
+    /// Read once at startup; the only thing we mutate at runtime is
+    /// `SessionState`, which is written back on quit.
+    user_config: crate::user_config::UserConfig,
+    /// In-memory copy of the last-known session state, applied to the
+    /// UI once the database list arrives in `bootstrap`.
+    pending_session: Option<crate::user_config::SessionState>,
     /// SQL input state — single source of truth for the SQL editor buffer.
     pub sql_input: InputState,
     /// Table grid state for the tables tab.
@@ -150,6 +157,12 @@ impl App {
             auth_token: config.auth_token.clone(),
             last_metrics_fetch: None,
             last_live_clients_fetch: None,
+            user_config: config.user_config.clone(),
+            pending_session: if config.user_config.restore_session {
+                Some(crate::user_config::SessionState::load())
+            } else {
+                None
+            },
         }
     }
 
@@ -233,6 +246,16 @@ impl App {
             if self.state.should_quit {
                 break;
             }
+        }
+
+        // Persist last-known UI state for the next launch.
+        if self.user_config.restore_session {
+            let snapshot = crate::user_config::SessionState {
+                last_database: self.state.selected_database().map(str::to_string),
+                last_table: self.state.selected_table().map(|t| t.table_name.clone()),
+                last_tab: Some(tab_to_index(self.state.current_tab)),
+            };
+            snapshot.save();
         }
 
         Ok(())
@@ -330,6 +353,19 @@ impl App {
     /// Uses explicit `return` statements to make early-exit control flow clear.
     #[allow(clippy::needless_return)]
     async fn handle_key(&mut self, key: KeyEvent) {
+        // ── Command palette intercept ─────────────────────────────────────
+        // The palette owns every key while it's open. Ctrl+C still quits.
+        if self.state.palette.is_some() {
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('c'))
+            {
+                self.state.should_quit = true;
+                return;
+            }
+            self.handle_palette_key(key).await;
+            return;
+        }
+
         // ── Modal dialog intercept ────────────────────────────────────────
         // When a confirm prompt or form is open, the modal owns every
         // key. Ctrl+C still quits as a panic-button escape hatch.
@@ -355,6 +391,12 @@ impl App {
                     // Force a fresh WebSocket connection (e.g. after a server bounce).
                     self.connect_ws().await;
                     self.state.set_notification("Reconnecting WebSocket…".to_string());
+                    return;
+                }
+                KeyCode::Char('p') => {
+                    // Open the command palette.
+                    self.state.palette =
+                        Some(crate::state::palette::CommandPalette::new());
                     return;
                 }
                 KeyCode::Char('a') | KeyCode::Home if self.state.focus == FocusPanel::SqlInput => {
@@ -1397,6 +1439,80 @@ impl App {
         }
     }
 
+    // ── Command palette (Faz 6.3) ────────────────────────────────────────
+
+    /// Route a key event into the active command palette overlay.
+    /// Mirrors `handle_modal_key`'s "take, mutate, put back" pattern
+    /// so we never hold two borrows on `state` at once.
+    async fn handle_palette_key(&mut self, key: KeyEvent) {
+        let Some(mut palette) = self.state.palette.take() else {
+            return;
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                // Cancel — drop the palette entirely.
+                return;
+            }
+            KeyCode::Enter => {
+                if let Some(cmd) = palette.current() {
+                    self.dispatch_command(cmd).await;
+                }
+                return;
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                let len = palette.filter().len();
+                palette.next(len);
+            }
+            KeyCode::Up | KeyCode::BackTab => {
+                palette.prev();
+            }
+            KeyCode::Backspace => {
+                palette.query.backspace();
+                palette.selected = 0;
+            }
+            KeyCode::Char(ch) => {
+                palette.query.insert(ch);
+                palette.selected = 0;
+            }
+            _ => {}
+        }
+
+        self.state.palette = Some(palette);
+    }
+
+    /// Run the action behind a [`Command`].
+    async fn dispatch_command(&mut self, cmd: crate::state::palette::Command) {
+        use crate::state::palette::Command as C;
+        match cmd {
+            C::GotoTables => self.state.current_tab = Tab::Tables,
+            C::GotoSql => self.state.current_tab = Tab::Sql,
+            C::GotoLogs => self.state.current_tab = Tab::Logs,
+            C::GotoMetrics => self.state.current_tab = Tab::Metrics,
+            C::GotoModule => self.state.current_tab = Tab::Module,
+            C::GotoLive => self.state.current_tab = Tab::Live,
+            C::RefreshCurrentView => self.refresh_current_view().await,
+            C::ReconnectWebSocket => {
+                self.connect_ws().await;
+                self.state
+                    .set_notification("Reconnecting WebSocket…".to_string());
+            }
+            C::ToggleHelp => {
+                self.state.show_help = !self.state.show_help;
+                self.state.help_scroll = 0;
+            }
+            C::ExportCsv => {
+                self.export_current_result(crate::ui::export::ExportFormat::Csv);
+            }
+            C::ExportJson => {
+                self.export_current_result(crate::ui::export::ExportFormat::Json);
+            }
+            C::CopyCell => self.copy_selected_cell(),
+            C::CopyRow => self.copy_selected_row(),
+            C::Quit => self.state.should_quit = true,
+        }
+    }
+
     // ── Modal dialogs (Faz 5: write operations) ──────────────────────────
 
     /// Route a key event into the active modal dialog. Called from
@@ -2297,6 +2413,23 @@ impl App {
                         self.state.databases.insert(0, db);
                     }
                 }
+                // If a previous session left a "last database" hint
+                // and we still have no selection, try to land on it.
+                if self.state.selected_database_idx.is_none() {
+                    if let Some(session) = self.pending_session.as_ref() {
+                        if let Some(ref last_db) = session.last_database {
+                            if let Some(idx) =
+                                self.state.databases.iter().position(|d| d == last_db)
+                            {
+                                self.state.select_database(idx);
+                                if let Some(tab_idx) = session.last_tab {
+                                    self.state.current_tab = index_to_tab(tab_idx);
+                                }
+                                self.load_schema().await;
+                            }
+                        }
+                    }
+                }
                 if !self.state.databases.is_empty() && self.state.selected_database_idx.is_none() {
                     self.state.select_database(0);
                     self.load_schema().await;
@@ -2305,9 +2438,25 @@ impl App {
 
             AppEvent::SchemaLoaded(schema) => {
                 self.state.tables = schema.tables.clone();
+                // If we restored a session and the user was looking at
+                // a specific table, jump to it instead of defaulting
+                // to row 0.
                 if !self.state.tables.is_empty() && self.state.selected_table_idx.is_none() {
-                    self.state.selected_table_idx = Some(0);
+                    let restored = self
+                        .pending_session
+                        .as_ref()
+                        .and_then(|s| s.last_table.as_deref())
+                        .and_then(|name| {
+                            self.state
+                                .tables
+                                .iter()
+                                .position(|t| t.table_name == name)
+                        });
+                    self.state.selected_table_idx = Some(restored.unwrap_or(0));
                 }
+                // Session restore is one-shot — don't keep firing it
+                // every time the user navigates to a new database.
+                self.pending_session = None;
                 self.state.current_schema = Some(schema);
                 let table_count = self.state.tables.len();
                 send_event(
@@ -2415,6 +2564,19 @@ impl App {
             }
         }
     }
+}
+
+// ── Session restore helpers (Faz 6) ──────────────────────────────────────────
+
+/// Encode a [`Tab`] as the same `0..6` index used in
+/// `Tab::ALL`. Used when persisting / restoring `SessionState`.
+fn tab_to_index(tab: Tab) -> u8 {
+    Tab::ALL.iter().position(|t| *t == tab).unwrap_or(0) as u8
+}
+
+/// Inverse of [`tab_to_index`].
+fn index_to_tab(idx: u8) -> Tab {
+    Tab::ALL.get(idx as usize).copied().unwrap_or(Tab::Tables)
 }
 
 // ── Modal helpers (Faz 5) ────────────────────────────────────────────────────
@@ -2644,7 +2806,10 @@ pub fn draw_frame(
     sql_grid: &mut TableGridState,
 ) {
     use crate::ui::{
-        components::{help::HelpOverlay, modal::render_modal, status_bar::StatusBar},
+        components::{
+            help::HelpOverlay, modal::render_modal, palette::render_palette,
+            status_bar::StatusBar,
+        },
         layout::render_layout,
         sidebar::render_sidebar,
         tabs::{
@@ -2715,5 +2880,10 @@ pub fn draw_frame(
     // ── Modal dialog (drawn last so it's always on top) ──────────────────
     if let Some(ref modal) = state.modal {
         render_modal(area, frame.buffer_mut(), modal);
+    }
+
+    // ── Command palette (always on top, even above modals) ──────────────
+    if let Some(ref palette) = state.palette {
+        render_palette(area, frame.buffer_mut(), palette);
     }
 }

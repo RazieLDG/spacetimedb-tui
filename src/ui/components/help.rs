@@ -125,6 +125,7 @@ const SECTIONS: &[Section] = &[
             Binding { key: "q",               desc: "Quit the application" },
             Binding { key: "Ctrl+C",          desc: "Force quit" },
             Binding { key: "Ctrl+R",          desc: "Force WebSocket reconnect" },
+            Binding { key: "Ctrl+P",          desc: "Open command palette (fuzzy search)" },
             Binding { key: "?",               desc: "Toggle this help overlay" },
             Binding { key: "r",               desc: "Refresh current view" },
         ],

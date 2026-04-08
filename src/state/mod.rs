@@ -6,6 +6,7 @@
 
 pub mod app_state;
 pub mod modal;
+pub mod palette;
 
 // Re-export the most commonly used items.
 pub use app_state::{

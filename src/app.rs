@@ -819,6 +819,17 @@ impl App {
                 return;
             }
 
+            // `a` on the Databases sidebar panel opens a form to
+            // attach a new alias (human name) to the selected DB.
+            // Non-destructive, no typed-confirm required.
+            KeyCode::Char('a')
+                if self.state.focus == FocusPanel::Sidebar
+                    && self.state.sidebar_focus == SidebarFocus::Databases =>
+            {
+                self.open_add_alias_form();
+                return;
+            }
+
             // Sort — `s` cycles the sort state (off → asc → desc → off)
             // on the currently-selected column.
             KeyCode::Char('s')
@@ -1722,6 +1733,27 @@ impl App {
         ));
     }
 
+    /// Open a one-field form to attach a new alias / human name to
+    /// the currently selected database. Non-destructive — no typed
+    /// confirm required, just a non-empty string.
+    fn open_add_alias_form(&mut self) {
+        let Some(db_name) = self.state.selected_database().map(str::to_string) else {
+            self.state
+                .set_notification("No database selected".to_string());
+            return;
+        };
+        let field = crate::state::modal::FormField::new("New alias")
+            .with_placeholder("e.g. my-app-prod");
+        let action = crate::state::modal::ModalAction::AddDatabaseAlias {
+            database: db_name.clone(),
+        };
+        self.state.modal = Some(crate::state::modal::Modal::form(
+            format!("Add alias to {db_name}"),
+            vec![field],
+            action,
+        ));
+    }
+
     /// Open a typed-confirm form to permanently delete the currently
     /// selected database. The user has to type the database name
     /// verbatim into a single form field — a plain `[y/n]` would
@@ -2005,6 +2037,21 @@ impl App {
                     }
                     self.spawn_delete_database(database, op_label);
                 }
+                ModalAction::AddDatabaseAlias { database } => {
+                    // Non-destructive: accept any non-empty alias
+                    // and forward to the server. Validation (uniqueness,
+                    // formatting) is the server's job.
+                    let alias = fields
+                        .first()
+                        .map(|f| f.input.value.trim().to_string())
+                        .unwrap_or_default();
+                    if alias.is_empty() {
+                        self.state
+                            .set_notification("Alias cannot be empty".to_string());
+                        return;
+                    }
+                    self.spawn_add_alias(database, alias, op_label);
+                }
                 ModalAction::TruncateTable { table } => {
                     // Same typed-confirm pattern as DeleteDatabase.
                     let typed = fields.first().map(|f| f.input.value.trim().to_string());
@@ -2034,6 +2081,58 @@ impl App {
                 }
             },
         }
+    }
+
+    /// Run `client.add_database_alias` on a background task. On
+    /// success we re-fetch the database list so any new alias
+    /// shows up in the sidebar immediately, and re-pull the name
+    /// list for the currently selected DB.
+    fn spawn_add_alias(&self, database: String, alias: String, op_label: String) {
+        let client = self.client.clone();
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            match tokio::time::timeout(
+                HTTP_REQUEST_TIMEOUT,
+                client.add_database_alias(&database, &alias),
+            )
+            .await
+            {
+                Ok(Ok(())) => {
+                    send_event(
+                        &tx,
+                        AppEvent::WriteOpSuccess {
+                            op: op_label,
+                            response: serde_json::json!({
+                                "database": database,
+                                "new_alias": alias,
+                            }),
+                        },
+                    );
+                    // Refresh the sidebar so the new alias can be
+                    // discovered without a restart.
+                    if let Ok(Ok(dbs)) =
+                        tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.list_databases())
+                            .await
+                    {
+                        send_event(&tx, AppEvent::DatabasesLoaded(dbs));
+                    }
+                }
+                Ok(Err(e)) => send_event(
+                    &tx,
+                    AppEvent::WriteOpError {
+                        op: op_label,
+                        error: format!("{e:#}"),
+                    },
+                ),
+                Err(_) => send_event(
+                    &tx,
+                    AppEvent::WriteOpError {
+                        op: op_label,
+                        error: "request timed out".to_string(),
+                    },
+                ),
+            }
+        });
     }
 
     /// Run `client.delete_database` on a background task. On success

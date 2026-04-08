@@ -90,6 +90,7 @@ const SECTIONS: &[Section] = &[
     Section {
         title: "Admin ops (sidebar — Databases)",
         bindings: &[
+            Binding { key: "a",               desc: "Add a new alias / human name to the selected database" },
             Binding { key: "D (shift-d)",     desc: "DELETE database (typed-confirm: type the name)" },
         ],
     },

@@ -210,7 +210,13 @@ impl LogLevel {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LogEntry {
     /// When the message was produced (may be absent in older server versions).
-    #[serde(default)]
+    ///
+    /// Newer SpacetimeDB builds emit `ts` as a `u64` **microseconds
+    /// since the Unix epoch** (e.g. `1775679485454488`), while older
+    /// builds emitted RFC 3339 strings. The custom deserializer
+    /// below accepts either form so we don't blow up the Logs tab
+    /// when the server format shifts under us.
+    #[serde(default, deserialize_with = "deserialize_log_timestamp")]
     pub ts: Option<DateTime<Utc>>,
     /// Log level.
     pub level: LogLevel,
@@ -227,6 +233,43 @@ pub struct LogEntry {
     pub line_number: Option<u32>,
 }
 
+/// Deserialize a SpacetimeDB log-line timestamp.
+///
+/// Accepts three on-the-wire forms:
+/// - `null` / missing → `None`
+/// - `u64` microseconds since epoch → `Some(DateTime)`
+/// - RFC 3339 string → `Some(DateTime)` (legacy format)
+fn deserialize_log_timestamp<'de, D>(d: D) -> Result<Option<DateTime<Utc>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let v: Option<Value> = Option::deserialize(d)?;
+    let Some(v) = v else {
+        return Ok(None);
+    };
+    match v {
+        Value::Null => Ok(None),
+        Value::Number(n) => {
+            let micros = n
+                .as_u64()
+                .or_else(|| n.as_i64().map(|i| i.max(0) as u64))
+                .ok_or_else(|| D::Error::custom("ts: not an integer"))?;
+            let secs = (micros / 1_000_000) as i64;
+            let nsecs = ((micros % 1_000_000) * 1_000) as u32;
+            DateTime::<Utc>::from_timestamp(secs, nsecs)
+                .map(Some)
+                .ok_or_else(|| D::Error::custom("ts: microseconds out of range"))
+        }
+        Value::String(s) => DateTime::parse_from_rfc3339(&s)
+            .map(|dt| Some(dt.with_timezone(&Utc)))
+            .map_err(|e| D::Error::custom(format!("ts: not RFC 3339: {e}"))),
+        other => Err(D::Error::custom(format!(
+            "ts: expected null / integer / string, got {other:?}"
+        ))),
+    }
+}
+
 impl LogEntry {
     /// Format the entry as a single display line.
     #[allow(dead_code)]
@@ -236,6 +279,58 @@ impl LogEntry {
             .map(|t| t.format("%H:%M:%S%.3f").to_string())
             .unwrap_or_else(|| "??:??:??".to_string());
         format!("[{}] {} {}", ts, self.level, self.message)
+    }
+}
+
+#[cfg(test)]
+mod log_entry_tests {
+    use super::*;
+
+    #[test]
+    fn log_entry_parses_integer_microsecond_ts() {
+        // Shape that newer SpacetimeDB builds actually emit —
+        // the exact integer from the user-reported regression.
+        let json = r#"{
+            "level": "Info",
+            "ts": 1775679485454488,
+            "target": "alice_swarm_stdb",
+            "filename": "src/lib.rs",
+            "line_number": 179,
+            "function": "client_connected",
+            "message": "Client connected"
+        }"#;
+        let entry: LogEntry = serde_json::from_str(json).expect("ts integer parses");
+        let ts = entry.ts.expect("ts present");
+        // Microseconds → (secs, nanos) round-trip.
+        assert_eq!(ts.timestamp(), 1_775_679_485);
+        assert_eq!(ts.timestamp_subsec_micros(), 454_488);
+    }
+
+    #[test]
+    fn log_entry_parses_rfc3339_string_ts() {
+        // Legacy RFC 3339 format still works.
+        let json = r#"{
+            "level": "Warn",
+            "ts": "2024-01-02T03:04:05.123Z",
+            "message": "hello"
+        }"#;
+        let entry: LogEntry = serde_json::from_str(json).expect("ts string parses");
+        let ts = entry.ts.expect("ts present");
+        assert_eq!(ts.timestamp(), 1_704_164_645);
+    }
+
+    #[test]
+    fn log_entry_tolerates_missing_ts() {
+        let json = r#"{ "level": "Info", "message": "no ts" }"#;
+        let entry: LogEntry = serde_json::from_str(json).expect("missing ts parses");
+        assert!(entry.ts.is_none());
+    }
+
+    #[test]
+    fn log_entry_tolerates_null_ts() {
+        let json = r#"{ "level": "Info", "ts": null, "message": "null ts" }"#;
+        let entry: LogEntry = serde_json::from_str(json).expect("null ts parses");
+        assert!(entry.ts.is_none());
     }
 }
 

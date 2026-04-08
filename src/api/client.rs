@@ -266,6 +266,93 @@ impl SpacetimeClient {
         serde_json::from_str(&text).context("Failed to decode reducer response")
     }
 
+    /// Attach a new name (alias) to an existing database.
+    ///
+    /// SpacetimeDB endpoint: `POST /v1/database/<database>/names`
+    /// Body: a bare JSON string containing the new name.
+    ///
+    /// The docs use the word "domain" for what we call an alias —
+    /// a database can have any number of human-readable names and
+    /// every `GET /schema` / `POST /sql` call works with any of them.
+    #[instrument(skip(self), fields(db = %database, alias = %alias))]
+    pub async fn add_database_alias(&self, database: &str, alias: &str) -> Result<()> {
+        let url = format!("{}/v1/database/{}/names", self.base_url, database);
+        debug!("Adding alias '{alias}' to {database}");
+
+        // The endpoint expects a bare JSON string in the body, e.g. `"foo"`.
+        let body = serde_json::to_string(alias)
+            .context("Failed to encode alias as JSON string")?;
+
+        let resp = self
+            .post(&url)
+            .body(body)
+            .header(header::CONTENT_TYPE, "application/json")
+            .send()
+            .await
+            .context("Add-alias request failed")?;
+
+        let status = resp.status();
+        if status.is_success() {
+            // The server returns `{"Success": {...}}` on happy path
+            // but may return `{"PermissionDenied": {...}}` on refusal.
+            // We don't surface the body; the status is authoritative.
+            return Ok(());
+        }
+        let body = resp.text().await.unwrap_or_default();
+        let snip: String = body.chars().take(200).collect();
+        match status.as_u16() {
+            401 | 403 => bail!(
+                "Adding alias to '{database}' rejected (HTTP {status}). \
+                 The current token does not own this database."
+            ),
+            404 => bail!("Database '{database}' not found (HTTP 404)"),
+            409 => bail!(
+                "Alias '{alias}' already exists (HTTP 409). Pick a \
+                 different name or reuse the existing one."
+            ),
+            _ => bail!("Add-alias HTTP {status}: {snip}"),
+        }
+    }
+
+    /// List every alias / human name this database can be reached
+    /// under. Used by the sidebar to show the full list alongside
+    /// the selected identity.
+    ///
+    /// SpacetimeDB endpoint: `GET /v1/database/<database>/names`
+    /// Response: `{"names": ["alias1", "alias2", ...]}`
+    #[instrument(skip(self), fields(db = %database))]
+    pub async fn get_database_names(&self, database: &str) -> Result<Vec<String>> {
+        let url = format!("{}/v1/database/{}/names", self.base_url, database);
+        let resp = self
+            .get(&url)
+            .send()
+            .await
+            .context("get-names request failed")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            let snip: String = body.chars().take(200).collect();
+            bail!("get-names HTTP {status}: {snip}");
+        }
+        let raw: Value = resp.json().await.context("Failed to decode names response")?;
+        // Response wraps the list: `{"names":[...]}`. Tolerate a
+        // bare array too in case that ever changes.
+        let list = match raw {
+            Value::Object(ref o) => o
+                .get("names")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default(),
+            Value::Array(arr) => arr,
+            _ => Vec::new(),
+        };
+        Ok(list
+            .into_iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect())
+    }
+
     /// Permanently delete a database.
     ///
     /// SpacetimeDB endpoint: `DELETE /v1/database/<database>`
@@ -403,29 +490,6 @@ impl SpacetimeClient {
             }
         }
 
-        Ok(names)
-    }
-
-    /// Resolve a database identity to its registered name(s).
-    ///
-    /// SpacetimeDB 2.0 endpoint: `GET /v1/database/{identity}/names`
-    async fn get_database_names(&self, identity: &str) -> Result<Vec<String>> {
-        let url = format!("{}/v1/database/{}/names", self.base_url, identity);
-        let resp = self
-            .get(&url)
-            .send()
-            .await
-            .context("get_database_names request failed")?;
-        if !resp.status().is_success() {
-            bail!("HTTP {}", resp.status());
-        }
-        let raw: Value = resp.json().await.context("Failed to decode names response")?;
-        // Response: {"names": ["db-name"]}
-        let names = raw
-            .get("names")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
-            .unwrap_or_default();
         Ok(names)
     }
 

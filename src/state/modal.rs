@@ -104,6 +104,13 @@ pub enum ModalAction {
     TruncateTable {
         table: String,
     },
+    /// Attach a new alias (human name) to a database via
+    /// `POST /v1/database/<database>/names`. One-field form where
+    /// the user types the desired new alias. Non-destructive — no
+    /// typed-confirm required.
+    AddDatabaseAlias {
+        database: String,
+    },
 }
 
 impl ModalAction {
@@ -117,6 +124,7 @@ impl ModalAction {
             ModalAction::DeleteRow { table, .. } => format!("delete from {table}"),
             ModalAction::DeleteDatabase { database } => format!("delete db {database}"),
             ModalAction::TruncateTable { table } => format!("truncate {table}"),
+            ModalAction::AddDatabaseAlias { database } => format!("alias {database}"),
         }
     }
 }
@@ -232,6 +240,13 @@ mod tests {
             }
             .op_label(),
             "truncate events"
+        );
+        assert_eq!(
+            ModalAction::AddDatabaseAlias {
+                database: "mydb".to_string(),
+            }
+            .op_label(),
+            "alias mydb"
         );
     }
 

@@ -30,18 +30,22 @@ pub enum Tab {
     Metrics,
     /// Module inspector (reducers, tables, scheduled).
     Module,
+    /// Real-time transaction stream + connected-client list.
+    Live,
 }
 
 impl Tab {
-    pub const ALL: &'static [Tab] = &[Tab::Tables, Tab::Sql, Tab::Logs, Tab::Metrics, Tab::Module];
+    pub const ALL: &'static [Tab] =
+        &[Tab::Tables, Tab::Sql, Tab::Logs, Tab::Metrics, Tab::Module, Tab::Live];
 
     pub fn title(&self) -> &'static str {
         match self {
-            Tab::Tables   => "Tables",
-            Tab::Sql  => "SQL",
+            Tab::Tables  => "Tables",
+            Tab::Sql     => "SQL",
             Tab::Logs    => "Logs",
             Tab::Metrics => "Metrics",
             Tab::Module  => "Module",
+            Tab::Live    => "Live",
         }
     }
 
@@ -157,6 +161,47 @@ impl ConnectionInfo {
 
 /// Maximum number of SQL history entries retained.
 const SQL_HISTORY_LIMIT: usize = 200;
+
+/// A single row pushed into the Live tab's transaction feed.
+///
+/// Derived from [`crate::api::types::WsServerMessage::TransactionUpdate`]
+/// when one arrives over the subscription WebSocket. Only the bits the
+/// UI actually needs are kept so the buffer stays small even under
+/// heavy activity.
+#[derive(Debug, Clone)]
+pub struct TxLogEntry {
+    /// When we observed the update (client clock).
+    pub observed_at: DateTime<Utc>,
+    /// Caller identity (may be an empty string for system-originated
+    /// transactions).
+    pub caller: String,
+    /// Per-table row counts affected by this transaction, in the
+    /// server's original order. `(table, inserts, deletes)`.
+    pub tables: Vec<(String, usize, usize)>,
+    /// Whether the transaction committed successfully. `None` when
+    /// the server didn't include a status field.
+    pub committed: Option<bool>,
+}
+
+impl TxLogEntry {
+    /// Sum of row inserts across every table touched by this tx.
+    pub fn total_inserts(&self) -> usize {
+        self.tables.iter().map(|(_, i, _)| *i).sum()
+    }
+    /// Sum of row deletes across every table touched by this tx.
+    pub fn total_deletes(&self) -> usize {
+        self.tables.iter().map(|(_, _, d)| *d).sum()
+    }
+}
+
+/// One row in the Live tab's connected-client list.
+#[derive(Debug, Clone)]
+pub struct LiveClientEntry {
+    /// Hex identity or connection id (whichever the server returned).
+    pub identity: String,
+    /// When the client first connected (best-effort from `st_client`).
+    pub connected_at: Option<DateTime<Utc>>,
+}
 
 /// Result of advancing the SQL history cursor forward (↓).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -286,6 +331,13 @@ pub struct AppState {
     /// pushed for that table since the most recent `InitialSubscription`.
     /// Used by the status bar / Tables view to surface live updates.
     pub live_table_data: HashMap<String, Vec<serde_json::Value>>,
+    /// Rolling buffer of transactions observed over the WebSocket
+    /// subscription. Used by the Live tab to show a real-time feed of
+    /// what's happening in the database.
+    pub tx_log: VecDeque<TxLogEntry>,
+    /// Rolling list of connected clients, polled periodically from
+    /// `st_client`. Populated by the Live tab's background refresh.
+    pub live_clients: Vec<LiveClientEntry>,
     /// Whether the live-subscription WebSocket is currently connected.
     pub ws_connected: bool,
     /// If the WS task is waiting to reconnect, the instant at which the
@@ -412,6 +464,8 @@ impl AppState {
             query_result: None,
             table_browse_result: None,
             live_table_data: HashMap::new(),
+            tx_log: VecDeque::new(),
+            live_clients: Vec::new(),
             ws_connected: false,
             ws_reconnect_deadline: None,
             ws_reconnect_attempt: 0,
@@ -762,9 +816,12 @@ mod tests {
 
     #[test]
     fn test_tab_cycle() {
+        // Tables → Sql → Logs → Metrics → Module → Live → Tables (wraps).
         assert_eq!(Tab::Tables.next(), Tab::Sql);
-        assert_eq!(Tab::Module.next(), Tab::Tables);
-        assert_eq!(Tab::Tables.prev(), Tab::Module);
+        assert_eq!(Tab::Module.next(), Tab::Live);
+        assert_eq!(Tab::Live.next(), Tab::Tables);
+        assert_eq!(Tab::Tables.prev(), Tab::Live);
+        assert_eq!(Tab::Live.prev(), Tab::Module);
     }
 
     #[test]

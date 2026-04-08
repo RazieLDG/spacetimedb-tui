@@ -36,7 +36,7 @@ const SECTIONS: &[Section] = &[
         title: "Navigation",
         bindings: &[
             Binding { key: "Tab / Shift+Tab", desc: "Switch panel focus" },
-            Binding { key: "1-5",             desc: "Jump to tab (Tables/SQL/Logs/Metrics/Module)" },
+            Binding { key: "1-6",             desc: "Jump to tab (Tables/SQL/Logs/Metrics/Module/Live)" },
             Binding { key: "j / ↓",           desc: "Move selection down" },
             Binding { key: "k / ↑",           desc: "Move selection up" },
             Binding { key: "h / ←",           desc: "Sidebar: step up (Tables → Databases) / focus sidebar from main" },
@@ -85,6 +85,13 @@ const SECTIONS: &[Section] = &[
             Binding { key: "f",               desc: "Cycle minimum log level filter" },
             Binding { key: "r",               desc: "Refresh logs" },
             Binding { key: "c",               desc: "Clear log buffer" },
+        ],
+    },
+    Section {
+        title: "Live",
+        bindings: &[
+            Binding { key: "6",               desc: "Jump to the Live tab (tx feed + clients)" },
+            Binding { key: "r",               desc: "Force re-subscribe to the WebSocket feed" },
         ],
     },
     Section {

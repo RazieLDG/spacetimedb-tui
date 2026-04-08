@@ -65,6 +65,8 @@ pub enum AppEvent {
     LogsLoaded(Vec<crate::api::types::LogEntry>),
     /// Metrics fetched.
     MetricsLoaded(crate::state::MetricsSnapshot),
+    /// Live tab's periodic `st_client` poll returned.
+    LiveClientsLoaded(Vec<crate::state::app_state::LiveClientEntry>),
     /// A live log line from WebSocket.
     LogLine(crate::api::types::LogEntry),
     /// Ping result.
@@ -100,10 +102,15 @@ pub struct App {
     /// Last time the metrics tab pulled fresh data — used to throttle the
     /// background refresh task to one fetch every `METRICS_REFRESH_INTERVAL`.
     last_metrics_fetch: Option<Instant>,
+    /// Last time the Live tab polled `st_client` for the connected-client
+    /// list. Throttled the same way metrics are.
+    last_live_clients_fetch: Option<Instant>,
 }
 
 /// How often the Metrics tab automatically refreshes server-side metrics.
 const METRICS_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+/// How often the Live tab re-polls `st_client` for connected clients.
+const LIVE_CLIENTS_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Maximum time we wait for any single HTTP-backed background request before
 /// surfacing a timeout error to the user.
@@ -135,6 +142,7 @@ impl App {
             ws_url: config.ws_url.clone(),
             auth_token: config.auth_token.clone(),
             last_metrics_fetch: None,
+            last_live_clients_fetch: None,
         }
     }
 
@@ -209,6 +217,9 @@ impl App {
             // Metrics tab is visible.
             self.maybe_refresh_metrics();
 
+            // Throttled poll of st_client for the Live tab.
+            self.maybe_refresh_live_clients();
+
             // Expire notifications
             self.state.tick_notifications(Duration::from_secs(5));
 
@@ -218,6 +229,63 @@ impl App {
         }
 
         Ok(())
+    }
+
+    /// If the Live tab is visible and we haven't polled `st_client`
+    /// recently, spawn a background SQL query that fills
+    /// `state.live_clients`.
+    fn maybe_refresh_live_clients(&mut self) {
+        if self.state.current_tab != Tab::Live {
+            return;
+        }
+        let due = match self.last_live_clients_fetch {
+            None => true,
+            Some(t) => t.elapsed() >= LIVE_CLIENTS_REFRESH_INTERVAL,
+        };
+        if !due {
+            return;
+        }
+        let db = match self.state.selected_database() {
+            Some(d) => d.to_string(),
+            None => return,
+        };
+        self.last_live_clients_fetch = Some(Instant::now());
+
+        let client = self.client.clone();
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            // `st_client` is a system table; we cap the result so a
+            // huge production deployment doesn't hang the UI.
+            let sql = "SELECT * FROM st_client LIMIT 200";
+            let fetch = tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.query_sql(&db, sql));
+            let Ok(Ok(result)) = fetch.await else {
+                // Silent — `st_client` may not be exposed on some
+                // deployments; we don't want to spam the error popup.
+                return;
+            };
+            let clients: Vec<crate::state::app_state::LiveClientEntry> = result
+                .rows
+                .iter()
+                .map(|row| {
+                    // Best-effort: pick the first string-ish cell as
+                    // the identity. We don't have a reliable schema
+                    // for st_client across server versions.
+                    let identity = row
+                        .iter()
+                        .find_map(|v| match v {
+                            serde_json::Value::String(s) => Some(s.clone()),
+                            serde_json::Value::Number(n) => Some(n.to_string()),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| "(unknown)".to_string());
+                    crate::state::app_state::LiveClientEntry {
+                        identity,
+                        connected_at: None,
+                    }
+                })
+                .collect();
+            send_event(&tx, AppEvent::LiveClientsLoaded(clients));
+        });
     }
 
     /// If the user is on the Metrics tab and we haven't fetched metrics
@@ -474,6 +542,10 @@ impl App {
             }
             KeyCode::Char('5') => {
                 self.state.current_tab = Tab::Module;
+                return;
+            }
+            KeyCode::Char('6') => {
+                self.state.current_tab = Tab::Live;
                 return;
             }
 
@@ -1404,6 +1476,12 @@ impl App {
             Tab::Module => {
                 self.load_schema().await;
             }
+            Tab::Live => {
+                // The Live tab is driven entirely by the WebSocket
+                // subscription + the client-list polling task, so a
+                // manual refresh just re-subscribes.
+                self.connect_ws().await;
+            }
         }
     }
 
@@ -1554,6 +1632,16 @@ impl App {
         }
     }
 
+    /// Push a transaction entry onto the Live-tab feed, capping the
+    /// buffer so a chatty module can't grow it without bound.
+    fn push_tx_log_entry(&mut self, entry: crate::state::TxLogEntry) {
+        const MAX: usize = 500;
+        if self.state.tx_log.len() >= MAX {
+            self.state.tx_log.pop_front();
+        }
+        self.state.tx_log.push_back(entry);
+    }
+
     /// Apply a decoded WebSocket server message to the application state.
     fn handle_ws_server_message(&mut self, msg: crate::api::types::WsServerMessage) {
         use crate::api::types::WsServerMessage;
@@ -1580,8 +1668,13 @@ impl App {
                 // (the server's row identity model isn't exposed in the JSON
                 // protocol, so this is a best-effort match).
                 let mut total_changes = 0usize;
+                let mut per_table: Vec<(String, usize, usize)> = Vec::new();
                 for table_update in payload.database_update.tables {
-                    total_changes += table_update.inserts.len() + table_update.deletes.len();
+                    let inserts_n = table_update.inserts.len();
+                    let deletes_n = table_update.deletes.len();
+                    total_changes += inserts_n + deletes_n;
+                    per_table.push((table_update.table_name.clone(), inserts_n, deletes_n));
+
                     let entry = self
                         .state
                         .live_table_data
@@ -1595,6 +1688,27 @@ impl App {
                 if total_changes > 0 {
                     tracing::debug!("Transaction update: {total_changes} row changes");
                 }
+
+                // Push a summary row into the Live tab's transaction feed.
+                // Extract caller identity + status from the payload's
+                // free-form `extra` map (which preserves fields the
+                // server added after we wrote this code).
+                let caller = payload
+                    .extra
+                    .get("caller_identity")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                let committed = payload
+                    .status
+                    .as_ref()
+                    .map(|s| matches!(s, crate::api::types::TransactionStatus::Committed));
+                self.push_tx_log_entry(crate::state::TxLogEntry {
+                    observed_at: chrono::Utc::now(),
+                    caller,
+                    tables: per_table,
+                    committed,
+                });
             }
             WsServerMessage::IdentityToken(payload) => {
                 tracing::info!(
@@ -1704,6 +1818,10 @@ impl App {
                 self.state.update_metrics(snapshot);
             }
 
+            AppEvent::LiveClientsLoaded(clients) => {
+                self.state.live_clients = clients;
+            }
+
             AppEvent::LogLine(entry) => {
                 self.state.push_log(entry);
             }
@@ -1768,6 +1886,7 @@ pub fn draw_frame(
         layout::render_layout,
         sidebar::render_sidebar,
         tabs::{
+            live::render_live,
             logs::render_logs,
             metrics::render_metrics,
             module::render_module,
@@ -1817,6 +1936,9 @@ pub fn draw_frame(
         crate::state::Tab::Module => {
             let selected = state.module_selected_reducer;
             render_module(content_areas.content, frame.buffer_mut(), state, selected);
+        }
+        crate::state::Tab::Live => {
+            render_live(content_areas.content, frame.buffer_mut(), state);
         }
     }
 

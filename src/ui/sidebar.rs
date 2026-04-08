@@ -222,8 +222,19 @@ fn build_items(app: &AppState) -> Vec<TreeItem> {
         // If this DB is selected, show its tables below it
         if is_selected_db {
             if app.tables.is_empty() {
+                // Three terminal states the placeholder can be in:
+                //   1. schema fetch in flight → spinner
+                //   2. schema fetch failed    → error hint
+                //   3. neither flag set       → truly empty schema
+                let placeholder = if app.schema_loading {
+                    "      (loading…)"
+                } else if app.schema_load_failed {
+                    "      (schema unavailable — press r to retry)"
+                } else {
+                    "      (no tables)"
+                };
                 items.push(TreeItem {
-                    label: "      (loading…)".to_string(),
+                    label: placeholder.to_string(),
                     fg: MUTED,
                     is_db: false,
                     idx: usize::MAX,

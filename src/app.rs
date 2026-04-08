@@ -45,6 +45,10 @@ pub enum AppEvent {
     DatabasesLoaded(Vec<String>),
     /// Tables / schema fetched for the selected database.
     SchemaLoaded(crate::api::types::SchemaResponse),
+    /// Schema fetch failed — carries a pre-formatted error message.
+    /// Separate from the generic `Error` variant so the handler can
+    /// clear `schema_loading` and flip `schema_load_failed` atomically.
+    SchemaError(String),
     /// SQL query result arrived (user-typed SQL in the SQL console tab).
     QueryResult {
         result: crate::api::types::QueryResult,
@@ -1213,6 +1217,12 @@ impl App {
         self.state.tables.clear();
         self.state.selected_table_idx = None;
         self.state.current_schema = None;
+        // Track the in-flight schema fetch so the sidebar can show
+        // a real loading spinner and clear it on both success and
+        // failure (fixes the "stuck on (loading…)" bug after HTTP
+        // 500s).
+        self.state.schema_loading = true;
+        self.state.schema_load_failed = false;
 
         let client = self.client.clone();
         let tx = self.event_tx.clone();
@@ -1221,11 +1231,11 @@ impl App {
                 Ok(Ok(schema)) => send_event(&tx, AppEvent::SchemaLoaded(schema)),
                 Ok(Err(e)) => send_event(
                     &tx,
-                    AppEvent::Error(format!("Schema load failed: {e:#}")),
+                    AppEvent::SchemaError(format!("Schema load failed: {e:#}")),
                 ),
                 Err(_) => send_event(
                     &tx,
-                    AppEvent::Error("Schema load timed out".to_string()),
+                    AppEvent::SchemaError("Schema load timed out".to_string()),
                 ),
             }
         });
@@ -2717,7 +2727,16 @@ impl App {
     async fn refresh_current_view(&mut self) {
         match self.state.current_tab {
             Tab::Tables => {
-                self.load_table_data().await;
+                // If the previous schema fetch failed, `r` should
+                // retry it instead of running a no-op table load
+                // against a schema we don't have.
+                if self.state.schema_load_failed
+                    || self.state.current_schema.is_none()
+                {
+                    self.load_schema().await;
+                } else {
+                    self.load_table_data().await;
+                }
             }
             Tab::Sql => {
                 // Re-execute last SQL if any
@@ -3048,6 +3067,8 @@ impl App {
             }
 
             AppEvent::SchemaLoaded(schema) => {
+                self.state.schema_loading = false;
+                self.state.schema_load_failed = false;
                 self.state.tables = schema.tables.clone();
                 // If we restored a session and the user was looking at
                 // a specific table, jump to it instead of defaulting
@@ -3076,6 +3097,15 @@ impl App {
                 );
                 // Establish WebSocket subscription for live data
                 self.connect_ws().await;
+            }
+
+            AppEvent::SchemaError(msg) => {
+                // Clear the in-flight flag so the sidebar drops its
+                // "(loading…)" placeholder, then flip the terminal
+                // "failed" flag so it can show an error hint instead.
+                self.state.schema_loading = false;
+                self.state.schema_load_failed = true;
+                self.state.set_error(msg);
             }
 
             AppEvent::QueryResult { result, duration, sql } => {

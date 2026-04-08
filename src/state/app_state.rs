@@ -357,6 +357,17 @@ pub struct AppState {
     pub result_scroll_col: usize,
     /// Whether a query is currently in flight.
     pub query_loading: bool,
+    /// Whether a `get_schema` request is currently in flight for
+    /// the active database. Used by the sidebar to distinguish
+    /// "waiting for the first schema to arrive" (show `(loading…)`)
+    /// from "schema load failed / no tables" (show a terminal
+    /// placeholder so the UI doesn't spin forever).
+    pub schema_loading: bool,
+    /// Set to `true` after a schema load returns a non-success
+    /// status. Cleared the next time `load_schema` kicks off. The
+    /// sidebar reads this to show `(schema unavailable)` instead of
+    /// the spinning loading placeholder.
+    pub schema_load_failed: bool,
 
     // ------------------------------------------------------------------
     // Grid search
@@ -487,6 +498,8 @@ impl AppState {
             result_scroll_row: 0,
             result_scroll_col: 0,
             query_loading: false,
+            schema_loading: false,
+            schema_load_failed: false,
 
             grid_search: None,
             grid_search_editing: false,

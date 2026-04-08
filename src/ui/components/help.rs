@@ -45,6 +45,17 @@ const SECTIONS: &[Section] = &[
             Binding { key: "G / End",         desc: "Jump to last item" },
             Binding { key: "Enter",           desc: "Select / confirm" },
             Binding { key: "Esc / Backspace", desc: "Sidebar: step up tree; otherwise focus sidebar" },
+            Binding { key: "/ (slash)",       desc: "Sidebar search: filter databases / tables as you type" },
+        ],
+    },
+    Section {
+        title: "Help overlay",
+        bindings: &[
+            Binding { key: "?",               desc: "Toggle this overlay" },
+            Binding { key: "j / k / ↓ ↑",     desc: "Scroll the help text line by line" },
+            Binding { key: "g / Home",        desc: "Jump to the top" },
+            Binding { key: "G / End",         desc: "Jump to the bottom" },
+            Binding { key: "Esc / q",         desc: "Close the overlay" },
         ],
     },
     Section {
@@ -183,9 +194,11 @@ impl HelpOverlay {
 
 impl Widget for HelpOverlay {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        // Centre the popup
-        let popup_w = area.width.min(62);
-        let popup_h = area.height.min(32);
+        // Centre the popup — grow to consume almost the whole screen
+        // so the long binding list fits without forcing the user to
+        // scroll through a narrow peephole.
+        let popup_w = area.width.saturating_sub(4).min(78);
+        let popup_h = area.height.saturating_sub(2);
         let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
         let popup_y = area.y + (area.height.saturating_sub(popup_h)) / 2;
         let popup_area = Rect::new(popup_x, popup_y, popup_w, popup_h);

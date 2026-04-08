@@ -64,9 +64,10 @@ pub enum ModalAction {
         table: String,
         column_types: Vec<String>,
     },
-    /// Update a single row by primary key. The form's first field is
-    /// always the WHERE clause value (the existing PK), the rest are
-    /// the new column values.
+    /// Update a single row by primary key. The PK column may be at
+    /// any index — `pk_index` tells the dispatcher which form field
+    /// is read-only and which `column_types[i]` to use for the
+    /// WHERE clause literal.
     UpdateRow {
         table: String,
         pk_column: String,
@@ -75,6 +76,10 @@ pub enum ModalAction {
         /// WHERE clause survives any edits the user makes to the
         /// PK field.
         original_pk: String,
+        /// Index of the PK column inside `column_types` / `fields`,
+        /// so the dispatcher knows which field to skip when
+        /// generating the SET clause.
+        pk_index: usize,
     },
     /// Delete a single row identified by `where_sql` (already
     /// quoted / formatted by the caller). Confirm dialog only.

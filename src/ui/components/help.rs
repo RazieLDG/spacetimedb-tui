@@ -144,6 +144,20 @@ impl HelpOverlay {
     pub fn new(scroll: usize) -> Self {
         Self { scroll }
     }
+
+    /// Total number of lines the overlay would render with the
+    /// current section list. Used by `app.rs` to clamp the scroll
+    /// offset so a user mashing `↓` doesn't push the state into
+    /// nonsense values that take dozens of `↑` presses to recover.
+    pub fn total_lines() -> usize {
+        let mut n = 0usize;
+        for section in SECTIONS {
+            n += 1; // header
+            n += section.bindings.len();
+            n += 1; // blank line between sections
+        }
+        n
+    }
 }
 
 impl Widget for HelpOverlay {

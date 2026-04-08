@@ -218,7 +218,10 @@ impl App {
                         self.handle_key(key).await;
                     }
                     Event::Resize(_, _) => {
-                        self.state.needs_redraw = true;
+                        // Crossterm always redraws the next frame after a
+                        // resize since we're in non-blocking poll mode, so
+                        // we just consume the event and let the tick rate
+                        // handle the redraw.
                     }
                     Event::Mouse(_) => {}
                     _ => {}
@@ -452,15 +455,30 @@ impl App {
 
         // ── Help overlay ──────────────────────────────────────────────────
         if self.state.show_help {
+            // Clamp the scroll offset to the actual number of lines so a
+            // user mashing `↓` doesn't push the value into the millions
+            // (and then have to bash `↑` for ages to recover).
+            let max_scroll = crate::ui::components::help::HelpOverlay::total_lines()
+                .saturating_sub(1);
             match key.code {
                 KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
                     self.state.show_help = false;
                 }
                 KeyCode::Char('j') | KeyCode::Down => {
-                    self.state.help_scroll = self.state.help_scroll.saturating_add(1);
+                    self.state.help_scroll = self
+                        .state
+                        .help_scroll
+                        .saturating_add(1)
+                        .min(max_scroll);
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
                     self.state.help_scroll = self.state.help_scroll.saturating_sub(1);
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    self.state.help_scroll = 0;
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    self.state.help_scroll = max_scroll;
                 }
                 _ => {}
             }
@@ -1635,6 +1653,10 @@ impl App {
             None => return,
         };
 
+        // Pick the PK column up-front so we can mark it read-only in
+        // the form labels and use it in the WHERE clause below.
+        let (pk_idx, pk_column) = pick_primary_key(&table);
+
         // Pre-fill each form field with the row's current display value.
         let fields: Vec<crate::state::modal::FormField> = table
             .columns
@@ -1642,7 +1664,7 @@ impl App {
             .enumerate()
             .map(|(i, c)| {
                 let type_label = type_tag(&c.col_type);
-                let pk_marker = if i == 0 { " — PK (read-only)" } else { "" };
+                let pk_marker = if i == pk_idx { " — PK (read-only)" } else { "" };
                 let mut field = crate::state::modal::FormField::new(format!(
                     "{} ({}{pk_marker})",
                     c.col_name, type_label
@@ -1661,9 +1683,8 @@ impl App {
             .iter()
             .map(|c| type_tag(&c.col_type))
             .collect();
-        let pk_column = table.columns[0].col_name.clone();
         let original_pk = row
-            .first()
+            .get(pk_idx)
             .map(crate::ui::tabs::tables::value_to_display)
             .unwrap_or_default();
 
@@ -1672,6 +1693,7 @@ impl App {
             pk_column,
             column_types,
             original_pk,
+            pk_index: pk_idx,
         };
         self.state.modal = Some(crate::state::modal::Modal::form(
             format!("Update row in {}", table.table_name),
@@ -1717,11 +1739,11 @@ impl App {
             None => return,
         };
 
-        let pk_col = &table.columns[0];
-        let pk_name = pk_col.col_name.clone();
+        let (pk_idx, pk_name) = pick_primary_key(&table);
+        let pk_col = &table.columns[pk_idx];
         let pk_type = type_tag(&pk_col.col_type);
         let pk_value_raw = row
-            .first()
+            .get(pk_idx)
             .map(crate::ui::tabs::tables::value_to_display)
             .unwrap_or_default();
         let pk_literal = sql_literal(&pk_value_raw, &pk_type);
@@ -1880,15 +1902,16 @@ impl App {
                     pk_column,
                     column_types,
                     original_pk,
+                    pk_index,
                 } => {
-                    // First field is always the PK display (read-only
-                    // logically); the remaining fields are the new
-                    // column values in declaration order.
+                    // Skip the PK field when generating the SET clause
+                    // — it's the WHERE column, not an assignment.
                     let assignments: Vec<String> = fields
                         .iter()
-                        .skip(1)
-                        .zip(column_types.iter().skip(1))
-                        .map(|(f, t)| {
+                        .zip(column_types.iter())
+                        .enumerate()
+                        .filter(|(i, _)| *i != pk_index)
+                        .map(|(_, (f, t))| {
                             let col = extract_field_name(&f.label);
                             format!("{col} = {}", sql_literal(&f.input.value, t))
                         })
@@ -1897,7 +1920,7 @@ impl App {
                         self.state.set_notification("Nothing to update".to_string());
                         return;
                     }
-                    let pk_type = column_types.first().cloned().unwrap_or_default();
+                    let pk_type = column_types.get(pk_index).cloned().unwrap_or_default();
                     let where_value = sql_literal(&original_pk, &pk_type);
                     let sql = format!(
                         "UPDATE {table} SET {} WHERE {pk_column} = {where_value}",
@@ -2566,6 +2589,51 @@ impl App {
     }
 }
 
+// ── PK detection helper ──────────────────────────────────────────────────────
+
+/// Pick the most likely primary-key column for a table.
+///
+/// SpacetimeDB's v9 schema JSON doesn't expose a reliable
+/// "primary key" flag, so this is a heuristic with two fallbacks:
+///   1. The first column flagged `is_autoinc` — autoinc columns are
+///      almost always the table's identity in real schemas.
+///   2. The first column whose name is `id`, `pk`, or ends in `_id`
+///      and matches the table's bare name (e.g. `user_id` for `users`).
+///   3. Column 0 — last-resort default.
+///
+/// Returns `(index, column_name)`. Used by row update / delete so the
+/// WHERE clause targets the right column instead of always assuming
+/// it's column zero.
+fn pick_primary_key(table: &crate::api::types::TableInfo) -> (usize, String) {
+    // 1. autoinc wins.
+    if let Some((i, c)) = table
+        .columns
+        .iter()
+        .enumerate()
+        .find(|(_, c)| c.is_autoinc)
+    {
+        return (i, c.col_name.clone());
+    }
+    // 2. naming convention.
+    let lower = table.table_name.to_ascii_lowercase();
+    let stem = lower.trim_end_matches('s');
+    for (i, c) in table.columns.iter().enumerate() {
+        let n = c.col_name.to_ascii_lowercase();
+        if n == "id" || n == "pk" || n == format!("{stem}_id") {
+            return (i, c.col_name.clone());
+        }
+    }
+    // 3. fallback.
+    (
+        0,
+        table
+            .columns
+            .first()
+            .map(|c| c.col_name.clone())
+            .unwrap_or_default(),
+    )
+}
+
 // ── Session restore helpers (Faz 6) ──────────────────────────────────────────
 
 /// Encode a [`Tab`] as the same `0..6` index used in
@@ -2710,6 +2778,89 @@ fn parse_prometheus_metrics(text: &str) -> crate::state::MetricsSnapshot {
 #[cfg(test)]
 mod modal_helper_tests {
     use super::*;
+
+    use crate::api::types::{ColumnInfo, TableInfo};
+
+    fn make_col(name: &str, autoinc: bool) -> ColumnInfo {
+        ColumnInfo {
+            col_id: 0,
+            col_name: name.to_string(),
+            col_type: serde_json::json!("U64"),
+            is_autoinc: autoinc,
+        }
+    }
+
+    fn make_table(name: &str, cols: Vec<ColumnInfo>) -> TableInfo {
+        TableInfo {
+            table_name: name.to_string(),
+            product_type_ref: 0,
+            table_type: "user".to_string(),
+            table_access: "public".to_string(),
+            columns: cols,
+            indexes: vec![],
+            constraints: vec![],
+        }
+    }
+
+    #[test]
+    fn pick_primary_key_prefers_autoinc() {
+        let t = make_table(
+            "users",
+            vec![
+                make_col("name", false),
+                make_col("user_id", true), // autoinc — should win
+                make_col("email", false),
+            ],
+        );
+        let (idx, name) = pick_primary_key(&t);
+        assert_eq!(idx, 1);
+        assert_eq!(name, "user_id");
+    }
+
+    #[test]
+    fn pick_primary_key_falls_back_to_id_naming() {
+        let t = make_table(
+            "users",
+            vec![
+                make_col("name", false),
+                make_col("id", false), // naming convention
+                make_col("email", false),
+            ],
+        );
+        let (idx, name) = pick_primary_key(&t);
+        assert_eq!(idx, 1);
+        assert_eq!(name, "id");
+    }
+
+    #[test]
+    fn pick_primary_key_falls_back_to_user_id_for_users_table() {
+        let t = make_table(
+            "users",
+            vec![
+                make_col("name", false),
+                make_col("email", false),
+                make_col("user_id", false),
+            ],
+        );
+        let (idx, name) = pick_primary_key(&t);
+        assert_eq!(idx, 2);
+        assert_eq!(name, "user_id");
+    }
+
+    #[test]
+    fn pick_primary_key_last_resort_is_first_column() {
+        let t = make_table(
+            "logs",
+            vec![
+                make_col("timestamp", false),
+                make_col("level", false),
+                make_col("message", false),
+            ],
+        );
+        let (idx, name) = pick_primary_key(&t);
+        assert_eq!(idx, 0);
+        assert_eq!(name, "timestamp");
+    }
 
     #[test]
     fn type_tag_handles_string_and_object_forms() {

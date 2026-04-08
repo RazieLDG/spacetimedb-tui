@@ -418,8 +418,6 @@ pub struct AppState {
     // ------------------------------------------------------------------
     /// Set to `true` to request a clean shutdown.
     pub should_quit: bool,
-    /// Whether the terminal was resized since the last render.
-    pub needs_redraw: bool,
     /// When the application was started (used by `uptime()`).
     pub started_at: Instant,
 
@@ -506,7 +504,6 @@ impl AppState {
             notification: None,
 
             should_quit: false,
-            needs_redraw: true,
             started_at: Instant::now(),
 
             search_query: String::new(),

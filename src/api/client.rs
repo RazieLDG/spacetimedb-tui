@@ -199,6 +199,67 @@ impl SpacetimeClient {
         parse_schema_response(raw)
     }
 
+    /// Invoke a reducer (or procedure) in `database` with the supplied
+    /// JSON-encoded arguments.
+    ///
+    /// SpacetimeDB endpoint:
+    ///   `POST /v1/database/<database>/call/<reducer>`
+    /// Body: a JSON array `[arg0, arg1, …]` whose elements are the
+    /// already-encoded values of each parameter, in declaration order.
+    ///
+    /// On success returns the response body as a JSON `Value` so the
+    /// caller can surface whatever the server reported (transaction
+    /// id, energy used, error string, …) without us having to keep
+    /// up with the server's response schema.
+    #[instrument(skip(self, args), fields(db = %database, reducer = %reducer))]
+    pub async fn call_reducer(
+        &self,
+        database: &str,
+        reducer: &str,
+        args: &[Value],
+    ) -> Result<Value> {
+        let url = format!(
+            "{}/v1/database/{}/call/{}",
+            self.base_url, database, reducer
+        );
+        debug!("Calling reducer with {} args", args.len());
+
+        let body = serde_json::to_string(args)
+            .context("Failed to encode reducer arguments as JSON")?;
+
+        let resp = self
+            .post(&url)
+            .body(body)
+            .header(header::CONTENT_TYPE, "application/json")
+            .send()
+            .await
+            .context("Reducer call request failed")?;
+
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let snip: String = text.chars().take(200).collect();
+            if status.as_u16() == 404 {
+                bail!(
+                    "Reducer '{reducer}' not found in '{database}' (HTTP 404). \
+                     Check the spelling and that the module is published."
+                );
+            }
+            if status.as_u16() == 400 {
+                bail!(
+                    "Reducer '{reducer}' rejected the call (HTTP 400). \
+                     Argument count or types are likely wrong. Server said: {snip}"
+                );
+            }
+            bail!("Reducer call HTTP {status}: {snip}");
+        }
+        // The server may return an empty body on success — fall back to Null.
+        if text.trim().is_empty() {
+            return Ok(Value::Null);
+        }
+        serde_json::from_str(&text).context("Failed to decode reducer response")
+    }
+
     /// Retrieve the last `num_lines` log lines for `database`.
     ///
     /// SpacetimeDB endpoint: `GET /v1/database/<database>/logs`

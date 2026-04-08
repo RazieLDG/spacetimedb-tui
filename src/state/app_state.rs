@@ -443,6 +443,14 @@ pub struct AppState {
     /// instead of hardcoded constants so that `--theme light` actually
     /// changes what the user sees.
     pub theme: ThemeColors,
+
+    // ------------------------------------------------------------------
+    // Modal dialog state (Faz 5: write operations)
+    // ------------------------------------------------------------------
+    /// Active modal dialog (confirm prompt or multi-field form), if
+    /// any. While `Some`, the main key handler routes every event
+    /// into the modal until the user accepts or cancels.
+    pub modal: Option<crate::state::modal::Modal>,
 }
 
 impl AppState {
@@ -475,6 +483,7 @@ impl AppState {
 
             grid_search: None,
             grid_search_editing: false,
+            modal: None,
 
             sql_history: VecDeque::new(),
             history_cursor: None,

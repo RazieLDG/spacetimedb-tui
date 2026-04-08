@@ -79,6 +79,31 @@ const SECTIONS: &[Section] = &[
         ],
     },
     Section {
+        title: "Write ops (Tables tab)",
+        bindings: &[
+            Binding { key: "i",               desc: "Insert new row (opens form)" },
+            Binding { key: "U (shift-u)",     desc: "Update selected row (opens edit form)" },
+            Binding { key: "d",               desc: "Delete selected row (asks for y/n confirm)" },
+        ],
+    },
+    Section {
+        title: "Module tab — reducer calls",
+        bindings: &[
+            Binding { key: "j / k",           desc: "Move between reducers" },
+            Binding { key: "Enter",           desc: "Open reducer call form" },
+        ],
+    },
+    Section {
+        title: "Modal dialogs",
+        bindings: &[
+            Binding { key: "Tab / ↓",         desc: "Next field (form)" },
+            Binding { key: "Shift+Tab / ↑",   desc: "Previous field (form)" },
+            Binding { key: "Enter",           desc: "Submit form / confirm" },
+            Binding { key: "y",               desc: "Confirm (yes/no prompts)" },
+            Binding { key: "n / Esc",         desc: "Cancel modal" },
+        ],
+    },
+    Section {
         title: "Logs",
         bindings: &[
             Binding { key: "Space",           desc: "Pause / resume auto-scroll" },

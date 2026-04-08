@@ -67,6 +67,13 @@ pub enum AppEvent {
     MetricsLoaded(crate::state::MetricsSnapshot),
     /// Live tab's periodic `st_client` poll returned.
     LiveClientsLoaded(Vec<crate::state::app_state::LiveClientEntry>),
+    /// A reducer call (or write-SQL exec) finished successfully.
+    /// `op` is a short human label like `call insert_user` or
+    /// `delete row from users` so we can surface it in the status bar
+    /// and the Live tab without re-deriving the description here.
+    WriteOpSuccess { op: String, response: serde_json::Value },
+    /// A reducer call (or write-SQL exec) failed.
+    WriteOpError { op: String, error: String },
     /// A live log line from WebSocket.
     LogLine(crate::api::types::LogEntry),
     /// Ping result.
@@ -323,6 +330,20 @@ impl App {
     /// Uses explicit `return` statements to make early-exit control flow clear.
     #[allow(clippy::needless_return)]
     async fn handle_key(&mut self, key: KeyEvent) {
+        // ── Modal dialog intercept ────────────────────────────────────────
+        // When a confirm prompt or form is open, the modal owns every
+        // key. Ctrl+C still quits as a panic-button escape hatch.
+        if self.state.modal.is_some() {
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('c'))
+            {
+                self.state.should_quit = true;
+                return;
+            }
+            self.handle_modal_key(key).await;
+            return;
+        }
+
         // ── Global always-active bindings ─────────────────────────────────
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
@@ -685,6 +706,39 @@ impl App {
                 return;
             }
 
+            // Insert row (Tables tab only). Opens a form prefilled
+            // with the current schema's columns. Submit issues an
+            // INSERT INTO ... VALUES (...) SQL statement.
+            KeyCode::Char('i')
+                if self.state.focus == FocusPanel::Main
+                    && self.state.current_tab == Tab::Tables =>
+            {
+                self.open_insert_form();
+                return;
+            }
+
+            // Delete row (Tables tab only). Opens a y/n confirm dialog
+            // that issues a DELETE FROM ... WHERE pk = ... statement.
+            // PK is heuristically the first column of the table.
+            KeyCode::Char('d')
+                if self.state.focus == FocusPanel::Main
+                    && self.state.current_tab == Tab::Tables =>
+            {
+                self.open_delete_confirm();
+                return;
+            }
+
+            // Update row (Tables tab only). Opens an edit form
+            // prefilled with the current row's values. The first
+            // field is the PK display; submit issues an UPDATE.
+            KeyCode::Char('U')
+                if self.state.focus == FocusPanel::Main
+                    && self.state.current_tab == Tab::Tables =>
+            {
+                self.open_update_form();
+                return;
+            }
+
             // Sort — `s` cycles the sort state (off → asc → desc → off)
             // on the currently-selected column.
             KeyCode::Char('s')
@@ -1012,6 +1066,11 @@ impl App {
             FocusPanel::Main => {
                 if self.state.current_tab == Tab::Sql {
                     self.state.focus = FocusPanel::SqlInput;
+                } else if self.state.current_tab == Tab::Module {
+                    // Enter on a reducer in the module inspector opens
+                    // a call form (or a no-arg confirm, when the
+                    // reducer has no parameters).
+                    self.open_reducer_form();
                 }
             }
             _ => {}
@@ -1336,6 +1395,494 @@ impl App {
                 self.state.set_error(format!("Export failed: {e:#}"));
             }
         }
+    }
+
+    // ── Modal dialogs (Faz 5: write operations) ──────────────────────────
+
+    /// Route a key event into the active modal dialog. Called from
+    /// `handle_key` when `state.modal.is_some()`.
+    async fn handle_modal_key(&mut self, key: KeyEvent) {
+        // Take the modal out of state so we can mutate its fields
+        // freely without holding two borrows at the same time. We
+        // put it back at the end unless the user accepted / cancelled.
+        let Some(mut modal) = self.state.modal.take() else {
+            return;
+        };
+
+        match &mut modal {
+            crate::state::modal::Modal::Confirm { .. } => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.dispatch_modal_action(modal).await;
+                    return;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    // Cancelled — drop the modal entirely.
+                    return;
+                }
+                _ => {}
+            },
+            crate::state::modal::Modal::Form { fields, focus, .. } => match key.code {
+                KeyCode::Esc => {
+                    return;
+                }
+                KeyCode::Enter => {
+                    self.dispatch_modal_action(modal).await;
+                    return;
+                }
+                KeyCode::Tab | KeyCode::Down => {
+                    if !fields.is_empty() {
+                        *focus = (*focus + 1) % fields.len();
+                    }
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    if !fields.is_empty() {
+                        *focus = if *focus == 0 {
+                            fields.len() - 1
+                        } else {
+                            *focus - 1
+                        };
+                    }
+                }
+                KeyCode::Left => {
+                    if let Some(f) = fields.get_mut(*focus) {
+                        f.input.move_left();
+                    }
+                }
+                KeyCode::Right => {
+                    if let Some(f) = fields.get_mut(*focus) {
+                        f.input.move_right();
+                    }
+                }
+                KeyCode::Home => {
+                    if let Some(f) = fields.get_mut(*focus) {
+                        f.input.home();
+                    }
+                }
+                KeyCode::End => {
+                    if let Some(f) = fields.get_mut(*focus) {
+                        f.input.end();
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(f) = fields.get_mut(*focus) {
+                        f.input.backspace();
+                    }
+                }
+                KeyCode::Delete => {
+                    if let Some(f) = fields.get_mut(*focus) {
+                        f.input.delete();
+                    }
+                }
+                KeyCode::Char(ch) => {
+                    if let Some(f) = fields.get_mut(*focus) {
+                        f.input.insert(ch);
+                    }
+                }
+                _ => {}
+            },
+        }
+
+        // Key didn't trigger accept/cancel — put the modal back.
+        self.state.modal = Some(modal);
+    }
+
+    /// Open an edit form pre-filled with the currently selected row's
+    /// values. Field 0 is the PK (used for the WHERE clause); the
+    /// rest are the editable column values. The submit handler builds
+    /// an `UPDATE table SET col=val,... WHERE pk=original_pk` SQL.
+    fn open_update_form(&mut self) {
+        let Some(table) = self.state.selected_table().cloned() else {
+            self.state
+                .set_notification("No table selected".to_string());
+            return;
+        };
+        if table.columns.is_empty() {
+            self.state
+                .set_error(format!("Table '{}' has no columns", table.table_name));
+            return;
+        }
+        let data_idx = match self.active_data_row_index() {
+            Some(i) => i,
+            None => {
+                self.state
+                    .set_notification("No row selected".to_string());
+                return;
+            }
+        };
+        let row = match self
+            .state
+            .table_browse_result
+            .as_ref()
+            .and_then(|qr| qr.rows.get(data_idx))
+        {
+            Some(r) => r.clone(),
+            None => return,
+        };
+
+        // Pre-fill each form field with the row's current display value.
+        let fields: Vec<crate::state::modal::FormField> = table
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let type_label = type_tag(&c.col_type);
+                let pk_marker = if i == 0 { " — PK (read-only)" } else { "" };
+                let mut field = crate::state::modal::FormField::new(format!(
+                    "{} ({}{pk_marker})",
+                    c.col_name, type_label
+                ));
+                let cell_text = row
+                    .get(i)
+                    .map(crate::ui::tabs::tables::value_to_display)
+                    .unwrap_or_default();
+                field.input.set(cell_text);
+                field
+            })
+            .collect();
+
+        let column_types: Vec<String> = table
+            .columns
+            .iter()
+            .map(|c| type_tag(&c.col_type))
+            .collect();
+        let pk_column = table.columns[0].col_name.clone();
+        let original_pk = row
+            .first()
+            .map(crate::ui::tabs::tables::value_to_display)
+            .unwrap_or_default();
+
+        let action = crate::state::modal::ModalAction::UpdateRow {
+            table: table.table_name.clone(),
+            pk_column,
+            column_types,
+            original_pk,
+        };
+        self.state.modal = Some(crate::state::modal::Modal::form(
+            format!("Update row in {}", table.table_name),
+            fields,
+            action,
+        ));
+    }
+
+    /// Open a confirm dialog to delete the currently selected row.
+    /// Uses the first column of the table as the WHERE-clause key
+    /// (best-effort PK detection — SpacetimeDB schemas don't expose
+    /// a reliable "primary key" flag in the v9 JSON we already parse,
+    /// and the first column is the PK in the overwhelming majority
+    /// of real-world tables).
+    fn open_delete_confirm(&mut self) {
+        // Pull the data we need before borrowing mutably.
+        let Some(table) = self.state.selected_table().cloned() else {
+            self.state
+                .set_notification("No table selected".to_string());
+            return;
+        };
+        if table.columns.is_empty() {
+            self.state
+                .set_error(format!("Table '{}' has no columns", table.table_name));
+            return;
+        }
+
+        let data_idx = match self.active_data_row_index() {
+            Some(i) => i,
+            None => {
+                self.state
+                    .set_notification("No row selected".to_string());
+                return;
+            }
+        };
+        let row = match self
+            .state
+            .table_browse_result
+            .as_ref()
+            .and_then(|qr| qr.rows.get(data_idx))
+        {
+            Some(r) => r.clone(),
+            None => return,
+        };
+
+        let pk_col = &table.columns[0];
+        let pk_name = pk_col.col_name.clone();
+        let pk_type = type_tag(&pk_col.col_type);
+        let pk_value_raw = row
+            .first()
+            .map(crate::ui::tabs::tables::value_to_display)
+            .unwrap_or_default();
+        let pk_literal = sql_literal(&pk_value_raw, &pk_type);
+        let where_sql = format!("{pk_name} = {pk_literal}");
+
+        let prompt = format!(
+            "DELETE FROM {table_name} WHERE {where_sql}\n\n\
+             This will permanently remove one row.\n\
+             Press [y] to confirm, [n] to cancel.",
+            table_name = table.table_name,
+        );
+        let action = crate::state::modal::ModalAction::DeleteRow {
+            table: table.table_name.clone(),
+            where_sql,
+        };
+        self.state.modal = Some(crate::state::modal::Modal::confirm(
+            format!("Delete row from {}", table.table_name),
+            prompt,
+            action,
+        ));
+    }
+
+    /// Open an insert form for the currently selected table in the
+    /// Tables tab. Each user-visible column gets one form field. The
+    /// submit handler builds an `INSERT INTO ... VALUES (...)` SQL
+    /// statement and runs it via [`spawn_write_sql`].
+    fn open_insert_form(&mut self) {
+        let Some(table) = self.state.selected_table().cloned() else {
+            self.state
+                .set_notification("No table selected".to_string());
+            return;
+        };
+
+        if table.columns.is_empty() {
+            self.state
+                .set_error(format!("Table '{}' has no columns", table.table_name));
+            return;
+        }
+
+        let fields: Vec<crate::state::modal::FormField> = table
+            .columns
+            .iter()
+            .map(|c| {
+                let type_label = type_tag(&c.col_type);
+                let auto = if c.is_autoinc { " — auto" } else { "" };
+                crate::state::modal::FormField::new(format!(
+                    "{} ({}{auto})",
+                    c.col_name, type_label
+                ))
+                .with_placeholder(default_placeholder_for_type(&type_label))
+            })
+            .collect();
+
+        let column_types: Vec<String> = table
+            .columns
+            .iter()
+            .map(|c| type_tag(&c.col_type))
+            .collect();
+
+        let action = crate::state::modal::ModalAction::InsertRow {
+            table: table.table_name.clone(),
+            column_types,
+        };
+
+        self.state.modal = Some(crate::state::modal::Modal::form(
+            format!("Insert into {}", table.table_name),
+            fields,
+            action,
+        ));
+    }
+
+    /// Open a reducer-call form for the currently selected reducer in
+    /// the Module tab. No-op if there is no schema or selection.
+    fn open_reducer_form(&mut self) {
+        let Some(schema) = self.state.current_schema.as_ref() else {
+            return;
+        };
+        let Some(reducer) = schema.reducers.get(self.state.module_selected_reducer) else {
+            return;
+        };
+
+        let fields: Vec<crate::state::modal::FormField> = reducer
+            .params
+            .iter()
+            .map(|p| {
+                let type_label = type_tag(&p.algebraic_type);
+                crate::state::modal::FormField::new(format!("{} ({})", p.name, type_label))
+                    .with_placeholder(default_placeholder_for_type(&type_label))
+            })
+            .collect();
+
+        let action = crate::state::modal::ModalAction::CallReducer {
+            reducer: reducer.name.clone(),
+            param_types: reducer
+                .params
+                .iter()
+                .map(|p| type_tag(&p.algebraic_type))
+                .collect(),
+        };
+
+        let title = if reducer.params.is_empty() {
+            format!("Call {} (no args — Enter to confirm)", reducer.name)
+        } else {
+            format!("Call {}", reducer.name)
+        };
+
+        self.state.modal = Some(crate::state::modal::Modal::form(title, fields, action));
+    }
+
+    /// Dispatch a finished modal action — runs the underlying API
+    /// call on a background task and surfaces the result via
+    /// `AppEvent::WriteOpSuccess` / `WriteOpError`. The modal is
+    /// dropped (the caller already moved it out of `state.modal`).
+    async fn dispatch_modal_action(&mut self, modal: crate::state::modal::Modal) {
+        use crate::state::modal::{Modal, ModalAction};
+
+        let db = match self.state.selected_database() {
+            Some(d) => d.to_string(),
+            None => {
+                self.state
+                    .set_error("No database selected".to_string());
+                return;
+            }
+        };
+        let op_label = modal.action().op_label();
+
+        match modal {
+            Modal::Form { fields, action, .. } => match action {
+                ModalAction::CallReducer { reducer, param_types } => {
+                    let args: Vec<serde_json::Value> = fields
+                        .iter()
+                        .zip(param_types.iter())
+                        .map(|(f, t)| coerce_field_to_json(&f.input.value, t))
+                        .collect();
+                    self.spawn_call_reducer(db, reducer, args, op_label);
+                }
+                ModalAction::InsertRow { table, column_types } => {
+                    let columns: Vec<String> = fields
+                        .iter()
+                        .map(|f| extract_field_name(&f.label))
+                        .collect();
+                    let values: Vec<String> = fields
+                        .iter()
+                        .zip(column_types.iter())
+                        .map(|(f, t)| sql_literal(&f.input.value, t))
+                        .collect();
+                    let sql = format!(
+                        "INSERT INTO {table} ({}) VALUES ({})",
+                        columns.join(", "),
+                        values.join(", ")
+                    );
+                    self.spawn_write_sql(db, sql, op_label);
+                }
+                ModalAction::UpdateRow {
+                    table,
+                    pk_column,
+                    column_types,
+                    original_pk,
+                } => {
+                    // First field is always the PK display (read-only
+                    // logically); the remaining fields are the new
+                    // column values in declaration order.
+                    let assignments: Vec<String> = fields
+                        .iter()
+                        .skip(1)
+                        .zip(column_types.iter().skip(1))
+                        .map(|(f, t)| {
+                            let col = extract_field_name(&f.label);
+                            format!("{col} = {}", sql_literal(&f.input.value, t))
+                        })
+                        .collect();
+                    if assignments.is_empty() {
+                        self.state.set_notification("Nothing to update".to_string());
+                        return;
+                    }
+                    let pk_type = column_types.first().cloned().unwrap_or_default();
+                    let where_value = sql_literal(&original_pk, &pk_type);
+                    let sql = format!(
+                        "UPDATE {table} SET {} WHERE {pk_column} = {where_value}",
+                        assignments.join(", ")
+                    );
+                    self.spawn_write_sql(db, sql, op_label);
+                }
+                ModalAction::DeleteRow { .. } => {
+                    // DeleteRow is always a Confirm, never a Form —
+                    // unreachable but handle gracefully.
+                    self.state
+                        .set_error("Internal: DeleteRow inside a Form".to_string());
+                }
+            },
+            Modal::Confirm { action, .. } => match action {
+                ModalAction::DeleteRow { table, where_sql } => {
+                    let sql = format!("DELETE FROM {table} WHERE {where_sql}");
+                    self.spawn_write_sql(db, sql, op_label);
+                }
+                _ => {
+                    self.state
+                        .set_error("Internal: non-DeleteRow inside Confirm".to_string());
+                }
+            },
+        }
+    }
+
+    /// Run `client.call_reducer` on a background task and route the
+    /// outcome through `AppEvent::WriteOp{Success,Error}`.
+    fn spawn_call_reducer(
+        &self,
+        db: String,
+        reducer: String,
+        args: Vec<serde_json::Value>,
+        op_label: String,
+    ) {
+        let client = self.client.clone();
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            match tokio::time::timeout(
+                HTTP_REQUEST_TIMEOUT,
+                client.call_reducer(&db, &reducer, &args),
+            )
+            .await
+            {
+                Ok(Ok(response)) => send_event(
+                    &tx,
+                    AppEvent::WriteOpSuccess {
+                        op: op_label,
+                        response,
+                    },
+                ),
+                Ok(Err(e)) => send_event(
+                    &tx,
+                    AppEvent::WriteOpError {
+                        op: op_label,
+                        error: format!("{e:#}"),
+                    },
+                ),
+                Err(_) => send_event(
+                    &tx,
+                    AppEvent::WriteOpError {
+                        op: op_label,
+                        error: "request timed out".to_string(),
+                    },
+                ),
+            }
+        });
+    }
+
+    /// Run a write SQL statement (INSERT/UPDATE/DELETE) on a
+    /// background task and route the outcome the same way reducer
+    /// calls are.
+    fn spawn_write_sql(&self, db: String, sql: String, op_label: String) {
+        let client = self.client.clone();
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.query_sql(&db, &sql)).await {
+                Ok(Ok(_result)) => send_event(
+                    &tx,
+                    AppEvent::WriteOpSuccess {
+                        op: op_label,
+                        response: serde_json::json!({"sql": sql}),
+                    },
+                ),
+                Ok(Err(e)) => send_event(
+                    &tx,
+                    AppEvent::WriteOpError {
+                        op: op_label,
+                        error: format!("{e:#}"),
+                    },
+                ),
+                Err(_) => send_event(
+                    &tx,
+                    AppEvent::WriteOpError {
+                        op: op_label,
+                        error: "request timed out".to_string(),
+                    },
+                ),
+            }
+        });
     }
 
     /// Tab-complete the SQL input against the current schema.
@@ -1830,6 +2377,31 @@ impl App {
                 self.state.live_clients = clients;
             }
 
+            AppEvent::WriteOpSuccess { op, response } => {
+                self.state.query_loading = false;
+                let summary = if response.is_null() {
+                    op.clone()
+                } else {
+                    let s = response.to_string();
+                    let preview: String = s.chars().take(60).collect();
+                    format!("{op} → {preview}")
+                };
+                self.state.set_notification(format!("✓ {summary}"));
+                // Many writes invalidate the table-browse view, so a
+                // gentle refresh is useful — but only when the user
+                // is still looking at the Tables tab.
+                if self.state.current_tab == Tab::Tables
+                    && self.state.selected_table().is_some()
+                {
+                    self.load_table_data().await;
+                }
+            }
+
+            AppEvent::WriteOpError { op, error } => {
+                self.state.query_loading = false;
+                self.state.set_error(format!("{op} failed: {error}"));
+            }
+
             AppEvent::LogLine(entry) => {
                 self.state.push_log(entry);
             }
@@ -1843,6 +2415,98 @@ impl App {
             }
         }
     }
+}
+
+// ── Modal helpers (Faz 5) ────────────────────────────────────────────────────
+
+/// Extract the SpacetimeDB type "tag" from an algebraic-type JSON
+/// value. The schema encodes types as either `"String"` or
+/// `{"String": []}`-style objects, so we tolerate both.
+fn type_tag(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Object(o) => o
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "Unknown".to_string()),
+        _ => "Unknown".to_string(),
+    }
+}
+
+/// Suggest a placeholder string for a form field based on its type
+/// tag. Just guidance — the user can type whatever they want.
+fn default_placeholder_for_type(t: &str) -> String {
+    match t {
+        "String" => "text".to_string(),
+        "Bool" => "true / false".to_string(),
+        s if s.starts_with('U') || s.starts_with('I') => "0".to_string(),
+        s if s.starts_with('F') => "0.0".to_string(),
+        _ => "".to_string(),
+    }
+}
+
+/// Extract the bare column / parameter name from a form field label
+/// like `"name (String)"` → `"name"`.
+fn extract_field_name(label: &str) -> String {
+    label.split_whitespace().next().unwrap_or("").to_string()
+}
+
+/// Coerce a raw input string into a JSON value suitable for the
+/// SpacetimeDB reducer-call wire format. We try to be helpful but
+/// not magical: numerics parse, booleans parse, everything else stays
+/// a string. JSON-shaped input (`[1,2]`, `{"k":"v"}`) is preserved
+/// verbatim by attempting a `serde_json::from_str` first.
+fn coerce_field_to_json(raw: &str, type_tag: &str) -> serde_json::Value {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return serde_json::Value::Null;
+    }
+    // Numeric / bool inference based on the declared type tag.
+    if type_tag.starts_with('U') || type_tag.starts_with('I') {
+        if let Ok(n) = trimmed.parse::<i64>() {
+            return serde_json::json!(n);
+        }
+    }
+    if type_tag.starts_with('F') {
+        if let Ok(f) = trimmed.parse::<f64>() {
+            return serde_json::json!(f);
+        }
+    }
+    if type_tag == "Bool" {
+        if let Ok(b) = trimmed.parse::<bool>() {
+            return serde_json::json!(b);
+        }
+    }
+    // If the input *looks* like JSON, accept it as-is so users can
+    // pass arrays / objects to complex param types.
+    if matches!(trimmed.chars().next(), Some('[' | '{' | '"')) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            return v;
+        }
+    }
+    serde_json::Value::String(trimmed.to_string())
+}
+
+/// Build a SQL literal from a raw input string and a type tag.
+/// Numerics are emitted bare, booleans become `TRUE`/`FALSE`, and
+/// everything else is single-quoted with embedded quotes doubled.
+fn sql_literal(raw: &str, type_tag: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "NULL".to_string();
+    }
+    if type_tag.starts_with('U') || type_tag.starts_with('I') || type_tag.starts_with('F') {
+        return trimmed.to_string();
+    }
+    if type_tag == "Bool" {
+        return match trimmed.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => "TRUE".to_string(),
+            _ => "FALSE".to_string(),
+        };
+    }
+    let escaped = trimmed.replace('\'', "''");
+    format!("'{escaped}'")
 }
 
 // ── Metrics Parser ────────────────────────────────────────────────────────────
@@ -1879,6 +2543,96 @@ fn parse_prometheus_metrics(text: &str) -> crate::state::MetricsSnapshot {
     snapshot
 }
 
+// ── Tests for modal helpers ──────────────────────────────────────────────────
+
+#[cfg(test)]
+mod modal_helper_tests {
+    use super::*;
+
+    #[test]
+    fn type_tag_handles_string_and_object_forms() {
+        assert_eq!(
+            type_tag(&serde_json::json!("String")),
+            "String"
+        );
+        assert_eq!(
+            type_tag(&serde_json::json!({"U64": []})),
+            "U64"
+        );
+        assert_eq!(
+            type_tag(&serde_json::json!(null)),
+            "Unknown"
+        );
+    }
+
+    #[test]
+    fn extract_field_name_strips_type_suffix() {
+        assert_eq!(extract_field_name("name (String)"), "name");
+        assert_eq!(extract_field_name("user_id (U64 — auto)"), "user_id");
+        assert_eq!(extract_field_name(""), "");
+    }
+
+    #[test]
+    fn coerce_field_to_json_numeric_types() {
+        assert_eq!(coerce_field_to_json("42", "U64"), serde_json::json!(42));
+        assert_eq!(coerce_field_to_json("-7", "I32"), serde_json::json!(-7));
+        assert_eq!(coerce_field_to_json("1.5", "F64"), serde_json::json!(1.5));
+    }
+
+    #[test]
+    fn coerce_field_to_json_bool_and_string() {
+        assert_eq!(
+            coerce_field_to_json("true", "Bool"),
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            coerce_field_to_json("hello", "String"),
+            serde_json::json!("hello")
+        );
+    }
+
+    #[test]
+    fn coerce_field_to_json_passes_through_json_arrays() {
+        assert_eq!(
+            coerce_field_to_json("[1,2,3]", "Array"),
+            serde_json::json!([1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn coerce_field_to_json_empty_is_null() {
+        assert_eq!(
+            coerce_field_to_json("   ", "String"),
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn sql_literal_quotes_strings_and_escapes_quotes() {
+        assert_eq!(sql_literal("alice", "String"), "'alice'");
+        assert_eq!(sql_literal("O'Brien", "String"), "'O''Brien'");
+    }
+
+    #[test]
+    fn sql_literal_emits_numbers_bare() {
+        assert_eq!(sql_literal("42", "U64"), "42");
+        assert_eq!(sql_literal("-1.5", "F32"), "-1.5");
+    }
+
+    #[test]
+    fn sql_literal_bool_to_keyword() {
+        assert_eq!(sql_literal("true", "Bool"), "TRUE");
+        assert_eq!(sql_literal("false", "Bool"), "FALSE");
+        assert_eq!(sql_literal("1", "Bool"), "TRUE");
+        assert_eq!(sql_literal("nope", "Bool"), "FALSE");
+    }
+
+    #[test]
+    fn sql_literal_empty_is_null() {
+        assert_eq!(sql_literal("  ", "String"), "NULL");
+    }
+}
+
 // ── Frame renderer ────────────────────────────────────────────────────────────
 
 /// Draw the complete UI frame.
@@ -1890,7 +2644,7 @@ pub fn draw_frame(
     sql_grid: &mut TableGridState,
 ) {
     use crate::ui::{
-        components::{help::HelpOverlay, status_bar::StatusBar},
+        components::{help::HelpOverlay, modal::render_modal, status_bar::StatusBar},
         layout::render_layout,
         sidebar::render_sidebar,
         tabs::{
@@ -1956,5 +2710,10 @@ pub fn draw_frame(
     // ── Help overlay (drawn on top of everything) ─────────────────────────
     if state.show_help {
         HelpOverlay::new(state.help_scroll).render(area, frame.buffer_mut());
+    }
+
+    // ── Modal dialog (drawn last so it's always on top) ──────────────────
+    if let Some(ref modal) = state.modal {
+        render_modal(area, frame.buffer_mut(), modal);
     }
 }

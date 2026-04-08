@@ -17,10 +17,10 @@ use crate::api::types::LogLevel;
 use crate::state::{AppState, FocusPanel};
 
 // ── Theme ─────────────────────────────────────────────────────────────────────
-const ACCENT: Color = Color::Cyan;
-const BORDER_FOCUSED: Color = Color::Cyan;
-const BORDER_NORMAL: Color = Color::Rgb(40, 50, 65);
-const FG_MUTED: Color = Color::Rgb(110, 110, 110);
+// Level-specific colours (TRACE/DEBUG/INFO/WARN/ERROR/PANIC) intentionally
+// stay as fixed semantic colours — even in a "light" theme you want ERROR
+// to be unambiguously red. Only the chrome (border, accent, muted text) is
+// pulled from the active theme.
 const FG_TS: Color = Color::Rgb(140, 140, 160);
 const FG_TRACE: Color = Color::Rgb(120, 120, 140);
 const FG_DEBUG: Color = Color::Rgb(86, 182, 194);
@@ -31,12 +31,21 @@ const FG_PANIC: Color = Color::Rgb(255, 80, 80);
 const FG_MSG: Color = Color::Rgb(210, 210, 210);
 const PAUSED_BG: Color = Color::Rgb(60, 40, 20);
 
+fn rgb((r, g, b): (u8, u8, u8)) -> Color {
+    Color::Rgb(r, g, b)
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 /// Render the log viewer tab.
 pub fn render_logs(area: Rect, buf: &mut Buffer, app: &AppState) {
+    let theme = &app.theme;
+    let accent = rgb(theme.accent);
+    let border_focused = rgb(theme.border_focused);
+    let border_normal = rgb(theme.border_normal);
+
     let focused = app.focus == FocusPanel::Main;
-    let border_color = if focused { BORDER_FOCUSED } else { BORDER_NORMAL };
+    let border_color = if focused { border_focused } else { border_normal };
     let paused = !app.log_follow;
 
     let title = if paused {
@@ -49,7 +58,7 @@ pub fn render_logs(area: Rect, buf: &mut Buffer, app: &AppState) {
     } else {
         Span::styled(
             " 📜 Logs  [LIVE ▶] ",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
         )
     };
 
@@ -80,34 +89,46 @@ pub fn render_logs(area: Rect, buf: &mut Buffer, app: &AppState) {
 // ── Toolbar ───────────────────────────────────────────────────────────────────
 
 fn render_toolbar(area: Rect, buf: &mut Buffer, app: &AppState, paused: bool) {
+    let theme = &app.theme;
+    let accent = rgb(theme.accent);
+    let fg_muted = rgb(theme.fg_muted);
+    let toolbar_bg = rgb(theme.bg_secondary);
+
     for x in area.x..area.x + area.width {
         buf[(x, area.y)]
             .set_char(' ')
-            .set_style(Style::default().bg(Color::Rgb(20, 26, 38)));
+            .set_style(Style::default().bg(toolbar_bg));
     }
 
     let total = app.log_buffer.len();
+    let visible = app.visible_logs().count();
     let db = app.selected_database().unwrap_or("—");
+    let (level_text, level_color) = level_display(&app.log_filter_level);
 
     let left = Line::from(vec![
         Span::styled(
-            format!(" {total} lines "),
-            Style::default().fg(FG_MUTED),
+            format!(" {visible}/{total} "),
+            Style::default().fg(fg_muted),
         ),
         Span::styled("│ ", Style::default().fg(Color::Rgb(50, 50, 60))),
         Span::styled(
             format!("db: {db} "),
-            Style::default().fg(ACCENT),
+            Style::default().fg(accent),
+        ),
+        Span::styled("│ ", Style::default().fg(Color::Rgb(50, 50, 60))),
+        Span::styled(
+            format!("level≥{level_text} "),
+            Style::default().fg(level_color).add_modifier(Modifier::BOLD),
         ),
     ]);
     buf.set_line(area.x, area.y, &left, area.width);
 
     let hint = if paused {
-        " Space:resume  r:refresh  c:clear "
+        " Space:resume  f:level  r:refresh  c:clear "
     } else {
-        " Space:pause  r:refresh  c:clear "
+        " Space:pause  f:level  r:refresh  c:clear "
     };
-    let hint_span = Span::styled(hint, Style::default().fg(FG_MUTED));
+    let hint_span = Span::styled(hint, Style::default().fg(fg_muted));
     let hint_w = hint.len() as u16;
     let hint_x = area.x + area.width.saturating_sub(hint_w);
     buf.set_line(hint_x, area.y, &Line::from(hint_span), hint_w);
@@ -120,11 +141,14 @@ fn render_log_lines(area: Rect, buf: &mut Buffer, app: &AppState, paused: bool) 
         return;
     }
 
+    let theme = &app.theme;
+    let fg_muted = rgb(theme.fg_muted);
+
     // Fill background — slightly different tint when paused
     let bg = if paused {
         PAUSED_BG
     } else {
-        Color::Rgb(15, 18, 26)
+        rgb(theme.bg_primary)
     };
     for y in area.y..area.y + area.height {
         for x in area.x..area.x + area.width {
@@ -134,18 +158,23 @@ fn render_log_lines(area: Rect, buf: &mut Buffer, app: &AppState, paused: bool) 
         }
     }
 
-    if app.log_buffer.is_empty() {
-        let msg = Line::from(Span::styled(
-            "  (no log entries — connect to a database to stream logs)",
-            Style::default().fg(FG_MUTED),
-        ));
+    // Apply the level filter once and render from the resulting slice.
+    let filtered: Vec<&crate::api::types::LogEntry> = app.visible_logs().collect();
+
+    if filtered.is_empty() {
+        let msg = if app.log_buffer.is_empty() {
+            "  (no log entries — connect to a database to stream logs)"
+        } else {
+            "  (no entries match the current level filter — press f to change)"
+        };
+        let line = Line::from(Span::styled(msg, Style::default().fg(fg_muted)));
         let y = area.y + area.height / 2;
-        buf.set_line(area.x, y, &msg, area.width);
+        buf.set_line(area.x, y, &line, area.width);
         return;
     }
 
     let visible_h = area.height as usize;
-    let total = app.log_buffer.len();
+    let total = filtered.len();
 
     // In auto-scroll mode, always show the tail; otherwise respect log_scroll.
     let scroll = if app.log_follow {
@@ -154,8 +183,7 @@ fn render_log_lines(area: Rect, buf: &mut Buffer, app: &AppState, paused: bool) 
         app.log_scroll.min(total.saturating_sub(1))
     };
 
-    for (row, entry) in app
-        .log_buffer
+    for (row, entry) in filtered
         .iter()
         .enumerate()
         .skip(scroll)
@@ -190,7 +218,7 @@ fn render_log_lines(area: Rect, buf: &mut Buffer, app: &AppState, paused: bool) 
         let target_span = if let Some(ref t) = entry.target {
             Span::styled(
                 format!("[{t}] "),
-                Style::default().fg(FG_MUTED).bg(bg),
+                Style::default().fg(fg_muted).bg(bg),
             )
         } else {
             Span::raw("")
@@ -213,7 +241,7 @@ fn render_log_lines(area: Rect, buf: &mut Buffer, app: &AppState, paused: bool) 
         let ind_y = area.y + area.height - 1;
         let line = Line::from(Span::styled(
             indicator,
-            Style::default().fg(FG_MUTED).bg(bg),
+            Style::default().fg(fg_muted).bg(bg),
         ));
         buf.set_line(ind_x, ind_y, &line, area.width);
     }
@@ -222,6 +250,9 @@ fn render_log_lines(area: Rect, buf: &mut Buffer, app: &AppState, paused: bool) 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn level_display(level: &LogLevel) -> (&'static str, Color) {
+    // Level-specific colours are semantic (red = error) and intentionally
+    // theme-independent. `Unknown` uses a neutral grey rather than the
+    // theme's muted colour so that `level_display` can stay `AppState`-free.
     match level {
         LogLevel::Trace   => ("TRACE", FG_TRACE),
         LogLevel::Debug   => ("DEBUG", FG_DEBUG),
@@ -229,6 +260,6 @@ fn level_display(level: &LogLevel) -> (&'static str, Color) {
         LogLevel::Warn    => ("WARN",  FG_WARN),
         LogLevel::Error   => ("ERROR", FG_ERROR),
         LogLevel::Panic   => ("PANIC", FG_PANIC),
-        LogLevel::Unknown => ("?????", FG_MUTED),
+        LogLevel::Unknown => ("?????", Color::Rgb(120, 120, 120)),
     }
 }

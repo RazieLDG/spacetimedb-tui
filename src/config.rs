@@ -244,10 +244,13 @@ impl std::fmt::Display for ThemeName {
 ///
 /// Using `u8` RGB triples rather than `ratatui::style::Color` directly so
 /// that `config.rs` does not need to depend on ratatui (keeping the layer
-/// boundary clean).  The UI layer converts these to `Color::Rgb(r, g, b)`.
+/// boundary clean). The UI layer converts these to `Color::Rgb(r, g, b)`
+/// when rendering.
 ///
-/// Fields are not yet fully wired into the UI renderers; they are available
-/// for future theming support.
+/// Most fields are referenced by the renderers (e.g. `accent`, `success`,
+/// `bg_selected`); the remaining ones (`bg_*`, `highlight`, `info`,
+/// `border_*`) are kept for future expansion when the rest of the UI is
+/// converted off hardcoded constants.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ThemeColors {

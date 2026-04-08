@@ -20,14 +20,20 @@ use ratatui::{
 use crate::state::{AppState, FocusPanel, SidebarFocus};
 
 // ── Theme ─────────────────────────────────────────────────────────────────────
+// Most static palette stays here; the row-selected background is pulled from
+// `app.theme` at render time so that `--theme light` / `--theme high-contrast`
+// flip the visible highlight colour.
 const ACCENT: Color = Color::Cyan;
-const SELECTED_BG: Color = Color::Rgb(44, 62, 80);
 const SELECTED_FG: Color = Color::White;
 const DB_FG: Color = Color::Rgb(97, 175, 239);
 const TABLE_FG: Color = Color::Rgb(200, 200, 200);
 const MUTED: Color = Color::Rgb(110, 110, 110);
 const SECTION_FG: Color = Color::Rgb(86, 182, 194);
 const SEARCH_BG: Color = Color::Rgb(28, 40, 58);
+
+fn rgb((r, g, b): (u8, u8, u8)) -> Color {
+    Color::Rgb(r, g, b)
+}
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -102,6 +108,8 @@ fn render_tree(area: Rect, buf: &mut Buffer, app: &AppState, focused: bool) {
         return;
     }
 
+    let selected_bg = rgb(app.theme.bg_selected);
+
     // Determine scroll so the selected item is always visible.
     let visible_h = area.height as usize;
     let selected_idx = find_selected_idx(&items, app);
@@ -112,7 +120,7 @@ fn render_tree(area: Rect, buf: &mut Buffer, app: &AppState, focused: bool) {
         let is_selected = Some(scroll + screen_row) == selected_idx;
 
         let bg = if is_selected && focused {
-            SELECTED_BG
+            selected_bg
         } else {
             Color::Reset
         };

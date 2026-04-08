@@ -25,7 +25,7 @@ use crate::{
     },
     config::Config,
     state::{
-        AppState, ConnectionStatus, FocusPanel, SidebarFocus, SqlHistoryEntry, Tab,
+        AppState, ConnectionStatus, FocusPanel, HistoryAdvance, SidebarFocus, SqlHistoryEntry, Tab,
     },
     ui::components::input::InputState,
     ui::components::table_grid::TableGridState,
@@ -45,12 +45,20 @@ pub enum AppEvent {
     DatabasesLoaded(Vec<String>),
     /// Tables / schema fetched for the selected database.
     SchemaLoaded(crate::api::types::SchemaResponse),
-    /// SQL query result arrived.
+    /// SQL query result arrived (user-typed SQL in the SQL console tab).
     QueryResult {
         result: crate::api::types::QueryResult,
         duration: Duration,
         sql: String,
     },
+    /// Table-browse result arrived (triggered by selecting a table from the
+    /// sidebar). Kept separate from `QueryResult` so the Tables tab and the
+    /// SQL tab do not share state.
+    TableBrowseResult {
+        result: crate::api::types::QueryResult,
+    },
+    /// Table-browse load failed.
+    TableBrowseError { error: String },
     /// SQL query failed.
     QueryError { sql: String, error: String },
     /// Log lines fetched.
@@ -77,7 +85,7 @@ pub struct App {
     pub event_tx: mpsc::UnboundedSender<AppEvent>,
     /// Receiver half — consumed by the event loop.
     event_rx: mpsc::UnboundedReceiver<AppEvent>,
-    /// Standalone SQL input state (mirrors app.state.sql_input).
+    /// SQL input state — single source of truth for the SQL editor buffer.
     pub sql_input: InputState,
     /// Table grid state for the tables tab.
     pub tables_grid: TableGridState,
@@ -89,13 +97,32 @@ pub struct App {
     ws_url: String,
     /// Auth token for WebSocket connections.
     auth_token: Option<String>,
+    /// Last time the metrics tab pulled fresh data — used to throttle the
+    /// background refresh task to one fetch every `METRICS_REFRESH_INTERVAL`.
+    last_metrics_fetch: Option<Instant>,
+}
+
+/// How often the Metrics tab automatically refreshes server-side metrics.
+const METRICS_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Maximum time we wait for any single HTTP-backed background request before
+/// surfacing a timeout error to the user.
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Send an [`AppEvent`] from a background task, logging a warning if the
+/// receiver has been dropped (which only happens during shutdown).
+fn send_event(tx: &mpsc::UnboundedSender<AppEvent>, event: AppEvent) {
+    if tx.send(event).is_err() {
+        tracing::warn!("AppEvent channel closed; dropping event");
+    }
 }
 
 impl App {
     /// Create a new [`App`] from config and a pre-built client.
     pub fn new(config: &Config, client: SpacetimeClient) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
-        let state = AppState::new(config.server_url.clone());
+        let mut state = AppState::new(config.server_url.clone());
+        state.theme = config.theme.clone();
         Self {
             state,
             client,
@@ -107,6 +134,7 @@ impl App {
             ws_handle: None,
             ws_url: config.ws_url.clone(),
             auth_token: config.auth_token.clone(),
+            last_metrics_fetch: None,
         }
     }
 
@@ -119,18 +147,23 @@ impl App {
         let tx = self.event_tx.clone();
 
         tokio::spawn(async move {
-            if client.ping().await {
-                let _ = tx.send(AppEvent::PingResult(true));
-                match client.list_databases().await {
-                    Ok(dbs) => {
-                        let _ = tx.send(AppEvent::DatabasesLoaded(dbs));
-                    }
-                    Err(e) => {
-                        let _ = tx.send(AppEvent::Error(format!("list_databases: {e:#}")));
-                    }
+            let ping_ok = matches!(
+                tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.ping()).await,
+                Ok(true)
+            );
+            send_event(&tx, AppEvent::PingResult(ping_ok));
+            if !ping_ok {
+                return;
+            }
+            match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.list_databases()).await {
+                Ok(Ok(dbs)) => send_event(&tx, AppEvent::DatabasesLoaded(dbs)),
+                Ok(Err(e)) => {
+                    send_event(&tx, AppEvent::Error(format!("list_databases: {e:#}")))
                 }
-            } else {
-                let _ = tx.send(AppEvent::PingResult(false));
+                Err(_) => send_event(
+                    &tx,
+                    AppEvent::Error("list_databases: request timed out".to_string()),
+                ),
             }
         });
     }
@@ -172,6 +205,10 @@ impl App {
             // Drain WebSocket events (non-blocking)
             self.drain_ws_events().await;
 
+            // Throttled background refresh of server metrics while the
+            // Metrics tab is visible.
+            self.maybe_refresh_metrics();
+
             // Expire notifications
             self.state.tick_notifications(Duration::from_secs(5));
 
@@ -181,6 +218,34 @@ impl App {
         }
 
         Ok(())
+    }
+
+    /// If the user is on the Metrics tab and we haven't fetched metrics
+    /// recently, spawn a background fetch. Throttled by
+    /// [`METRICS_REFRESH_INTERVAL`] to keep network traffic minimal.
+    fn maybe_refresh_metrics(&mut self) {
+        if self.state.current_tab != Tab::Metrics {
+            return;
+        }
+        let due = match self.last_metrics_fetch {
+            None => true,
+            Some(t) => t.elapsed() >= METRICS_REFRESH_INTERVAL,
+        };
+        if !due {
+            return;
+        }
+        self.last_metrics_fetch = Some(Instant::now());
+
+        let client = self.client.clone();
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            if let Ok(Ok(text)) =
+                tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.get_metrics()).await
+            {
+                let snapshot = parse_prometheus_metrics(&text);
+                send_event(&tx, AppEvent::MetricsLoaded(snapshot));
+            }
+        });
     }
 
     // ── Key dispatch ──────────────────────────────────────────────────────
@@ -195,6 +260,12 @@ impl App {
             match key.code {
                 KeyCode::Char('c') => {
                     self.state.should_quit = true;
+                    return;
+                }
+                KeyCode::Char('r') => {
+                    // Force a fresh WebSocket connection (e.g. after a server bounce).
+                    self.connect_ws().await;
+                    self.state.set_notification("Reconnecting WebSocket…".to_string());
                     return;
                 }
                 KeyCode::Char('a') | KeyCode::Home if self.state.focus == FocusPanel::SqlInput => {
@@ -234,9 +305,12 @@ impl App {
             return;
         }
 
-        // ── Error popup — any key clears it ───────────────────────────────
+        // ── Error popup — only Esc / Enter dismiss it so accidental keys
+        // don't silently swallow the message before the user has read it.
         if self.state.error_message.is_some() {
-            self.state.clear_error();
+            if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                self.state.clear_error();
+            }
             return;
         }
 
@@ -250,28 +324,23 @@ impl App {
                     self.execute_sql().await;
                 }
                 KeyCode::Up => {
-                    self.state.history_prev();
-                    if let Some(cursor) = self.state.history_cursor {
-                        let idx = self.state.sql_history.len().saturating_sub(1 + cursor);
-                        if let Some(entry) = self.state.sql_history.get(idx) {
-                            self.sql_input.set(entry.sql.clone());
+                    if self.state.history_prev() {
+                        if let Some(sql) = self.state.current_history_sql() {
+                            self.sql_input.set(sql.to_string());
                         }
                     }
                 }
-                KeyCode::Down => {
-                    self.state.history_next();
-                    match self.state.history_cursor {
-                        Some(cursor) => {
-                            let idx = self.state.sql_history.len().saturating_sub(1 + cursor);
-                            if let Some(entry) = self.state.sql_history.get(idx) {
-                                self.sql_input.set(entry.sql.clone());
-                            }
-                        }
-                        None => {
-                            self.sql_input.clear();
+                KeyCode::Down => match self.state.history_next() {
+                    HistoryAdvance::Moved => {
+                        if let Some(sql) = self.state.current_history_sql() {
+                            self.sql_input.set(sql.to_string());
                         }
                     }
-                }
+                    HistoryAdvance::Cleared => {
+                        self.sql_input.clear();
+                    }
+                    HistoryAdvance::Unchanged => {}
+                },
                 KeyCode::Left => self.sql_input.move_left(),
                 KeyCode::Right => self.sql_input.move_right(),
                 KeyCode::Home => self.sql_input.home(),
@@ -281,9 +350,6 @@ impl App {
                 KeyCode::Char(ch) => self.sql_input.insert(ch),
                 _ => {}
             }
-            // Keep app state in sync for rendering
-            self.state.sql_input = self.sql_input.value.clone();
-            self.state.sql_cursor = self.sql_input.cursor;
             return;
         }
 
@@ -316,11 +382,11 @@ impl App {
 
             // Direct tab jump
             KeyCode::Char('1') => {
-                self.state.current_tab = Tab::Query;
+                self.state.current_tab = Tab::Tables;
                 return;
             }
             KeyCode::Char('2') => {
-                self.state.current_tab = Tab::Schema;
+                self.state.current_tab = Tab::Sql;
                 return;
             }
             KeyCode::Char('3') => {
@@ -336,10 +402,23 @@ impl App {
                 return;
             }
 
-            // Focus toggle between sidebar and main
-            KeyCode::Left | KeyCode::Char('h') if self.state.focus == FocusPanel::Main => {
-                self.state.focus = FocusPanel::Sidebar;
-                return;
+            // Focus toggle between sidebar and main — plus "step up" the
+            // sidebar tree so that after opening a table the user can get
+            // back to the Databases list with Left / h.
+            KeyCode::Left | KeyCode::Char('h') => {
+                match self.state.focus {
+                    FocusPanel::Main => {
+                        self.state.focus = FocusPanel::Sidebar;
+                        return;
+                    }
+                    FocusPanel::Sidebar
+                        if self.state.sidebar_focus == SidebarFocus::Tables =>
+                    {
+                        self.state.sidebar_focus = SidebarFocus::Databases;
+                        return;
+                    }
+                    _ => {}
+                }
             }
             KeyCode::Right | KeyCode::Char('l') if self.state.focus == FocusPanel::Sidebar => {
                 self.state.focus = FocusPanel::Main;
@@ -348,7 +427,7 @@ impl App {
 
             // Enter SQL mode
             KeyCode::Char(':') => {
-                self.state.current_tab = Tab::Schema;
+                self.state.current_tab = Tab::Sql;
                 self.state.focus = FocusPanel::SqlInput;
                 return;
             }
@@ -394,10 +473,17 @@ impl App {
                 return;
             }
 
-            // Escape — go back / clear search
+            // Escape — multi-level "go back":
+            //   1. clear an active search-as-you-type query, else
+            //   2. if sidebar focus is on Tables, step back up to Databases, else
+            //   3. snap keyboard focus from the main pane back to the sidebar.
             KeyCode::Esc => {
                 if !self.state.search_query.is_empty() {
                     self.state.search_query.clear();
+                } else if self.state.focus == FocusPanel::Sidebar
+                    && self.state.sidebar_focus == SidebarFocus::Tables
+                {
+                    self.state.sidebar_focus = SidebarFocus::Databases;
                 } else {
                     self.state.focus = FocusPanel::Sidebar;
                 }
@@ -414,20 +500,28 @@ impl App {
                 self.state.log_scroll = 0;
                 return;
             }
+            KeyCode::Char('f') if self.state.current_tab == Tab::Logs => {
+                self.state.log_filter_level = self.state.log_filter_level.clone().next_filter();
+                self.state.set_notification(format!(
+                    "Log filter: {}",
+                    self.state.log_filter_level
+                ));
+                return;
+            }
 
             // Page navigation in tables
-            KeyCode::Char('n') if self.state.current_tab == Tab::Query => {
+            KeyCode::Char('n') if self.state.current_tab == Tab::Tables => {
                 self.tables_grid.scroll_row = self.tables_grid.scroll_row.saturating_add(20);
                 return;
             }
-            KeyCode::Char('p') if self.state.current_tab == Tab::Query => {
+            KeyCode::Char('p') if self.state.current_tab == Tab::Tables => {
                 self.tables_grid.scroll_row = self.tables_grid.scroll_row.saturating_sub(20);
                 return;
             }
 
             // Horizontal scroll in table/SQL results (< / > or H / L)
-            KeyCode::Char('<') | KeyCode::Char('H') if matches!(self.state.current_tab, Tab::Query | Tab::Schema) => {
-                let grid = if self.state.current_tab == Tab::Query {
+            KeyCode::Char('<') | KeyCode::Char('H') if matches!(self.state.current_tab, Tab::Tables | Tab::Sql) => {
+                let grid = if self.state.current_tab == Tab::Tables {
                     &mut self.tables_grid
                 } else {
                     &mut self.sql_grid
@@ -435,23 +529,37 @@ impl App {
                 grid.scroll_left();
                 return;
             }
-            KeyCode::Char('>') | KeyCode::Char('L') if matches!(self.state.current_tab, Tab::Query | Tab::Schema) => {
-                let col_count = self.state.query_result
-                    .as_ref()
-                    .map(|qr| qr.column_count())
-                    .unwrap_or(0);
-                let grid = if self.state.current_tab == Tab::Query {
-                    &mut self.tables_grid
+            KeyCode::Char('>') | KeyCode::Char('L') if matches!(self.state.current_tab, Tab::Tables | Tab::Sql) => {
+                let (col_count, grid) = if self.state.current_tab == Tab::Tables {
+                    let cc = self
+                        .state
+                        .table_browse_result
+                        .as_ref()
+                        .map(|qr| qr.column_count())
+                        .unwrap_or(0);
+                    (cc, &mut self.tables_grid)
                 } else {
-                    &mut self.sql_grid
+                    let cc = self
+                        .state
+                        .query_result
+                        .as_ref()
+                        .map(|qr| qr.column_count())
+                        .unwrap_or(0);
+                    (cc, &mut self.sql_grid)
                 };
                 grid.scroll_right(col_count);
                 return;
             }
 
-            // Search input (when in sidebar search mode)
+            // Search input (when in sidebar search mode) — also acts as
+            // "step up" when there's no search text and the user is on the
+            // Tables sub-panel.
             KeyCode::Backspace if self.state.focus == FocusPanel::Sidebar => {
-                self.state.search_query.pop();
+                if !self.state.search_query.is_empty() {
+                    self.state.search_query.pop();
+                } else if self.state.sidebar_focus == SidebarFocus::Tables {
+                    self.state.sidebar_focus = SidebarFocus::Databases;
+                }
                 return;
             }
             KeyCode::Char(ch) if self.state.focus == FocusPanel::Sidebar && !ch.is_ascii_control() => {
@@ -483,16 +591,16 @@ impl App {
                 }
             }
             FocusPanel::Main => match self.state.current_tab {
-                Tab::Query => {
+                Tab::Tables => {
                     let row_count = self
                         .state
-                        .query_result
+                        .table_browse_result
                         .as_ref()
                         .map(|qr| qr.row_count())
                         .unwrap_or(0);
                     self.tables_grid.next_row(row_count);
                 }
-                Tab::Schema => {
+                Tab::Sql => {
                     let row_count = self
                         .state
                         .query_result
@@ -539,10 +647,10 @@ impl App {
                 }
             },
             FocusPanel::Main => match self.state.current_tab {
-                Tab::Query => {
+                Tab::Tables => {
                     self.tables_grid.prev_row();
                 }
-                Tab::Schema => {
+                Tab::Sql => {
                     self.sql_grid.prev_row();
                 }
                 Tab::Logs => {
@@ -572,11 +680,11 @@ impl App {
                 }
             }
             FocusPanel::Main => match self.state.current_tab {
-                Tab::Query => {
+                Tab::Tables => {
                     self.tables_grid.selected_row = 0;
                     self.tables_grid.scroll_row = 0;
                 }
-                Tab::Schema => {
+                Tab::Sql => {
                     self.sql_grid.selected_row = 0;
                     self.sql_grid.scroll_row = 0;
                 }
@@ -593,13 +701,13 @@ impl App {
     fn nav_end(&mut self) {
         if self.state.focus == FocusPanel::Main {
             match self.state.current_tab {
-                Tab::Query => {
-                    if let Some(ref qr) = self.state.query_result {
+                Tab::Tables => {
+                    if let Some(ref qr) = self.state.table_browse_result {
                         let count = qr.row_count();
                         self.tables_grid.selected_row = count.saturating_sub(1);
                     }
                 }
-                Tab::Schema => {
+                Tab::Sql => {
                     if let Some(ref qr) = self.state.query_result {
                         let count = qr.row_count();
                         self.sql_grid.selected_row = count.saturating_sub(1);
@@ -628,13 +736,13 @@ impl App {
                         // Load the selected table's data
                         self.load_table_data().await;
                         self.state.focus = FocusPanel::Main;
-                        self.state.current_tab = Tab::Query;
+                        self.state.current_tab = Tab::Tables;
                         self.tables_grid = TableGridState::new();
                     }
                 }
             }
             FocusPanel::Main => {
-                if self.state.current_tab == Tab::Schema {
+                if self.state.current_tab == Tab::Sql {
                     self.state.focus = FocusPanel::SqlInput;
                 }
             }
@@ -656,13 +764,16 @@ impl App {
         let client = self.client.clone();
         let tx = self.event_tx.clone();
         tokio::spawn(async move {
-            match client.get_schema(&db).await {
-                Ok(schema) => {
-                    let _ = tx.send(AppEvent::SchemaLoaded(schema));
-                }
-                Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!("Schema load failed: {e:#}")));
-                }
+            match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.get_schema(&db)).await {
+                Ok(Ok(schema)) => send_event(&tx, AppEvent::SchemaLoaded(schema)),
+                Ok(Err(e)) => send_event(
+                    &tx,
+                    AppEvent::Error(format!("Schema load failed: {e:#}")),
+                ),
+                Err(_) => send_event(
+                    &tx,
+                    AppEvent::Error("Schema load timed out".to_string()),
+                ),
             }
         });
     }
@@ -678,28 +789,27 @@ impl App {
         };
 
         self.state.query_loading = true;
-        self.state.query_result = None;
+        self.state.table_browse_result = None;
 
         let sql = format!("SELECT * FROM {table} LIMIT 200");
         let client = self.client.clone();
         let tx = self.event_tx.clone();
-        let start = Instant::now();
 
         tokio::spawn(async move {
-            match client.query_sql(&db, &sql).await {
-                Ok(result) => {
-                    let _ = tx.send(AppEvent::QueryResult {
-                        result,
-                        duration: start.elapsed(),
-                        sql,
-                    });
-                }
-                Err(e) => {
-                    let _ = tx.send(AppEvent::QueryError {
-                        sql,
+            match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.query_sql(&db, &sql)).await {
+                Ok(Ok(result)) => send_event(&tx, AppEvent::TableBrowseResult { result }),
+                Ok(Err(e)) => send_event(
+                    &tx,
+                    AppEvent::TableBrowseError {
                         error: format!("{e:#}"),
-                    });
-                }
+                    },
+                ),
+                Err(_) => send_event(
+                    &tx,
+                    AppEvent::TableBrowseError {
+                        error: "table load timed out".to_string(),
+                    },
+                ),
             }
         });
     }
@@ -728,35 +838,46 @@ impl App {
         let sql_clone = sql.clone();
 
         tokio::spawn(async move {
-            match client.query_sql(&db, &sql_clone).await {
-                Ok(result) => {
-                    let _ = tx.send(AppEvent::QueryResult {
+            let outcome =
+                tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.query_sql(&db, &sql_clone))
+                    .await;
+            match outcome {
+                Ok(Ok(result)) => send_event(
+                    &tx,
+                    AppEvent::QueryResult {
                         result,
                         duration: start.elapsed(),
                         sql: sql_clone,
-                    });
-                }
-                Err(e) => {
-                    let _ = tx.send(AppEvent::QueryError {
+                    },
+                ),
+                Ok(Err(e)) => send_event(
+                    &tx,
+                    AppEvent::QueryError {
                         sql: sql_clone,
                         error: format!("{e:#}"),
-                    });
-                }
+                    },
+                ),
+                Err(_) => send_event(
+                    &tx,
+                    AppEvent::QueryError {
+                        sql: sql_clone,
+                        error: "SQL query timed out".to_string(),
+                    },
+                ),
             }
         });
     }
 
     async fn refresh_current_view(&mut self) {
         match self.state.current_tab {
-            Tab::Query => {
+            Tab::Tables => {
                 self.load_table_data().await;
             }
-            Tab::Schema => {
+            Tab::Sql => {
                 // Re-execute last SQL if any
                 if let Some(entry) = self.state.sql_history.back() {
                     let sql = entry.sql.clone();
                     self.sql_input.set(sql);
-                    self.state.sql_input = self.sql_input.value.clone();
                     self.execute_sql().await;
                 }
             }
@@ -767,12 +888,17 @@ impl App {
                 let client = self.client.clone();
                 let tx = self.event_tx.clone();
                 tokio::spawn(async move {
-                    if let Ok(text) = client.get_metrics().await {
+                    if let Ok(Ok(text)) =
+                        tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.get_metrics()).await
+                    {
                         let snapshot = parse_prometheus_metrics(&text);
-                        let _ = tx.send(AppEvent::MetricsLoaded(snapshot));
+                        send_event(&tx, AppEvent::MetricsLoaded(snapshot));
                     }
-                    let ok = client.ping().await;
-                    let _ = tx.send(AppEvent::PingResult(ok));
+                    let ok = matches!(
+                        tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.ping()).await,
+                        Ok(true)
+                    );
+                    send_event(&tx, AppEvent::PingResult(ok));
                 });
             }
             Tab::Module => {
@@ -789,13 +915,18 @@ impl App {
         let client = self.client.clone();
         let tx = self.event_tx.clone();
         tokio::spawn(async move {
-            match client.get_logs(&db, 500, false).await {
-                Ok(logs) => {
-                    let _ = tx.send(AppEvent::LogsLoaded(logs));
-                }
-                Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!("Logs fetch failed: {e:#}")));
-                }
+            match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.get_logs(&db, 500, false))
+                .await
+            {
+                Ok(Ok(logs)) => send_event(&tx, AppEvent::LogsLoaded(logs)),
+                Ok(Err(e)) => send_event(
+                    &tx,
+                    AppEvent::Error(format!("Logs fetch failed: {e:#}")),
+                ),
+                Err(_) => send_event(
+                    &tx,
+                    AppEvent::Error("Logs fetch timed out".to_string()),
+                ),
             }
         });
     }
@@ -804,13 +935,16 @@ impl App {
 
     /// Connect a WebSocket subscription for the currently selected database.
     ///
-    /// Closes any existing WebSocket connection before opening a new one.
+    /// Closes any existing WebSocket connection before opening a new one and
+    /// clears any stale live-data cache from a previous database.
     async fn connect_ws(&mut self) {
         // Close existing connection if any
         if let Some(ref handle) = self.ws_handle {
             handle.close().await;
         }
         self.ws_handle = None;
+        self.state.ws_connected = false;
+        self.state.live_table_data.clear();
 
         let db = match self.state.selected_database() {
             Some(d) => d.to_string(),
@@ -831,9 +965,10 @@ impl App {
             }
             Err(e) => {
                 tracing::warn!("Failed to spawn WebSocket subscription: {e}");
-                let _ = self.event_tx.send(AppEvent::Notification(
-                    format!("WebSocket unavailable: {e}"),
-                ));
+                send_event(
+                    &self.event_tx,
+                    AppEvent::Notification(format!("WebSocket unavailable: {e}")),
+                );
             }
         }
     }
@@ -857,6 +992,9 @@ impl App {
         match event {
             WsEvent::Connected => {
                 tracing::info!("WebSocket connected");
+                self.state.ws_connected = true;
+                self.state.ws_reconnect_deadline = None;
+                self.state.ws_reconnect_attempt = 0;
                 // Subscribe to all user tables after connection
                 self.ws_subscribe_all_tables().await;
             }
@@ -864,13 +1002,26 @@ impl App {
                 self.handle_ws_server_message(msg);
             }
             WsEvent::LogLine(entry) => {
-                let _ = self.event_tx.send(AppEvent::LogLine(entry));
+                send_event(&self.event_tx, AppEvent::LogLine(entry));
             }
             WsEvent::Disconnected { reason } => {
                 tracing::warn!("WebSocket disconnected: {reason}");
-                let _ = self.event_tx.send(AppEvent::Notification(
-                    format!("WebSocket disconnected: {reason}"),
-                ));
+                self.state.ws_connected = false;
+                send_event(
+                    &self.event_tx,
+                    AppEvent::Notification(format!("WebSocket disconnected: {reason}")),
+                );
+            }
+            WsEvent::Reconnecting { attempt, delay_ms } => {
+                tracing::info!(
+                    "WebSocket reconnect attempt {attempt} in {delay_ms}ms"
+                );
+                self.state.ws_reconnect_attempt = attempt;
+                self.state.ws_reconnect_deadline =
+                    Some(Instant::now() + Duration::from_millis(delay_ms));
+                // No notification here — the status bar renders a live
+                // countdown from `ws_reconnect_deadline` so a persistent
+                // toast would just duplicate the information.
             }
             WsEvent::Error(e) => {
                 tracing::warn!("WebSocket error: {e}");
@@ -907,34 +1058,50 @@ impl App {
     fn handle_ws_server_message(&mut self, msg: crate::api::types::WsServerMessage) {
         use crate::api::types::WsServerMessage;
         match msg {
-            WsServerMessage::InitialSubscription { database_update, .. } => {
-                // Initial snapshot — update live data in state
-                for table_update in database_update.tables {
-                    tracing::debug!(
-                        "Initial subscription data for table '{}': {} rows",
-                        table_update.table_name,
-                        table_update.inserts.len()
-                    );
+            WsServerMessage::InitialSubscription(payload) => {
+                // Initial snapshot — replace any existing live data for each table.
+                let mut total_rows = 0usize;
+                for table_update in payload.database_update.tables {
+                    total_rows += table_update.inserts.len();
+                    self.state
+                        .live_table_data
+                        .insert(table_update.table_name, table_update.inserts);
                 }
-                let _ = self.event_tx.send(AppEvent::Notification(
-                    "Live data subscription active".to_string(),
-                ));
+                send_event(
+                    &self.event_tx,
+                    AppEvent::Notification(format!(
+                        "Live subscription active — {total_rows} rows"
+                    )),
+                );
             }
-            WsServerMessage::TransactionUpdate { database_update, .. } => {
-                // Incremental update — log for now, future: apply to live data
-                let total_changes: usize = database_update
-                    .tables
-                    .iter()
-                    .map(|t| t.inserts.len() + t.deletes.len())
-                    .sum();
+            WsServerMessage::TransactionUpdate(payload) => {
+                // Incremental update — apply inserts/deletes to the cached
+                // live data. Deletes are matched by exact JSON value equality
+                // (the server's row identity model isn't exposed in the JSON
+                // protocol, so this is a best-effort match).
+                let mut total_changes = 0usize;
+                for table_update in payload.database_update.tables {
+                    total_changes += table_update.inserts.len() + table_update.deletes.len();
+                    let entry = self
+                        .state
+                        .live_table_data
+                        .entry(table_update.table_name)
+                        .or_default();
+                    if !table_update.deletes.is_empty() {
+                        entry.retain(|row| !table_update.deletes.contains(row));
+                    }
+                    entry.extend(table_update.inserts);
+                }
                 if total_changes > 0 {
                     tracing::debug!("Transaction update: {total_changes} row changes");
                 }
             }
-            WsServerMessage::IdentityToken { identity, .. } => {
-                tracing::info!("WebSocket identity confirmed: {identity}");
+            WsServerMessage::IdentityToken(payload) => {
+                tracing::info!(
+                    "WebSocket identity confirmed: {:?}",
+                    payload.identity
+                );
             }
-            WsServerMessage::Unknown => {}
         }
     }
 
@@ -974,9 +1141,10 @@ impl App {
                 }
                 self.state.current_schema = Some(schema);
                 let table_count = self.state.tables.len();
-                let _ = self.event_tx.send(AppEvent::Notification(
-                    format!("Schema loaded — {table_count} tables"),
-                ));
+                send_event(
+                    &self.event_tx,
+                    AppEvent::Notification(format!("Schema loaded — {table_count} tables")),
+                );
                 // Establish WebSocket subscription for live data
                 self.connect_ws().await;
             }
@@ -1009,6 +1177,21 @@ impl App {
                     row_count: None,
                     error: Some(error.clone()),
                 });
+                self.state.set_error(error);
+            }
+
+            AppEvent::TableBrowseResult { result } => {
+                self.state.query_loading = false;
+                let row_count = result.row_count();
+                self.state.table_browse_result = Some(result);
+                // Reset the Tables grid scroll/selection on fresh data.
+                self.tables_grid = TableGridState::new();
+                self.state
+                    .set_notification(format!("{row_count} rows loaded"));
+            }
+
+            AppEvent::TableBrowseError { error } => {
+                self.state.query_loading = false;
                 self.state.set_error(error);
             }
 
@@ -1113,10 +1296,10 @@ pub fn draw_frame(
 
     // ── Tab content ───────────────────────────────────────────────────────
     match state.current_tab {
-        crate::state::Tab::Query => {
+        crate::state::Tab::Tables => {
             render_tables(content_areas.content, frame.buffer_mut(), state, tables_grid);
         }
-        crate::state::Tab::Schema => {
+        crate::state::Tab::Sql => {
             render_sql(
                 content_areas.content,
                 frame.buffer_mut(),

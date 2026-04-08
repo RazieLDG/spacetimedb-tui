@@ -39,12 +39,12 @@ const SECTIONS: &[Section] = &[
             Binding { key: "1-5",             desc: "Jump to tab (Tables/SQL/Logs/Metrics/Module)" },
             Binding { key: "j / ↓",           desc: "Move selection down" },
             Binding { key: "k / ↑",           desc: "Move selection up" },
-            Binding { key: "h / ←",           desc: "Scroll / move left" },
-            Binding { key: "l / →",           desc: "Scroll / move right" },
+            Binding { key: "h / ←",           desc: "Sidebar: step up (Tables → Databases) / focus sidebar from main" },
+            Binding { key: "l / →",           desc: "Focus main pane" },
             Binding { key: "g / Home",        desc: "Jump to first item" },
             Binding { key: "G / End",         desc: "Jump to last item" },
             Binding { key: "Enter",           desc: "Select / confirm" },
-            Binding { key: "Esc",             desc: "Cancel / close modal" },
+            Binding { key: "Esc / Backspace", desc: "Sidebar: step up tree; otherwise focus sidebar" },
         ],
     },
     Section {
@@ -71,6 +71,7 @@ const SECTIONS: &[Section] = &[
         title: "Logs",
         bindings: &[
             Binding { key: "Space",           desc: "Pause / resume auto-scroll" },
+            Binding { key: "f",               desc: "Cycle minimum log level filter" },
             Binding { key: "r",               desc: "Refresh logs" },
             Binding { key: "c",               desc: "Clear log buffer" },
         ],
@@ -80,6 +81,7 @@ const SECTIONS: &[Section] = &[
         bindings: &[
             Binding { key: "q",               desc: "Quit the application" },
             Binding { key: "Ctrl+C",          desc: "Force quit" },
+            Binding { key: "Ctrl+R",          desc: "Force WebSocket reconnect" },
             Binding { key: "?",               desc: "Toggle this help overlay" },
             Binding { key: "r",               desc: "Refresh current view" },
         ],

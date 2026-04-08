@@ -190,6 +190,22 @@ impl std::fmt::Display for LogLevel {
     }
 }
 
+impl LogLevel {
+    /// Cycle to the next minimum-level filter, in increasing severity.
+    /// Wraps around: Panic → Trace.
+    pub fn next_filter(self) -> Self {
+        match self {
+            LogLevel::Trace => LogLevel::Debug,
+            LogLevel::Debug => LogLevel::Info,
+            LogLevel::Info => LogLevel::Warn,
+            LogLevel::Warn => LogLevel::Error,
+            LogLevel::Error => LogLevel::Panic,
+            LogLevel::Panic => LogLevel::Trace,
+            LogLevel::Unknown => LogLevel::Trace,
+        }
+    }
+}
+
 /// A single log line emitted by a SpacetimeDB module.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LogEntry {
@@ -228,35 +244,67 @@ impl LogEntry {
 // ---------------------------------------------------------------------------
 
 /// The type of a WebSocket message received from SpacetimeDB.
+///
+/// SpacetimeDB's `v1.json.spacetimedb` subprotocol uses SATS externally
+/// tagged enums — i.e. `{"IdentityToken": {...}}` rather than
+/// `{"type": "IdentityToken", ...}`. Every field with `#[serde(default)]`
+/// is tolerated so that field renames in newer server versions don't break
+/// the decoder entirely.
+///
+/// Messages we don't recognise (e.g. new variants added by a future server
+/// version) fail deserialisation and are surfaced as [`super::types::…`]'s
+/// `RawText` event by `decode_subscription_frame`, which is a safe no-op
+/// for the UI.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsServerMessage {
     /// Initial data snapshot after subscribing to a query.
-    InitialSubscription {
-        database_update: DatabaseUpdate,
-        request_id: u32,
-        total_host_execution_duration_micros: u64,
-    },
+    InitialSubscription(InitialSubscriptionPayload),
     /// Incremental update pushed by the server.
-    TransactionUpdate {
-        status: TransactionStatus,
-        timestamp: Value,
-        caller_identity: String,
-        caller_address: String,
-        reducer_call: Value,
-        energy_quanta_used: Value,
-        total_host_execution_duration_micros: u64,
-        database_update: DatabaseUpdate,
-    },
+    TransactionUpdate(TransactionUpdatePayload),
     /// Server acknowledges an identity.
-    IdentityToken {
-        identity: String,
-        token: String,
-        address: String,
-    },
-    /// Catch-all for unknown message types.
-    #[serde(other)]
-    Unknown,
+    IdentityToken(IdentityTokenPayload),
+}
+
+/// Payload of [`WsServerMessage::InitialSubscription`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InitialSubscriptionPayload {
+    #[serde(default)]
+    pub database_update: DatabaseUpdate,
+    #[serde(default)]
+    pub request_id: u32,
+    /// Server-side execution time. Newer servers use
+    /// `total_host_execution_duration` (nanos as i64); older ones used
+    /// `total_host_execution_duration_micros`. We don't need the value
+    /// directly, so leave it untyped.
+    #[serde(default)]
+    pub total_host_execution_duration: Option<Value>,
+}
+
+/// Payload of [`WsServerMessage::TransactionUpdate`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TransactionUpdatePayload {
+    #[serde(default)]
+    pub status: Option<TransactionStatus>,
+    #[serde(default)]
+    pub database_update: DatabaseUpdate,
+    /// Other fields (timestamp, caller identity, energy usage, …) are
+    /// preserved as raw JSON so future server additions don't break
+    /// decoding. The UI only needs `database_update` today.
+    #[serde(flatten, default)]
+    pub extra: std::collections::HashMap<String, Value>,
+}
+
+/// Payload of [`WsServerMessage::IdentityToken`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct IdentityTokenPayload {
+    #[serde(default)]
+    pub identity: Option<Value>,
+    #[serde(default)]
+    pub token: Option<String>,
+    /// Newer SpacetimeDB versions use `connection_id`, some older ones
+    /// used `address`. Accept either by flattening the rest of the payload.
+    #[serde(flatten, default)]
+    pub extra: std::collections::HashMap<String, Value>,
 }
 
 /// Status of a committed transaction.

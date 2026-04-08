@@ -29,8 +29,8 @@ const BORDER_NORMAL: Color = Color::Rgb(40, 50, 65);
 /// Maps [`Tab`] variants to their display labels (with shortcut hints).
 pub fn tab_title(tab: Tab) -> &'static str {
     match tab {
-        Tab::Query   => " 1:Tables ",
-        Tab::Schema  => " 2:SQL ",
+        Tab::Tables   => " 1:Tables ",
+        Tab::Sql  => " 2:SQL ",
         Tab::Logs    => " 3:Logs ",
         Tab::Metrics => " 4:Metrics ",
         Tab::Module  => " 5:Module ",

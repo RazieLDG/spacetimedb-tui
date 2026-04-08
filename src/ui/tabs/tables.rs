@@ -20,13 +20,9 @@ use ratatui::{
 use crate::state::AppState;
 use crate::ui::components::table_grid::{render_empty, TableGrid, TableGridState};
 
-// ── Theme ─────────────────────────────────────────────────────────────────────
-const ACCENT: Color = Color::Cyan;
-const FG_MUTED: Color = Color::Rgb(110, 110, 110);
-const BG_INFO: Color = Color::Rgb(20, 28, 42);
-const WARNING: Color = Color::Rgb(229, 192, 123);
-const BORDER_FOCUSED: Color = Color::Cyan;
-const BORDER_NORMAL: Color = Color::Rgb(40, 50, 65);
+fn rgb((r, g, b): (u8, u8, u8)) -> Color {
+    Color::Rgb(r, g, b)
+}
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -37,15 +33,20 @@ pub fn render_tables(
     app: &AppState,
     grid_state: &mut TableGridState,
 ) {
+    let theme = &app.theme;
+    let accent = rgb(theme.accent);
+    let border_focused = rgb(theme.border_focused);
+    let border_normal = rgb(theme.border_normal);
+
     // Outer block
     let focused = matches!(app.focus, crate::state::FocusPanel::Main);
-    let border_color = if focused { BORDER_FOCUSED } else { BORDER_NORMAL };
+    let border_color = if focused { border_focused } else { border_normal };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
         .title(Span::styled(
             " 📋 Table Browser ",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
     block.render(area, buf);
@@ -96,11 +97,19 @@ pub fn render_tables(
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn render_info_bar(area: Rect, buf: &mut Buffer, app: &AppState) {
+    let theme = &app.theme;
+    let accent = rgb(theme.accent);
+    let fg_primary = rgb(theme.fg_primary);
+    let fg_muted = rgb(theme.fg_muted);
+    let warning = rgb(theme.warning);
+    let success = rgb(theme.success);
+    let bg_info = rgb(theme.bg_secondary);
+
     // Fill background
     for x in area.x..area.x + area.width {
         buf[(x, area.y)]
             .set_char(' ')
-            .set_style(Style::default().bg(BG_INFO));
+            .set_style(Style::default().bg(bg_info));
     }
 
     let mut spans: Vec<Span> = Vec::new();
@@ -108,38 +117,48 @@ fn render_info_bar(area: Rect, buf: &mut Buffer, app: &AppState) {
     if let Some(db) = app.selected_database() {
         spans.push(Span::styled(
             format!(" 🗄 {db}"),
-            Style::default().fg(ACCENT),
+            Style::default().fg(accent),
         ));
     }
     if let Some(tbl) = app.selected_table() {
         spans.push(Span::styled(
             format!("  ›  {}", tbl.table_name),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default().fg(fg_primary).add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(
             format!("  ({} columns)", tbl.columns.len()),
-            Style::default().fg(FG_MUTED),
+            Style::default().fg(fg_muted),
         ));
     }
 
-    if let Some(ref qr) = app.query_result {
+    if let Some(ref qr) = app.table_browse_result {
         spans.push(Span::styled(
             format!("  {} rows", qr.row_count()),
-            Style::default().fg(FG_MUTED),
+            Style::default().fg(fg_muted),
         ));
+    }
+
+    // Live subscription badge for the currently selected table.
+    if let Some(tbl) = app.selected_table() {
+        if let Some(live_rows) = app.live_table_data.get(&tbl.table_name) {
+            spans.push(Span::styled(
+                format!("  ● live: {} rows", live_rows.len()),
+                Style::default().fg(success).add_modifier(Modifier::BOLD),
+            ));
+        }
     }
 
     if app.query_loading {
         spans.push(Span::styled(
             "  ⟳ loading…",
-            Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
+            Style::default().fg(warning).add_modifier(Modifier::BOLD),
         ));
     }
 
     // Right-align hint
     let hint = Span::styled(
         " r:refresh  n:next  p:prev ",
-        Style::default().fg(FG_MUTED),
+        Style::default().fg(fg_muted),
     );
     let hint_w = hint.content.len() as u16;
     let hint_x = area.x + area.width.saturating_sub(hint_w);
@@ -149,11 +168,12 @@ fn render_info_bar(area: Rect, buf: &mut Buffer, app: &AppState) {
     buf.set_line(hint_x, area.y, &Line::from(hint), hint_w);
 }
 
-/// Build (headers, rows, title) from the current query result or table cache.
+/// Build (headers, rows, title) from the latest table-browse result or cache.
 fn build_table_data(app: &AppState) -> Option<(Vec<String>, Vec<Vec<String>>, String)> {
-    // Prefer the live query result if it's for the current table
-    let qr = app.query_result.as_ref().or_else(|| {
-        // Try cache
+    // Prefer the most recent table-browse result; fall back to the cache if
+    // available (e.g. when navigating back to a table that was loaded earlier
+    // in the session).
+    let qr = app.table_browse_result.as_ref().or_else(|| {
         let db = app.selected_database()?;
         let tbl = app.selected_table()?;
         let key = AppState::cache_key(db, &tbl.table_name);

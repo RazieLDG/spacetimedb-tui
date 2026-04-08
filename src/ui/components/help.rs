@@ -84,6 +84,13 @@ const SECTIONS: &[Section] = &[
             Binding { key: "i",               desc: "Insert new row (opens form)" },
             Binding { key: "U (shift-u)",     desc: "Update selected row (opens edit form)" },
             Binding { key: "d",               desc: "Delete selected row (asks for y/n confirm)" },
+            Binding { key: "D (shift-d)",     desc: "Truncate table (typed-confirm: type the name)" },
+        ],
+    },
+    Section {
+        title: "Admin ops (sidebar — Databases)",
+        bindings: &[
+            Binding { key: "D (shift-d)",     desc: "DELETE database (typed-confirm: type the name)" },
         ],
     },
     Section {

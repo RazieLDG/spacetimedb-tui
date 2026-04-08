@@ -87,6 +87,23 @@ pub enum ModalAction {
         table: String,
         where_sql: String,
     },
+    /// Permanently delete an entire database.
+    ///
+    /// Always wrapped in a one-field [`Modal::Form`] where the user
+    /// has to type the database name verbatim — accidental triggers
+    /// would be too dangerous for a plain y/n confirm.
+    DeleteDatabase {
+        /// Name (or hex identity) of the database to delete. Used
+        /// both for the API call and as the typed-confirm string.
+        database: String,
+    },
+    /// Delete every row from a table (`DELETE FROM <table>`). Used
+    /// instead of `DROP TABLE` because SpacetimeDB tables are part
+    /// of the published module schema and cannot be dropped via SQL.
+    /// Same typed-confirm guard as [`DeleteDatabase`].
+    TruncateTable {
+        table: String,
+    },
 }
 
 impl ModalAction {
@@ -98,6 +115,8 @@ impl ModalAction {
             ModalAction::InsertRow { table, .. } => format!("insert into {table}"),
             ModalAction::UpdateRow { table, .. } => format!("update {table}"),
             ModalAction::DeleteRow { table, .. } => format!("delete from {table}"),
+            ModalAction::DeleteDatabase { database } => format!("delete db {database}"),
+            ModalAction::TruncateTable { table } => format!("truncate {table}"),
         }
     }
 }
@@ -199,6 +218,20 @@ mod tests {
             }
             .op_label(),
             "delete from users"
+        );
+        assert_eq!(
+            ModalAction::DeleteDatabase {
+                database: "alice-state".to_string(),
+            }
+            .op_label(),
+            "delete db alice-state"
+        );
+        assert_eq!(
+            ModalAction::TruncateTable {
+                table: "events".to_string(),
+            }
+            .op_label(),
+            "truncate events"
         );
     }
 

@@ -98,6 +98,12 @@ impl SpacetimeClient {
         self.maybe_auth(req)
     }
 
+    /// Build a `DELETE` request, attaching the auth token when present.
+    fn delete(&self, url: &str) -> reqwest::RequestBuilder {
+        let req = self.http.delete(url);
+        self.maybe_auth(req)
+    }
+
     fn maybe_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.auth_token {
             Some(token) => req.bearer_auth(token),
@@ -258,6 +264,42 @@ impl SpacetimeClient {
             return Ok(Value::Null);
         }
         serde_json::from_str(&text).context("Failed to decode reducer response")
+    }
+
+    /// Permanently delete a database.
+    ///
+    /// SpacetimeDB endpoint: `DELETE /v1/database/<database>`
+    /// Requires the bearer token to belong to the database's owner;
+    /// anonymous requests are rejected with HTTP 401 / 403.
+    ///
+    /// On the wire the server returns an empty body on success, so we
+    /// don't try to decode anything — only the HTTP status matters.
+    #[instrument(skip(self), fields(db = %database))]
+    pub async fn delete_database(&self, database: &str) -> Result<()> {
+        let url = format!("{}/v1/database/{}", self.base_url, database);
+        debug!("Deleting database");
+
+        let resp = self
+            .delete(&url)
+            .send()
+            .await
+            .context("Delete database request failed")?;
+
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let body = resp.text().await.unwrap_or_default();
+        let body_snip: String = body.chars().take(200).collect();
+        match status.as_u16() {
+            401 | 403 => bail!(
+                "Delete '{database}' rejected (HTTP {status}). The current \
+                 token does not own this database — try `spacetime login` \
+                 with the owner identity, or pass `--token` explicitly."
+            ),
+            404 => bail!("Database '{database}' not found (HTTP 404)"),
+            _ => bail!("Delete database HTTP {status}: {body_snip}"),
+        }
     }
 
     /// Retrieve the last `num_lines` log lines for `database`.

@@ -799,6 +799,26 @@ impl App {
                 return;
             }
 
+            // ── Destructive admin ops (typed-confirm forms) ───────
+            // Shift+D on the Tables tab → truncate the selected
+            // table (DELETE FROM <table>). Same key on the sidebar
+            // when focused on the Databases panel → delete the
+            // entire database via DELETE /v1/database/<name>.
+            KeyCode::Char('D')
+                if self.state.focus == FocusPanel::Main
+                    && self.state.current_tab == Tab::Tables =>
+            {
+                self.open_truncate_table_form();
+                return;
+            }
+            KeyCode::Char('D')
+                if self.state.focus == FocusPanel::Sidebar
+                    && self.state.sidebar_focus == SidebarFocus::Databases =>
+            {
+                self.open_delete_db_form();
+                return;
+            }
+
             // Sort — `s` cycles the sort state (off → asc → desc → off)
             // on the currently-selected column.
             KeyCode::Char('s')
@@ -1702,12 +1722,58 @@ impl App {
         ));
     }
 
+    /// Open a typed-confirm form to permanently delete the currently
+    /// selected database. The user has to type the database name
+    /// verbatim into a single form field — a plain `[y/n]` would
+    /// be too easy to trigger by accident, and the operation is
+    /// irreversible.
+    fn open_delete_db_form(&mut self) {
+        let Some(db_name) = self.state.selected_database().map(str::to_string) else {
+            self.state
+                .set_notification("No database selected".to_string());
+            return;
+        };
+        let field = crate::state::modal::FormField::new(format!(
+            "Type '{db_name}' to confirm DELETE"
+        ))
+        .with_placeholder("required");
+        let action = crate::state::modal::ModalAction::DeleteDatabase {
+            database: db_name.clone(),
+        };
+        self.state.modal = Some(crate::state::modal::Modal::form(
+            format!("⚠ DELETE DATABASE {db_name}"),
+            vec![field],
+            action,
+        ));
+    }
+
+    /// Open a typed-confirm form to delete every row from the
+    /// currently selected table. SpacetimeDB tables are part of
+    /// the published module schema and cannot be `DROP`ped via SQL,
+    /// so this is the closest "delete the table" operation we can
+    /// safely offer from a TUI session — it issues `DELETE FROM
+    /// <table>` once the user has typed the table name back to us.
+    fn open_truncate_table_form(&mut self) {
+        let Some(table) = self.state.selected_table().map(|t| t.table_name.clone()) else {
+            self.state.set_notification("No table selected".to_string());
+            return;
+        };
+        let field = crate::state::modal::FormField::new(format!(
+            "Type '{table}' to confirm TRUNCATE"
+        ))
+        .with_placeholder("required");
+        let action = crate::state::modal::ModalAction::TruncateTable {
+            table: table.clone(),
+        };
+        self.state.modal = Some(crate::state::modal::Modal::form(
+            format!("⚠ TRUNCATE TABLE {table}"),
+            vec![field],
+            action,
+        ));
+    }
+
     /// Open a confirm dialog to delete the currently selected row.
-    /// Uses the first column of the table as the WHERE-clause key
-    /// (best-effort PK detection — SpacetimeDB schemas don't expose
-    /// a reliable "primary key" flag in the v9 JSON we already parse,
-    /// and the first column is the PK in the overwhelming majority
-    /// of real-world tables).
+    /// Uses the heuristic in [`pick_primary_key`] for the WHERE clause.
     fn open_delete_confirm(&mut self) {
         // Pull the data we need before borrowing mutably.
         let Some(table) = self.state.selected_table().cloned() else {
@@ -1928,6 +1994,28 @@ impl App {
                     );
                     self.spawn_write_sql(db, sql, op_label);
                 }
+                ModalAction::DeleteDatabase { database } => {
+                    // Typed-confirm: the user must type the database
+                    // name verbatim into the single form field.
+                    let typed = fields.first().map(|f| f.input.value.trim().to_string());
+                    if typed.as_deref() != Some(database.as_str()) {
+                        self.state
+                            .set_error(format!("Type '{database}' exactly to confirm"));
+                        return;
+                    }
+                    self.spawn_delete_database(database, op_label);
+                }
+                ModalAction::TruncateTable { table } => {
+                    // Same typed-confirm pattern as DeleteDatabase.
+                    let typed = fields.first().map(|f| f.input.value.trim().to_string());
+                    if typed.as_deref() != Some(table.as_str()) {
+                        self.state
+                            .set_error(format!("Type '{table}' exactly to confirm"));
+                        return;
+                    }
+                    let sql = format!("DELETE FROM {table}");
+                    self.spawn_write_sql(db, sql, op_label);
+                }
                 ModalAction::DeleteRow { .. } => {
                     // DeleteRow is always a Confirm, never a Form —
                     // unreachable but handle gracefully.
@@ -1946,6 +2034,56 @@ impl App {
                 }
             },
         }
+    }
+
+    /// Run `client.delete_database` on a background task. On success
+    /// re-bootstraps the database list so the now-deleted entry
+    /// disappears from the sidebar without a manual refresh.
+    fn spawn_delete_database(&self, database: String, op_label: String) {
+        let client = self.client.clone();
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.delete_database(&database))
+                .await
+            {
+                Ok(Ok(())) => {
+                    send_event(
+                        &tx,
+                        AppEvent::WriteOpSuccess {
+                            op: op_label,
+                            response: serde_json::json!({"deleted": database}),
+                        },
+                    );
+                    // Re-fetch the database list so the sidebar
+                    // updates immediately. The bootstrap helper
+                    // already does ping → list_databases under a
+                    // timeout.
+                    match tokio::time::timeout(
+                        HTTP_REQUEST_TIMEOUT,
+                        client.list_databases(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(dbs)) => send_event(&tx, AppEvent::DatabasesLoaded(dbs)),
+                        _ => {}
+                    }
+                }
+                Ok(Err(e)) => send_event(
+                    &tx,
+                    AppEvent::WriteOpError {
+                        op: op_label,
+                        error: format!("{e:#}"),
+                    },
+                ),
+                Err(_) => send_event(
+                    &tx,
+                    AppEvent::WriteOpError {
+                        op: op_label,
+                        error: "request timed out".to_string(),
+                    },
+                ),
+            }
+        });
     }
 
     /// Run `client.call_reducer` on a background task and route the

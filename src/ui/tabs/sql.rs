@@ -225,12 +225,18 @@ fn render_results(
                 .collect();
 
             let dur = format_micros(qr.total_duration_micros);
-            let title = format!("Results — {} rows  ({})", rows.len(), dur);
+            let base_title = format!("Results — {} rows  ({})", rows.len(), dur);
+            let title = match app.grid_search.as_deref() {
+                Some(q) if app.grid_search_editing => format!("{base_title}  /{q}_"),
+                Some(q) if !q.is_empty() => format!("{base_title}  [/{q}]"),
+                _ => base_title,
+            };
 
             TableGrid::new(&headers, &rows)
                 .title(title)
                 .focused(focused)
                 .max_col_width(60)
+                .highlight_query(app.grid_search.as_deref())
                 .render(area, buf, grid_state);
         }
     }

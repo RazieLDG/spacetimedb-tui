@@ -307,6 +307,18 @@ pub struct AppState {
     pub query_loading: bool,
 
     // ------------------------------------------------------------------
+    // Grid search
+    // ------------------------------------------------------------------
+    /// Case-insensitive query that the data-grid tabs filter rows by.
+    /// When `None`, no search is active; when `Some("")`, the user has
+    /// opened the prompt but hasn't typed anything yet.
+    pub grid_search: Option<String>,
+    /// While `Some(true)`, the next key in the main handler feeds the
+    /// search prompt instead of running regular bindings. Set by the
+    /// `Ctrl+F` handler and cleared on Enter / Esc.
+    pub grid_search_editing: bool,
+
+    // ------------------------------------------------------------------
     // SQL history
     // ------------------------------------------------------------------
     /// Ordered list of past SQL executions (most recent last).
@@ -406,6 +418,9 @@ impl AppState {
             result_scroll_row: 0,
             result_scroll_col: 0,
             query_loading: false,
+
+            grid_search: None,
+            grid_search_editing: false,
 
             sql_history: VecDeque::new(),
             history_cursor: None,

@@ -291,6 +291,15 @@ impl App {
                     self.state.history_cursor = None;
                     return;
                 }
+                KeyCode::Char('f')
+                    if matches!(self.state.current_tab, Tab::Tables | Tab::Sql)
+                        && self.state.focus == FocusPanel::Main =>
+                {
+                    // Ctrl+F opens the grid search prompt.
+                    self.state.grid_search = Some(String::new());
+                    self.state.grid_search_editing = true;
+                    return;
+                }
                 KeyCode::Char('w') if self.state.focus == FocusPanel::SqlInput => {
                     // Delete the previous word (Ctrl+W, classic Unix convention).
                     let before = &self.sql_input.value[..self.sql_input.cursor];
@@ -332,6 +341,36 @@ impl App {
         if self.state.error_message.is_some() {
             if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
                 self.state.clear_error();
+            }
+            return;
+        }
+
+        // ── Grid search prompt mode ───────────────────────────────────────
+        // When Ctrl+F is active on a data-grid tab, we intercept every key
+        // for the search buffer instead of running the regular bindings.
+        if self.state.grid_search_editing {
+            match key.code {
+                KeyCode::Esc => {
+                    // Cancel search entirely — clears the highlight.
+                    self.state.grid_search = None;
+                    self.state.grid_search_editing = false;
+                }
+                KeyCode::Enter => {
+                    // Commit the query; highlights stay and n/N navigate.
+                    self.state.grid_search_editing = false;
+                    self.jump_to_next_match(true);
+                }
+                KeyCode::Backspace => {
+                    if let Some(q) = self.state.grid_search.as_mut() {
+                        q.pop();
+                    }
+                }
+                KeyCode::Char(ch) => {
+                    if let Some(q) = self.state.grid_search.as_mut() {
+                        q.push(ch);
+                    }
+                }
+                _ => {}
             }
             return;
         }
@@ -438,26 +477,56 @@ impl App {
                 return;
             }
 
-            // Focus toggle between sidebar and main — plus "step up" the
-            // sidebar tree so that after opening a table the user can get
-            // back to the Databases list with Left / h.
-            KeyCode::Left | KeyCode::Char('h') => {
-                match self.state.focus {
-                    FocusPanel::Main => {
-                        self.state.focus = FocusPanel::Sidebar;
-                        return;
-                    }
-                    FocusPanel::Sidebar
-                        if self.state.sidebar_focus == SidebarFocus::Tables =>
-                    {
-                        self.state.sidebar_focus = SidebarFocus::Databases;
-                        return;
-                    }
-                    _ => {}
+            // Sidebar focus: h/← steps up Tables → Databases; l/→ moves
+            // focus over into the main pane.
+            KeyCode::Left | KeyCode::Char('h') if self.state.focus == FocusPanel::Sidebar => {
+                if self.state.sidebar_focus == SidebarFocus::Tables {
+                    self.state.sidebar_focus = SidebarFocus::Databases;
                 }
+                return;
             }
             KeyCode::Right | KeyCode::Char('l') if self.state.focus == FocusPanel::Sidebar => {
                 self.state.focus = FocusPanel::Main;
+                return;
+            }
+
+            // Main focus: h/← and l/→ move the cell cursor inside a data
+            // grid (Tables or SQL tabs). Use Esc to drop back to sidebar.
+            KeyCode::Left | KeyCode::Char('h')
+                if self.state.focus == FocusPanel::Main
+                    && matches!(self.state.current_tab, Tab::Tables | Tab::Sql) =>
+            {
+                let grid = if self.state.current_tab == Tab::Tables {
+                    &mut self.tables_grid
+                } else {
+                    &mut self.sql_grid
+                };
+                grid.prev_col();
+                return;
+            }
+            KeyCode::Right | KeyCode::Char('l')
+                if self.state.focus == FocusPanel::Main
+                    && matches!(self.state.current_tab, Tab::Tables | Tab::Sql) =>
+            {
+                let col_count = if self.state.current_tab == Tab::Tables {
+                    self.state
+                        .table_browse_result
+                        .as_ref()
+                        .map(|qr| qr.column_count())
+                        .unwrap_or(0)
+                } else {
+                    self.state
+                        .query_result
+                        .as_ref()
+                        .map(|qr| qr.column_count())
+                        .unwrap_or(0)
+                };
+                let grid = if self.state.current_tab == Tab::Tables {
+                    &mut self.tables_grid
+                } else {
+                    &mut self.sql_grid
+                };
+                grid.next_col(col_count);
                 return;
             }
 
@@ -526,6 +595,79 @@ impl App {
                 return;
             }
 
+            // Clipboard — `y` yanks the currently selected cell, `Y`
+            // yanks the whole row (TSV-joined). Works on the data-grid
+            // tabs (Tables / SQL) when focus is in the main pane.
+            KeyCode::Char('y')
+                if self.state.focus == FocusPanel::Main
+                    && matches!(self.state.current_tab, Tab::Tables | Tab::Sql) =>
+            {
+                self.copy_selected_cell();
+                return;
+            }
+            KeyCode::Char('Y')
+                if self.state.focus == FocusPanel::Main
+                    && matches!(self.state.current_tab, Tab::Tables | Tab::Sql) =>
+            {
+                self.copy_selected_row();
+                return;
+            }
+
+            // Sort — `s` cycles the sort state (off → asc → desc → off)
+            // on the currently-selected column.
+            KeyCode::Char('s')
+                if self.state.focus == FocusPanel::Main
+                    && matches!(self.state.current_tab, Tab::Tables | Tab::Sql) =>
+            {
+                let col_count = self
+                    .active_grid()
+                    .map(|(qr, _)| qr.column_count())
+                    .unwrap_or(0);
+                if col_count == 0 {
+                    return;
+                }
+                let grid = if self.state.current_tab == Tab::Tables {
+                    &mut self.tables_grid
+                } else {
+                    &mut self.sql_grid
+                };
+                grid.cycle_sort(grid.selected_col);
+                let col_name = self
+                    .active_grid()
+                    .and_then(|(qr, g)| {
+                        qr.column_names().get(g.selected_col).map(|s| s.to_string())
+                    })
+                    .unwrap_or_default();
+                let dir = match (
+                    self.active_grid().map(|(_, g)| g.sort_col),
+                    self.active_grid().map(|(_, g)| g.sort_desc),
+                ) {
+                    (Some(Some(_)), Some(false)) => "asc",
+                    (Some(Some(_)), Some(true)) => "desc",
+                    _ => "off",
+                };
+                self.state
+                    .set_notification(format!("Sort {col_name} {dir}"));
+                return;
+            }
+
+            // Export — `e` writes a CSV, `E` writes a JSON file under
+            // `./exports/` for the currently visible query result.
+            KeyCode::Char('e')
+                if self.state.focus == FocusPanel::Main
+                    && matches!(self.state.current_tab, Tab::Tables | Tab::Sql) =>
+            {
+                self.export_current_result(crate::ui::export::ExportFormat::Csv);
+                return;
+            }
+            KeyCode::Char('E')
+                if self.state.focus == FocusPanel::Main
+                    && matches!(self.state.current_tab, Tab::Tables | Tab::Sql) =>
+            {
+                self.export_current_result(crate::ui::export::ExportFormat::Json);
+                return;
+            }
+
             // Log-specific
             KeyCode::Char(' ') if self.state.current_tab == Tab::Logs => {
                 self.state.log_follow = !self.state.log_follow;
@@ -545,7 +687,25 @@ impl App {
                 return;
             }
 
-            // Page navigation in tables
+            // `n` / `N` on data-grid tabs: jump to next / previous
+            // search match when a search query is active, otherwise
+            // fall through to page-scroll on the Tables tab.
+            KeyCode::Char('n')
+                if matches!(self.state.current_tab, Tab::Tables | Tab::Sql)
+                    && self.state.grid_search.is_some() =>
+            {
+                self.jump_to_next_match(true);
+                return;
+            }
+            KeyCode::Char('N')
+                if matches!(self.state.current_tab, Tab::Tables | Tab::Sql)
+                    && self.state.grid_search.is_some() =>
+            {
+                self.jump_to_next_match(false);
+                return;
+            }
+
+            // Page navigation in tables (no active search)
             KeyCode::Char('n') if self.state.current_tab == Tab::Tables => {
                 self.tables_grid.scroll_row = self.tables_grid.scroll_row.saturating_add(20);
                 return;
@@ -848,6 +1008,262 @@ impl App {
                 ),
             }
         });
+    }
+
+    /// Return a reference to the `QueryResult` / `TableGridState` pair
+    /// that backs the currently focused data-grid tab, together with
+    /// the table-name hint (if any) used for notifications.
+    fn active_grid(
+        &self,
+    ) -> Option<(&crate::api::types::QueryResult, &TableGridState)> {
+        match self.state.current_tab {
+            Tab::Tables => self
+                .state
+                .table_browse_result
+                .as_ref()
+                .map(|qr| (qr, &self.tables_grid)),
+            Tab::Sql => self
+                .state
+                .query_result
+                .as_ref()
+                .map(|qr| (qr, &self.sql_grid)),
+            _ => None,
+        }
+    }
+
+    /// Translate a grid's `selected_row` (which is in display order
+    /// when a sort is active) back to the underlying `QueryResult.rows`
+    /// index, so clipboard / export operations read the cells the user
+    /// is actually looking at.
+    fn active_data_row_index(&self) -> Option<usize> {
+        let (qr, grid) = self.active_grid()?;
+        // Re-project the rows into the same `Vec<Vec<String>>` that the
+        // renderer sorts, then ask `sorted_data_index` for the mapping.
+        let string_rows: Vec<Vec<String>> = qr
+            .rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(crate::ui::tabs::tables::value_to_display)
+                    .collect()
+            })
+            .collect();
+        crate::ui::components::table_grid::sorted_data_index(
+            &string_rows,
+            grid.sort_col,
+            grid.sort_desc,
+            grid.selected_row,
+        )
+    }
+
+    /// Copy the currently-highlighted cell to the terminal clipboard.
+    fn copy_selected_cell(&mut self) {
+        let cell_text = {
+            let data_idx = match self.active_data_row_index() {
+                Some(i) => i,
+                None => return,
+            };
+            let Some((qr, grid)) = self.active_grid() else {
+                return;
+            };
+            let row = match qr.rows.get(data_idx) {
+                Some(r) => r,
+                None => return,
+            };
+            let value = match row.get(grid.selected_col) {
+                Some(v) => v,
+                None => return,
+            };
+            crate::ui::tabs::tables::value_to_display(value)
+        };
+
+        match crate::ui::clipboard::copy_to_clipboard(&cell_text) {
+            Ok(n) => {
+                let preview: String = cell_text.chars().take(40).collect();
+                self.state
+                    .set_notification(format!("Copied {n}B: {preview}"));
+            }
+            Err(e) => {
+                tracing::warn!("clipboard copy failed: {e}");
+                self.state
+                    .set_error(format!("Clipboard copy failed: {e}"));
+            }
+        }
+    }
+
+    /// Copy the currently-selected row to the terminal clipboard as a
+    /// TSV (tab-separated values) line.
+    fn copy_selected_row(&mut self) {
+        let (row_text, col_count) = {
+            let data_idx = match self.active_data_row_index() {
+                Some(i) => i,
+                None => return,
+            };
+            let Some((qr, _grid)) = self.active_grid() else {
+                return;
+            };
+            let row = match qr.rows.get(data_idx) {
+                Some(r) => r,
+                None => return,
+            };
+            let tsv = row
+                .iter()
+                .map(crate::ui::tabs::tables::value_to_display)
+                .collect::<Vec<_>>()
+                .join("\t");
+            (tsv, row.len())
+        };
+
+        match crate::ui::clipboard::copy_to_clipboard(&row_text) {
+            Ok(n) => {
+                self.state
+                    .set_notification(format!("Copied row ({col_count} cells, {n}B)"));
+            }
+            Err(e) => {
+                tracing::warn!("clipboard copy failed: {e}");
+                self.state
+                    .set_error(format!("Clipboard copy failed: {e}"));
+            }
+        }
+    }
+
+    /// Move the cell cursor to the next (or previous, if `forward` is
+    /// `false`) row that contains a match for the current grid search
+    /// query. Wraps around the end of the result set.
+    ///
+    /// A "match" is any cell whose string representation contains the
+    /// query as a case-insensitive substring. Used by Enter on the
+    /// search prompt and by `n` / `N` afterwards.
+    fn jump_to_next_match(&mut self, forward: bool) {
+        let query = match self.state.grid_search.as_ref() {
+            Some(q) if !q.is_empty() => q.to_ascii_lowercase(),
+            _ => return,
+        };
+
+        // Snapshot the rows we're searching so we can release the
+        // immutable borrow on `state` before mutating the grid.
+        let rows: Vec<Vec<String>> = {
+            let qr = match self.state.current_tab {
+                Tab::Tables => self.state.table_browse_result.as_ref(),
+                Tab::Sql => self.state.query_result.as_ref(),
+                _ => return,
+            };
+            let Some(qr) = qr else {
+                return;
+            };
+            qr.rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(crate::ui::tabs::tables::value_to_display)
+                        .collect()
+                })
+                .collect()
+        };
+
+        if rows.is_empty() {
+            self.state.set_notification("No rows to search".to_string());
+            return;
+        }
+
+        let grid = if self.state.current_tab == Tab::Tables {
+            &mut self.tables_grid
+        } else {
+            &mut self.sql_grid
+        };
+
+        // Walk display order (which is `rows` when unsorted, or the
+        // sort permutation when a sort is active) so `n` / `N`
+        // visually steps by one row on screen each time.
+        let order: Vec<usize> = match grid.sort_col {
+            Some(col) => {
+                let mut idxs: Vec<usize> = (0..rows.len()).collect();
+                idxs.sort_by(|&a, &b| {
+                    let av = rows[a].get(col).map(String::as_str).unwrap_or("");
+                    let bv = rows[b].get(col).map(String::as_str).unwrap_or("");
+                    // Replicate `compare_cells` locally so we don't have
+                    // to expose it outside `table_grid`.
+                    match (av.parse::<f64>(), bv.parse::<f64>()) {
+                        (Ok(na), Ok(nb)) => {
+                            na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal)
+                        }
+                        _ => av
+                            .to_ascii_lowercase()
+                            .cmp(&bv.to_ascii_lowercase()),
+                    }
+                });
+                if grid.sort_desc {
+                    idxs.reverse();
+                }
+                idxs
+            }
+            None => (0..rows.len()).collect(),
+        };
+
+        let n = order.len();
+        let start = grid.selected_row.min(n - 1);
+        for step in 1..=n {
+            let display_idx = if forward {
+                (start + step) % n
+            } else {
+                (start + n - step) % n
+            };
+            let data_idx = order[display_idx];
+            if rows[data_idx]
+                .iter()
+                .any(|cell| cell.to_ascii_lowercase().contains(&query))
+            {
+                grid.selected_row = display_idx;
+                return;
+            }
+        }
+        self.state
+            .set_notification(format!("No match for \"{query}\""));
+    }
+
+    /// Serialise the currently visible query result to CSV or JSON and
+    /// write it under `./exports/`. Shows the resulting path in the
+    /// status bar notification so the user can `cat` / open it.
+    fn export_current_result(&mut self, format: crate::ui::export::ExportFormat) {
+        let (qr, label) = match self.state.current_tab {
+            Tab::Tables => {
+                let qr = match self.state.table_browse_result.as_ref() {
+                    Some(qr) => qr,
+                    None => {
+                        self.state.set_notification("Nothing to export".to_string());
+                        return;
+                    }
+                };
+                let label = self
+                    .state
+                    .selected_table()
+                    .map(|t| t.table_name.clone())
+                    .unwrap_or_else(|| "table".to_string());
+                (qr.clone(), label)
+            }
+            Tab::Sql => {
+                let qr = match self.state.query_result.as_ref() {
+                    Some(qr) => qr,
+                    None => {
+                        self.state.set_notification("Nothing to export".to_string());
+                        return;
+                    }
+                };
+                (qr.clone(), "query".to_string())
+            }
+            _ => return,
+        };
+
+        match crate::ui::export::write_export(&qr, format, &label) {
+            Ok(path) => {
+                self.state
+                    .set_notification(format!("Exported to {}", path.display()));
+            }
+            Err(e) => {
+                tracing::warn!("export failed: {e:#}");
+                self.state.set_error(format!("Export failed: {e:#}"));
+            }
+        }
     }
 
     /// Tab-complete the SQL input against the current schema.

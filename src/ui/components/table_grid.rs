@@ -28,12 +28,79 @@ const FG_MUTED: Color = Color::Rgb(120, 120, 120);
 /// Mutable state for a [`TableGrid`] widget.
 #[derive(Debug, Clone, Default)]
 pub struct TableGridState {
-    /// Index of the currently selected row (0-based).
+    /// Index of the currently selected row (0-based, in display order).
     pub selected_row: usize,
+    /// Index of the currently selected column (0-based). Used for
+    /// cell-level clipboard copy and highlighting.
+    pub selected_col: usize,
     /// First visible column index (horizontal scroll).
     pub scroll_col: usize,
     /// First visible row index (vertical scroll).
     pub scroll_row: usize,
+    /// Column index to sort by, if any. `None` means rows are shown in
+    /// their original order.
+    pub sort_col: Option<usize>,
+    /// Whether the sort is descending (true) or ascending (false).
+    pub sort_desc: bool,
+}
+
+impl TableGridState {
+    /// Toggle the sort state on a column: off → ascending → descending
+    /// → off. Used by the `s` key binding so the user can step through
+    /// the three states without memorising separate keys.
+    pub fn cycle_sort(&mut self, col: usize) {
+        match (self.sort_col, self.sort_desc) {
+            (Some(c), false) if c == col => {
+                // asc → desc
+                self.sort_desc = true;
+            }
+            (Some(c), true) if c == col => {
+                // desc → off
+                self.sort_col = None;
+                self.sort_desc = false;
+            }
+            _ => {
+                // any other state → asc on this column
+                self.sort_col = Some(col);
+                self.sort_desc = false;
+            }
+        }
+    }
+
+}
+
+/// Compute the original-data index for a given display-order row when
+/// the grid is sorted by `sort_col` (ascending unless `sort_desc`).
+///
+/// This is a free function rather than a method on `TableGridState`
+/// because it needs access to the raw cell strings to re-derive the
+/// permutation, and we don't want to drag a whole `Vec<Vec<String>>`
+/// into the state struct.
+pub fn sorted_data_index(
+    rows: &[Vec<String>],
+    sort_col: Option<usize>,
+    sort_desc: bool,
+    display_row: usize,
+) -> Option<usize> {
+    if rows.is_empty() {
+        return None;
+    }
+    let display = display_row.min(rows.len() - 1);
+    match sort_col {
+        None => Some(display),
+        Some(col) => {
+            let mut indices: Vec<usize> = (0..rows.len()).collect();
+            indices.sort_by(|&a, &b| {
+                let av = rows[a].get(col).map(String::as_str).unwrap_or("");
+                let bv = rows[b].get(col).map(String::as_str).unwrap_or("");
+                compare_cells(av, bv)
+            });
+            if sort_desc {
+                indices.reverse();
+            }
+            indices.get(display).copied()
+        }
+    }
 }
 
 impl TableGridState {
@@ -68,6 +135,27 @@ impl TableGridState {
         self.scroll_col = self.scroll_col.saturating_sub(1);
     }
 
+    /// Move the cell cursor one column to the right (clamped to
+    /// `col_count`). Also nudges horizontal scroll if we walked off the
+    /// right edge of the visible window.
+    pub fn next_col(&mut self, col_count: usize) {
+        if col_count == 0 {
+            return;
+        }
+        self.selected_col = (self.selected_col + 1).min(col_count - 1);
+        if self.selected_col > self.scroll_col + 8 {
+            self.scroll_col = self.selected_col.saturating_sub(8);
+        }
+    }
+
+    /// Move the cell cursor one column to the left.
+    pub fn prev_col(&mut self) {
+        self.selected_col = self.selected_col.saturating_sub(1);
+        if self.selected_col < self.scroll_col {
+            self.scroll_col = self.selected_col;
+        }
+    }
+
     /// Ensure the selected row is visible within `visible_height` rows.
     pub fn ensure_visible(&mut self, visible_height: usize) {
         if visible_height == 0 {
@@ -95,6 +183,10 @@ pub struct TableGrid<'a> {
     focused: bool,
     /// Maximum column width cap (default: 40).
     max_col_width: usize,
+    /// Case-insensitive substring to highlight in cell content. Rows
+    /// that contain the query are tinted with a yellow background so
+    /// search results are easy to spot at a glance.
+    highlight_query: Option<&'a str>,
 }
 
 impl<'a> TableGrid<'a> {
@@ -105,6 +197,7 @@ impl<'a> TableGrid<'a> {
             title: None,
             focused: false,
             max_col_width: 40,
+            highlight_query: None,
         }
     }
 
@@ -120,6 +213,14 @@ impl<'a> TableGrid<'a> {
 
     pub fn max_col_width(mut self, w: usize) -> Self {
         self.max_col_width = w;
+        self
+    }
+
+    /// Tint rows that contain `query` (case-insensitive) with a
+    /// distinctive background colour. Passing `None` or an empty
+    /// string disables highlighting.
+    pub fn highlight_query(mut self, query: Option<&'a str>) -> Self {
+        self.highlight_query = query.filter(|q| !q.is_empty());
         self
     }
 
@@ -253,7 +354,17 @@ impl<'a> StatefulWidget for TableGrid<'a> {
             let mut x = inner.x;
             for &ci in &visible_cols {
                 let w = col_widths[ci];
-                let cell = Self::render_cell(&self.headers[ci], w);
+                // Append a sort-direction indicator when this column is
+                // the active sort key, so the user knows which column
+                // drove the current order.
+                let header_text = match state.sort_col {
+                    Some(c) if c == ci => {
+                        let arrow = if state.sort_desc { " ↓" } else { " ↑" };
+                        format!("{}{}", self.headers[ci], arrow)
+                    }
+                    _ => self.headers[ci].clone(),
+                };
+                let cell = Self::render_cell(&header_text, w);
                 let span = Span::styled(
                     cell,
                     Style::default()
@@ -313,24 +424,56 @@ impl<'a> StatefulWidget for TableGrid<'a> {
         let data_start_y = inner.y + 2; // after header + separator
         let available_rows = inner.height.saturating_sub(2) as usize;
 
+        // Compute a display-order permutation from the sort state. When
+        // no sort is active this is just 0..n and walking it is a no-op.
+        // When a sort *is* active, `selected_row` indexes into this
+        // permutation, not into `self.rows` directly — the rest of the
+        // loop reads `self.rows[order[ri]]` to fetch the actual cells.
+        let row_order: Vec<usize> = match state.sort_col {
+            Some(col) if col < self.headers.len() && !self.rows.is_empty() => {
+                let mut indices: Vec<usize> = (0..self.rows.len()).collect();
+                indices.sort_by(|&a, &b| {
+                    let av = self.rows[a].get(col).map(String::as_str).unwrap_or("");
+                    let bv = self.rows[b].get(col).map(String::as_str).unwrap_or("");
+                    compare_cells(av, bv)
+                });
+                if state.sort_desc {
+                    indices.reverse();
+                }
+                indices
+            }
+            _ => (0..self.rows.len()).collect(),
+        };
+
         // Ensure scroll so selected row is visible
         state.ensure_visible(available_rows);
 
-        for (ri, row) in self
-            .rows
-            .iter()
-            .enumerate()
-            .skip(state.scroll_row)
-            .take(available_rows)
-        {
-            let screen_y = data_start_y + (ri - state.scroll_row) as u16;
+        for display_idx in state.scroll_row..(state.scroll_row + available_rows).min(row_order.len()) {
+            let ri = row_order[display_idx];
+            let row = &self.rows[ri];
+            let screen_y = data_start_y + (display_idx - state.scroll_row) as u16;
             if screen_y >= inner.y + inner.height {
                 break;
             }
 
-            let is_selected = ri == state.selected_row;
+            let is_selected = display_idx == state.selected_row;
+
+            // Check whether the row contains the active search query.
+            // Matched rows get a subtle amber tint so the user can spot
+            // them at a glance, even without wrapping via n/N.
+            let is_match = self
+                .highlight_query
+                .map(|q| {
+                    let q_lower = q.to_ascii_lowercase();
+                    row.iter()
+                        .any(|cell| cell.to_ascii_lowercase().contains(&q_lower))
+                })
+                .unwrap_or(false);
+
             let row_bg = if is_selected {
                 SELECTED_BG
+            } else if is_match {
+                Color::Rgb(60, 50, 20) // subtle amber for search matches
             } else if ri % 2 == 0 {
                 Color::Reset
             } else {
@@ -347,7 +490,17 @@ impl<'a> StatefulWidget for TableGrid<'a> {
                 let w = col_widths[ci];
                 let cell_text = row.get(ci).map(|s| s.as_str()).unwrap_or("");
                 let cell = Self::render_cell(cell_text, w);
-                let style = Style::default().fg(row_fg).bg(row_bg);
+
+                // The "active cell" is the intersection of the selected
+                // row and selected column — it gets an extra-bright
+                // background so Ctrl+C targets are visible at a glance.
+                let is_cell_cursor = is_selected && ci == state.selected_col;
+                let cell_bg = if is_cell_cursor {
+                    Color::Rgb(72, 100, 130)
+                } else {
+                    row_bg
+                };
+                let style = Style::default().fg(row_fg).bg(cell_bg);
                 let span = if is_selected {
                     Span::styled(cell, style.add_modifier(Modifier::BOLD))
                 } else {
@@ -389,6 +542,105 @@ impl<'a> StatefulWidget for TableGrid<'a> {
                 buf.set_line(ind_x, ind_y, &line, inner.width);
             }
         }
+    }
+}
+
+/// Three-way comparison that tries a numeric ordering first (so that
+/// `"2" < "10"`) and falls back to case-insensitive lexicographic
+/// comparison when one or both sides aren't numbers. Used by the sort
+/// helper in the grid renderer.
+fn compare_cells(a: &str, b: &str) -> std::cmp::Ordering {
+    match (a.parse::<f64>(), b.parse::<f64>()) {
+        (Ok(na), Ok(nb)) => na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal),
+        _ => a
+            .to_ascii_lowercase()
+            .cmp(&b.to_ascii_lowercase()),
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cycle_sort_off_asc_desc_off() {
+        let mut s = TableGridState::new();
+        assert_eq!(s.sort_col, None);
+
+        s.cycle_sort(2);
+        assert_eq!(s.sort_col, Some(2));
+        assert!(!s.sort_desc);
+
+        s.cycle_sort(2);
+        assert_eq!(s.sort_col, Some(2));
+        assert!(s.sort_desc);
+
+        s.cycle_sort(2);
+        assert_eq!(s.sort_col, None);
+        assert!(!s.sort_desc);
+    }
+
+    #[test]
+    fn cycle_sort_switching_columns_resets_direction() {
+        let mut s = TableGridState::new();
+        s.cycle_sort(0);
+        s.cycle_sort(0); // asc → desc
+        s.cycle_sort(3); // switch to a new column → asc
+        assert_eq!(s.sort_col, Some(3));
+        assert!(!s.sort_desc);
+    }
+
+    #[test]
+    fn sorted_data_index_ascending_numeric() {
+        let rows = vec![
+            vec!["10".to_string(), "b".to_string()],
+            vec!["2".to_string(), "a".to_string()],
+            vec!["30".to_string(), "c".to_string()],
+        ];
+        // Ascending numeric order: 2, 10, 30 → original indices 1, 0, 2.
+        assert_eq!(sorted_data_index(&rows, Some(0), false, 0), Some(1));
+        assert_eq!(sorted_data_index(&rows, Some(0), false, 1), Some(0));
+        assert_eq!(sorted_data_index(&rows, Some(0), false, 2), Some(2));
+    }
+
+    #[test]
+    fn sorted_data_index_descending() {
+        let rows = vec![
+            vec!["a".to_string()],
+            vec!["c".to_string()],
+            vec!["b".to_string()],
+        ];
+        // Descending lex: c, b, a → original indices 1, 2, 0.
+        assert_eq!(sorted_data_index(&rows, Some(0), true, 0), Some(1));
+        assert_eq!(sorted_data_index(&rows, Some(0), true, 1), Some(2));
+        assert_eq!(sorted_data_index(&rows, Some(0), true, 2), Some(0));
+    }
+
+    #[test]
+    fn sorted_data_index_no_sort_is_identity() {
+        let rows = vec![vec!["x".to_string()], vec!["y".to_string()]];
+        assert_eq!(sorted_data_index(&rows, None, false, 0), Some(0));
+        assert_eq!(sorted_data_index(&rows, None, false, 1), Some(1));
+    }
+
+    #[test]
+    fn compare_cells_numeric_beats_lex() {
+        // Lex order would put "10" before "2"; numeric order is the
+        // other way round. We want numeric.
+        assert_eq!(
+            compare_cells("2", "10"),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn compare_cells_falls_back_to_lex_when_non_numeric() {
+        assert_eq!(
+            compare_cells("alice", "Bob"),
+            std::cmp::Ordering::Less
+        );
     }
 }
 

@@ -63,11 +63,19 @@ const SECTIONS: &[Section] = &[
         ],
     },
     Section {
-        title: "Tables",
+        title: "Data grid (Tables / SQL)",
         bindings: &[
-            Binding { key: "/ (slash)",       desc: "Search / filter tables" },
+            Binding { key: "h / l / ← →",     desc: "Move cell cursor across columns" },
+            Binding { key: "j / k / ↓ ↑",     desc: "Move cell cursor across rows" },
+            Binding { key: "y",               desc: "Copy selected cell to clipboard (OSC 52)" },
+            Binding { key: "Y (shift-y)",     desc: "Copy selected row as TSV" },
+            Binding { key: "e",               desc: "Export current results as CSV to ./exports/" },
+            Binding { key: "E (shift-e)",     desc: "Export current results as JSON to ./exports/" },
+            Binding { key: "Ctrl+F",          desc: "Open grid search prompt" },
+            Binding { key: "n / N",           desc: "Jump to next / previous search match" },
+            Binding { key: "s",               desc: "Cycle sort on selected column (off→asc→desc)" },
             Binding { key: "r",               desc: "Refresh current table data" },
-            Binding { key: "n / p",           desc: "Next / previous page" },
+            Binding { key: "n / p",           desc: "Next / previous page (when no search active)" },
         ],
     },
     Section {

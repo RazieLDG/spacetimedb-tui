@@ -74,9 +74,19 @@ pub fn render_tables(
     // ── Grid ──────────────────────────────────────────────────────────────
     match build_table_data(app) {
         Some((headers, rows, title)) => {
+            // Decorate the title with the live search prompt so the
+            // user has a visible cue of what they're typing into.
+            let display_title = match app.grid_search.as_deref() {
+                Some(q) if app.grid_search_editing => {
+                    format!("{title}  /{q}_")
+                }
+                Some(q) if !q.is_empty() => format!("{title}  [/{q}]"),
+                _ => title,
+            };
             let widget = TableGrid::new(&headers, &rows)
-                .title(title)
-                .focused(focused);
+                .title(display_title)
+                .focused(focused)
+                .highlight_query(app.grid_search.as_deref());
             widget.render(grid_area, buf, grid_state);
         }
         None => {

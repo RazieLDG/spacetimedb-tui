@@ -606,11 +606,32 @@ fn parse_query_result(raw: Value) -> Result<QueryResult> {
                 total_duration_micros: 0,
             });
         }
+        Value::Null => {
+            // Some mutation responses come back as a bare `null`.
+            return Ok(QueryResult {
+                schema: Vec::new(),
+                rows: Vec::new(),
+                total_duration_micros: 0,
+            });
+        }
         other => bail!("Unexpected SQL response shape: {other}"),
     };
 
     // schema can be an array (v1) or {"elements": [...]} object (v9).
-    let schema_val = obj.get("schema").ok_or_else(|| anyhow!("SQL response missing 'schema'"))?;
+    // Mutation statements (INSERT / UPDATE / DELETE) don't return a
+    // schema at all — fall back to an empty result instead of bailing,
+    // so the TUI's write-op pipeline can treat them as a success.
+    let Some(schema_val) = obj.get("schema") else {
+        let total_duration_micros = obj
+            .get("total_duration_micros")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        return Ok(QueryResult {
+            schema: Vec::new(),
+            rows: Vec::new(),
+            total_duration_micros,
+        });
+    };
     let elements: &[Value] = if let Some(arr) = schema_val.as_array() {
         arr
     } else if let Some(arr) = schema_val.get("elements").and_then(|e| e.as_array()) {
@@ -930,6 +951,46 @@ mod tests {
         let raw = json!([]);
         let result = parse_query_result(raw).unwrap();
         assert_eq!(result.row_count(), 0);
+    }
+
+    #[test]
+    fn test_parse_query_result_mutation_response_no_schema() {
+        // Regression guard: UPDATE / INSERT / DELETE responses don't
+        // include a `schema` field. Before this fix, the parser bailed
+        // with "SQL response missing 'schema'", which surfaced in the
+        // spreadsheet edit mode as a WriteOpError even though the
+        // mutation had actually committed on the server side.
+        let raw = json!({
+            "total_duration_micros": 42
+        });
+        let result = parse_query_result(raw).expect("mutation response parses");
+        assert_eq!(result.schema.len(), 0);
+        assert_eq!(result.rows.len(), 0);
+        assert_eq!(result.total_duration_micros, 42);
+    }
+
+    #[test]
+    fn test_parse_query_result_mutation_response_array_wrapper() {
+        // Same idea but wrapped in the `[...]` envelope the server
+        // sometimes uses for SELECT results. The first element has
+        // no schema → still treated as a successful mutation.
+        let raw = json!([{
+            "total_duration_micros": 17,
+            "rows": []
+        }]);
+        let result = parse_query_result(raw).expect("wrapped mutation parses");
+        assert_eq!(result.schema.len(), 0);
+        assert_eq!(result.rows.len(), 0);
+        assert_eq!(result.total_duration_micros, 17);
+    }
+
+    #[test]
+    fn test_parse_query_result_bare_null_is_empty() {
+        // Tolerate a bare JSON null — observed on some endpoints.
+        let raw = json!(null);
+        let result = parse_query_result(raw).expect("null parses");
+        assert_eq!(result.schema.len(), 0);
+        assert_eq!(result.rows.len(), 0);
     }
 
     #[test]

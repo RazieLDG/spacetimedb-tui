@@ -1585,6 +1585,14 @@ impl App {
             WsEvent::Disconnected { reason } => {
                 tracing::warn!("WebSocket disconnected: {reason}");
                 self.state.ws_connected = false;
+                // If the disconnect was flagged as permanent
+                // ("(retries disabled)" marker from subscription_task),
+                // clear the countdown so the status bar doesn't keep
+                // showing a stale "reconnect in Ns" pill forever.
+                if reason.contains("(retries disabled)") {
+                    self.state.ws_reconnect_deadline = None;
+                    self.state.ws_reconnect_attempt = 0;
+                }
                 send_event(
                     &self.event_tx,
                     AppEvent::Notification(format!("WebSocket disconnected: {reason}")),

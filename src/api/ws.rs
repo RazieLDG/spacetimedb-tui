@@ -12,7 +12,7 @@ use tokio_tungstenite::{
     connect_async,
     tungstenite::{
         handshake::client::{generate_key, Request},
-        Message,
+        Error as TungError, Message,
     },
 };
 use tracing::{debug, error, info, warn};
@@ -246,9 +246,15 @@ fn build_ws_request(url: Url, auth_token: Option<&str>) -> Result<Request> {
 enum ConnectOutcome {
     /// The user (or app) requested a graceful shutdown — exit the retry loop.
     Closed,
-    /// The connection was lost; the outer loop should sleep with backoff and
-    /// try again. Carries a human-readable reason for diagnostics.
+    /// The connection was lost transiently; the outer loop should sleep
+    /// with backoff and try again (e.g. the server was restarted, the
+    /// stream timed out, a socket-level error fired).
     Lost(String),
+    /// The connection failed with a permanent server-side error such as
+    /// HTTP 401 / 403 / 404 / 5xx. Retrying won't help and would just
+    /// spam the log, so the outer loop should exit immediately with a
+    /// clear disconnected reason.
+    Fatal(String),
 }
 
 const RECONNECT_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
@@ -282,6 +288,18 @@ async fn subscription_task(
         {
             ConnectOutcome::Closed => {
                 info!("WebSocket subscription task exiting (closed)");
+                return;
+            }
+            ConnectOutcome::Fatal(reason) => {
+                // Permanent server-side refusal — surface it once and
+                // walk out of the retry loop. The user can hit Ctrl+R
+                // (or switch databases) to try again.
+                warn!("WebSocket subscription aborted: {reason}");
+                let _ = event_tx
+                    .send(WsEvent::Disconnected {
+                        reason: format!("{reason} (retries disabled)"),
+                    })
+                    .await;
                 return;
             }
             ConnectOutcome::Lost(reason) => {
@@ -331,6 +349,20 @@ async fn connect_subscription_once(
     let (ws_stream, _) = match connect_async(request).await {
         Ok(pair) => pair,
         Err(e) => {
+            // Classify the handshake failure. A server-side HTTP error
+            // (401 / 403 / 404 / 5xx) is almost always permanent for a
+            // given database: retrying it would just spam the logs
+            // every second forever. A socket-level error (connection
+            // refused, reset, DNS) is transient — worth a backoff retry.
+            if let TungError::Http(resp) = &e {
+                let status = resp.status();
+                if status.is_client_error() || status.is_server_error() {
+                    error!("WebSocket handshake returned HTTP {status}");
+                    return ConnectOutcome::Fatal(format!(
+                        "Server returned HTTP {status}"
+                    ));
+                }
+            }
             error!("WebSocket connect failed: {e}");
             return ConnectOutcome::Lost(format!("Connect error: {e}"));
         }
@@ -615,6 +647,19 @@ mod tests {
         let req = build_ws_request(url, Some("mytoken")).unwrap();
         let auth = req.headers().get("Authorization").unwrap();
         assert_eq!(auth, "Bearer mytoken");
+    }
+
+    #[test]
+    fn connect_outcome_fatal_is_distinct_from_lost() {
+        // Sanity check that the discriminants don't accidentally
+        // collapse — Fatal must round-trip through `matches!` so the
+        // retry loop in subscription_task can reliably skip backoff.
+        let lost = ConnectOutcome::Lost("transient".to_string());
+        let fatal = ConnectOutcome::Fatal("HTTP 500".to_string());
+        assert!(matches!(lost, ConnectOutcome::Lost(_)));
+        assert!(matches!(fatal, ConnectOutcome::Fatal(_)));
+        assert!(!matches!(lost, ConnectOutcome::Fatal(_)));
+        assert!(!matches!(fatal, ConnectOutcome::Lost(_)));
     }
 
     #[test]

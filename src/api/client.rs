@@ -153,7 +153,14 @@ impl SpacetimeClient {
 
     /// Fetch the full schema (tables, reducers, typespace) for `database`.
     ///
-    /// SpacetimeDB endpoint: `GET /v1/database/<database>/schema`
+    /// SpacetimeDB endpoint: `GET /v1/database/<database>/schema?version=9`
+    ///
+    /// If version 9 returns a 500/501/503 (which happens on
+    /// databases that were published with a newer module format the
+    /// server knows about but our client doesn't), we surface a
+    /// clearer error message rather than leaking the raw body — and
+    /// still bail, because the rest of the UI can't function without
+    /// a schema anyway.
     #[instrument(skip(self), fields(db = %database))]
     pub async fn get_schema(&self, database: &str) -> Result<Schema> {
         let url = format!("{}/v1/database/{}/schema", self.base_url, database);
@@ -169,7 +176,23 @@ impl SpacetimeClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            bail!("Schema HTTP {status}: {body}");
+            let body_snip: String = body.chars().take(200).collect();
+            if status.as_u16() == 500 {
+                bail!(
+                    "Schema HTTP 500 for '{database}'. The server could not \
+                     serialise its schema — usually this means the database \
+                     was published with a module format this client doesn't \
+                     understand, or the module crashed on the server side. \
+                     Server body: {body_snip}"
+                );
+            }
+            if status.as_u16() == 404 {
+                bail!(
+                    "Schema HTTP 404 — database '{database}' does not exist \
+                     or is not visible to the current identity"
+                );
+            }
+            bail!("Schema HTTP {status}: {body_snip}");
         }
 
         let raw: Value = resp.json().await.context("Failed to decode schema response")?;

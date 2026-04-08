@@ -278,10 +278,32 @@ impl App {
                 }
                 KeyCode::Char('k') if self.state.focus == FocusPanel::SqlInput => {
                     self.sql_input.kill_to_end();
+                    self.state.history_cursor = None;
                     return;
                 }
                 KeyCode::Char('u') if self.state.focus == FocusPanel::SqlInput => {
                     self.sql_input.kill_to_start();
+                    self.state.history_cursor = None;
+                    return;
+                }
+                KeyCode::Char('l') if self.state.focus == FocusPanel::SqlInput => {
+                    self.sql_input.clear();
+                    self.state.history_cursor = None;
+                    return;
+                }
+                KeyCode::Char('w') if self.state.focus == FocusPanel::SqlInput => {
+                    // Delete the previous word (Ctrl+W, classic Unix convention).
+                    let before = &self.sql_input.value[..self.sql_input.cursor];
+                    let trimmed_end = before.trim_end_matches(|c: char| c.is_whitespace());
+                    let word_start = trimmed_end
+                        .rfind(|c: char| c.is_whitespace() || !(c.is_alphanumeric() || c == '_'))
+                        .map(|i| i + 1)
+                        .unwrap_or(0);
+                    let range = word_start..self.sql_input.cursor;
+                    if !range.is_empty() {
+                        self.sql_input.replace_range(range, "");
+                        self.state.history_cursor = None;
+                    }
                     return;
                 }
                 _ => {}
@@ -323,6 +345,9 @@ impl App {
                 KeyCode::Enter => {
                     self.execute_sql().await;
                 }
+                KeyCode::Tab => {
+                    self.complete_sql_input();
+                }
                 KeyCode::Up => {
                     if self.state.history_prev() {
                         if let Some(sql) = self.state.current_history_sql() {
@@ -345,9 +370,20 @@ impl App {
                 KeyCode::Right => self.sql_input.move_right(),
                 KeyCode::Home => self.sql_input.home(),
                 KeyCode::End => self.sql_input.end(),
-                KeyCode::Backspace => self.sql_input.backspace(),
-                KeyCode::Delete => self.sql_input.delete(),
-                KeyCode::Char(ch) => self.sql_input.insert(ch),
+                KeyCode::Backspace => {
+                    self.sql_input.backspace();
+                    self.state.history_cursor = None;
+                }
+                KeyCode::Delete => {
+                    self.sql_input.delete();
+                    self.state.history_cursor = None;
+                }
+                KeyCode::Char(ch) => {
+                    self.sql_input.insert(ch);
+                    // Any edit drops the user out of "browsing history"
+                    // mode so ↓ no longer snaps back to the old entry.
+                    self.state.history_cursor = None;
+                }
                 _ => {}
             }
             return;
@@ -812,6 +848,54 @@ impl App {
                 ),
             }
         });
+    }
+
+    /// Tab-complete the SQL input against the current schema.
+    ///
+    /// Extracts the identifier token immediately to the left of the cursor,
+    /// builds a candidate list from SQL keywords plus every table/column
+    /// name in the active schema, and then either (a) commits the unique
+    /// completion, (b) extends the token to the longest common prefix
+    /// shared by multiple matches and surfaces the candidate list as a
+    /// notification, or (c) shows a "no match" notification.
+    fn complete_sql_input(&mut self) {
+        use crate::ui::components::completion::{complete, build_candidates, CompletionResult};
+
+        let (range, word) = self.sql_input.current_word();
+        if word.is_empty() {
+            return;
+        }
+        let word = word.to_string();
+
+        let candidates = build_candidates(self.state.tables.iter());
+        let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+
+        match complete(&word, &refs) {
+            CompletionResult::NoMatch => {
+                self.state
+                    .set_notification(format!("No match for \"{word}\""));
+            }
+            CompletionResult::Unique(hit) => {
+                self.sql_input.replace_range(range, &hit);
+            }
+            CompletionResult::Multiple {
+                common_prefix,
+                candidates,
+            } => {
+                // Extend the input to the longest common prefix (if any),
+                // then show the user what's still ambiguous.
+                if common_prefix.len() > word.len() {
+                    self.sql_input.replace_range(range, &common_prefix);
+                }
+                let preview: Vec<String> = candidates.into_iter().take(6).collect();
+                let more = if preview.len() == 6 { "…" } else { "" };
+                self.state.set_notification(format!(
+                    "{} matches: {}{more}",
+                    preview.len(),
+                    preview.join(", ")
+                ));
+            }
+        }
     }
 
     async fn execute_sql(&mut self) {

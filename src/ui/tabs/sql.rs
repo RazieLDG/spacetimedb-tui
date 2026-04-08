@@ -82,9 +82,10 @@ pub fn render_sql(
     // ── Input widget ──────────────────────────────────────────────────────
     let sql_focused = app.focus == FocusPanel::SqlInput;
     InputWidget::new(input_state)
-        .title("SQL  (Enter=execute  ↑↓=history  Ctrl+K=clear)")
+        .title("SQL  (Enter=run  Tab=complete  ↑↓=history  Ctrl+K=clear)")
         .placeholder("SELECT * FROM <table> LIMIT 100")
         .focused(sql_focused)
+        .highlight_sql(true)
         .render(input_area, buf);
 
     // ── Results panel ─────────────────────────────────────────────────────

@@ -52,9 +52,12 @@ const SECTIONS: &[Section] = &[
         bindings: &[
             Binding { key: ":",               desc: "Enter SQL mode (focus input)" },
             Binding { key: "Enter",           desc: "Execute SQL query" },
+            Binding { key: "Tab",             desc: "Autocomplete keyword / table / column" },
             Binding { key: "↑ / ↓",           desc: "Browse query history" },
+            Binding { key: "Ctrl+L",          desc: "Clear entire input" },
             Binding { key: "Ctrl+K",          desc: "Kill to end of line" },
             Binding { key: "Ctrl+U",          desc: "Kill to start of line" },
+            Binding { key: "Ctrl+W",          desc: "Delete previous word" },
             Binding { key: "Ctrl+A / Home",   desc: "Move cursor to start" },
             Binding { key: "Ctrl+E / End",    desc: "Move cursor to end" },
         ],

@@ -54,11 +54,7 @@ pub fn serialise(qr: &QueryResult, format: ExportFormat) -> Vec<u8> {
 
 /// Serialise `qr` to the configured `format` and write it under
 /// `./exports/<label>-<timestamp>.<ext>`. Returns the path written.
-pub fn write_export(
-    qr: &QueryResult,
-    format: ExportFormat,
-    label: &str,
-) -> Result<PathBuf> {
+pub fn write_export(qr: &QueryResult, format: ExportFormat, label: &str) -> Result<PathBuf> {
     let dir = PathBuf::from("exports");
     fs::create_dir_all(&dir)
         .with_context(|| format!("Failed to create export dir {}", dir.display()))?;
@@ -67,15 +63,21 @@ pub fn write_export(
     // filenames (spaces, slashes, etc.).
     let safe_label: String = label
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
     let filename = format!("{safe_label}-{timestamp}.{}", format.extension());
     let path = dir.join(filename);
 
     let bytes = serialise(qr, format);
-    let mut f = fs::File::create(&path)
-        .with_context(|| format!("Failed to create {}", path.display()))?;
+    let mut f =
+        fs::File::create(&path).with_context(|| format!("Failed to create {}", path.display()))?;
     f.write_all(&bytes)
         .with_context(|| format!("Failed to write {}", path.display()))?;
     f.flush()
@@ -122,7 +124,9 @@ where
 }
 
 fn csv_escape(s: &str) -> String {
-    let needs_quoting = s.chars().any(|c| c == ',' || c == '"' || c == '\n' || c == '\r');
+    let needs_quoting = s
+        .chars()
+        .any(|c| c == ',' || c == '"' || c == '\n' || c == '\r');
     if needs_quoting {
         let escaped = s.replace('"', "\"\"");
         format!("\"{escaped}\"")

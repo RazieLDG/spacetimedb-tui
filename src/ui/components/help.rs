@@ -209,9 +209,7 @@ impl Widget for HelpOverlay {
         let block = Block::default()
             .title(Span::styled(
                 " ⌨  Key Bindings — press ? to close ",
-                Style::default()
-                    .fg(ACCENT)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(BORDER))

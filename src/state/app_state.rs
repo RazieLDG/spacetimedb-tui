@@ -35,17 +35,23 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: &'static [Tab] =
-        &[Tab::Tables, Tab::Sql, Tab::Logs, Tab::Metrics, Tab::Module, Tab::Live];
+    pub const ALL: &'static [Tab] = &[
+        Tab::Tables,
+        Tab::Sql,
+        Tab::Logs,
+        Tab::Metrics,
+        Tab::Module,
+        Tab::Live,
+    ];
 
     pub fn title(&self) -> &'static str {
         match self {
-            Tab::Tables  => "Tables",
-            Tab::Sql     => "SQL",
-            Tab::Logs    => "Logs",
+            Tab::Tables => "Tables",
+            Tab::Sql => "SQL",
+            Tab::Logs => "Logs",
             Tab::Metrics => "Metrics",
-            Tab::Module  => "Module",
-            Tab::Live    => "Live",
+            Tab::Module => "Module",
+            Tab::Live => "Live",
         }
     }
 
@@ -713,7 +719,9 @@ impl AppState {
     /// to render the filtered slice.
     pub fn visible_logs(&self) -> impl Iterator<Item = &LogEntry> {
         let min_level = &self.log_filter_level;
-        self.log_buffer.iter().filter(move |e| level_gte(&e.level, min_level))
+        self.log_buffer
+            .iter()
+            .filter(move |e| level_gte(&e.level, min_level))
     }
 
     // ------------------------------------------------------------------
@@ -905,8 +913,7 @@ mod tests {
             filename: None,
             line_number: None,
         });
-        let visible: Vec<&str> =
-            s.visible_logs().map(|e| e.message.as_str()).collect();
+        let visible: Vec<&str> = s.visible_logs().map(|e| e.message.as_str()).collect();
         assert_eq!(visible, vec!["boom"]);
     }
 

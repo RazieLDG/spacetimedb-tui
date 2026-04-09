@@ -11,9 +11,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyModifiers,
-};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::mpsc;
 
 use ratatui::widgets::Widget;
@@ -75,7 +73,10 @@ pub enum AppEvent {
     /// `op` is a short human label like `call insert_user` or
     /// `delete row from users` so we can surface it in the status bar
     /// and the Live tab without re-deriving the description here.
-    WriteOpSuccess { op: String, response: serde_json::Value },
+    WriteOpSuccess {
+        op: String,
+        response: serde_json::Value,
+    },
     /// A reducer call (or write-SQL exec) failed.
     WriteOpError { op: String, error: String },
     /// A live log line from WebSocket.
@@ -189,9 +190,7 @@ impl App {
             }
             match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.list_databases()).await {
                 Ok(Ok(dbs)) => send_event(&tx, AppEvent::DatabasesLoaded(dbs)),
-                Ok(Err(e)) => {
-                    send_event(&tx, AppEvent::Error(format!("list_databases: {e:#}")))
-                }
+                Ok(Err(e)) => send_event(&tx, AppEvent::Error(format!("list_databases: {e:#}"))),
                 Err(_) => send_event(
                     &tx,
                     AppEvent::Error("list_databases: request timed out".to_string()),
@@ -212,7 +211,15 @@ impl App {
         loop {
             // Draw
             terminal
-                .draw(|frame| draw_frame(frame, &mut self.state, &self.sql_input, &mut self.tables_grid, &mut self.sql_grid))
+                .draw(|frame| {
+                    draw_frame(
+                        frame,
+                        &mut self.state,
+                        &self.sql_input,
+                        &mut self.tables_grid,
+                        &mut self.sql_grid,
+                    )
+                })
                 .context("Terminal draw failed")?;
 
             // Poll for crossterm events (non-blocking, timeout = TICK_RATE)
@@ -422,7 +429,8 @@ impl App {
                 KeyCode::Char('r') => {
                     // Force a fresh WebSocket connection (e.g. after a server bounce).
                     self.connect_ws().await;
-                    self.state.set_notification("Reconnecting WebSocket…".to_string());
+                    self.state
+                        .set_notification("Reconnecting WebSocket…".to_string());
                     return;
                 }
                 KeyCode::Char('e')
@@ -437,8 +445,7 @@ impl App {
                 }
                 KeyCode::Char('p') => {
                     // Open the command palette.
-                    self.state.palette =
-                        Some(crate::state::palette::CommandPalette::new());
+                    self.state.palette = Some(crate::state::palette::CommandPalette::new());
                     return;
                 }
                 KeyCode::Char('a') | KeyCode::Home if self.state.focus == FocusPanel::SqlInput => {
@@ -497,18 +504,15 @@ impl App {
             // Clamp the scroll offset to the actual number of lines so a
             // user mashing `↓` doesn't push the value into the millions
             // (and then have to bash `↑` for ages to recover).
-            let max_scroll = crate::ui::components::help::HelpOverlay::total_lines()
-                .saturating_sub(1);
+            let max_scroll =
+                crate::ui::components::help::HelpOverlay::total_lines().saturating_sub(1);
             match key.code {
                 KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
                     self.state.show_help = false;
                 }
                 KeyCode::Char('j') | KeyCode::Down => {
-                    self.state.help_scroll = self
-                        .state
-                        .help_scroll
-                        .saturating_add(1)
-                        .min(max_scroll);
+                    self.state.help_scroll =
+                        self.state.help_scroll.saturating_add(1).min(max_scroll);
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
                     self.state.help_scroll = self.state.help_scroll.saturating_sub(1);
@@ -957,10 +961,8 @@ impl App {
             }
             KeyCode::Char('f') if self.state.current_tab == Tab::Logs => {
                 self.state.log_filter_level = self.state.log_filter_level.clone().next_filter();
-                self.state.set_notification(format!(
-                    "Log filter: {}",
-                    self.state.log_filter_level
-                ));
+                self.state
+                    .set_notification(format!("Log filter: {}", self.state.log_filter_level));
                 return;
             }
 
@@ -993,7 +995,9 @@ impl App {
             }
 
             // Horizontal scroll in table/SQL results (< / > or H / L)
-            KeyCode::Char('<') | KeyCode::Char('H') if matches!(self.state.current_tab, Tab::Tables | Tab::Sql) => {
+            KeyCode::Char('<') | KeyCode::Char('H')
+                if matches!(self.state.current_tab, Tab::Tables | Tab::Sql) =>
+            {
                 let grid = if self.state.current_tab == Tab::Tables {
                     &mut self.tables_grid
                 } else {
@@ -1002,7 +1006,9 @@ impl App {
                 grid.scroll_left();
                 return;
             }
-            KeyCode::Char('>') | KeyCode::Char('L') if matches!(self.state.current_tab, Tab::Tables | Tab::Sql) => {
+            KeyCode::Char('>') | KeyCode::Char('L')
+                if matches!(self.state.current_tab, Tab::Tables | Tab::Sql) =>
+            {
                 let (col_count, grid) = if self.state.current_tab == Tab::Tables {
                     let cc = self
                         .state
@@ -1035,7 +1041,9 @@ impl App {
                 }
                 return;
             }
-            KeyCode::Char(ch) if self.state.focus == FocusPanel::Sidebar && !ch.is_ascii_control() => {
+            KeyCode::Char(ch)
+                if self.state.focus == FocusPanel::Sidebar && !ch.is_ascii_control() =>
+            {
                 // In sidebar, typing filters the list
                 self.state.search_query.push(ch);
                 return;
@@ -1049,20 +1057,18 @@ impl App {
 
     async fn nav_down(&mut self) {
         match self.state.focus {
-            FocusPanel::Sidebar => {
-                match self.state.sidebar_focus {
-                    SidebarFocus::Databases => {
-                        let old = self.state.selected_database_idx;
-                        self.state.database_next();
-                        if self.state.selected_database_idx != old {
-                            self.load_schema().await;
-                        }
-                    }
-                    SidebarFocus::Tables => {
-                        self.state.table_next();
+            FocusPanel::Sidebar => match self.state.sidebar_focus {
+                SidebarFocus::Databases => {
+                    let old = self.state.selected_database_idx;
+                    self.state.database_next();
+                    if self.state.selected_database_idx != old {
+                        self.load_schema().await;
                     }
                 }
-            }
+                SidebarFocus::Tables => {
+                    self.state.table_next();
+                }
+            },
             FocusPanel::Main => match self.state.current_tab {
                 Tab::Tables => {
                     let row_count = self
@@ -1201,7 +1207,8 @@ impl App {
                     SidebarFocus::Databases => {
                         // Move focus to tables
                         self.state.sidebar_focus = SidebarFocus::Tables;
-                        if !self.state.tables.is_empty() && self.state.selected_table_idx.is_none() {
+                        if !self.state.tables.is_empty() && self.state.selected_table_idx.is_none()
+                        {
                             self.state.selected_table_idx = Some(0);
                         }
                     }
@@ -1301,9 +1308,7 @@ impl App {
     /// Return a reference to the `QueryResult` / `TableGridState` pair
     /// that backs the currently focused data-grid tab, together with
     /// the table-name hint (if any) used for notifications.
-    fn active_grid(
-        &self,
-    ) -> Option<(&crate::api::types::QueryResult, &TableGridState)> {
+    fn active_grid(&self) -> Option<(&crate::api::types::QueryResult, &TableGridState)> {
         match self.state.current_tab {
             Tab::Tables => self
                 .state
@@ -1371,18 +1376,14 @@ impl App {
         // the display index whose mapped data index matches.
         // O(n²) in the worst case but data grids cap at a few
         // hundred rows — acceptable for a one-shot key event.
-        for display_idx in 0..string_rows.len() {
-            if crate::ui::components::table_grid::sorted_data_index(
+        (0..string_rows.len()).find(|&display_idx| {
+            crate::ui::components::table_grid::sorted_data_index(
                 &string_rows,
                 Some(sort_col),
                 grid.sort_desc,
                 display_idx,
             ) == Some(data_idx)
-            {
-                return Some(display_idx);
-            }
-        }
-        None
+        })
     }
 
     /// Copy the currently-highlighted cell to the terminal clipboard.
@@ -1414,8 +1415,7 @@ impl App {
             }
             Err(e) => {
                 tracing::warn!("clipboard copy failed: {e}");
-                self.state
-                    .set_error(format!("Clipboard copy failed: {e}"));
+                self.state.set_error(format!("Clipboard copy failed: {e}"));
             }
         }
     }
@@ -1450,8 +1450,7 @@ impl App {
             }
             Err(e) => {
                 tracing::warn!("clipboard copy failed: {e}");
-                self.state
-                    .set_error(format!("Clipboard copy failed: {e}"));
+                self.state.set_error(format!("Clipboard copy failed: {e}"));
             }
         }
     }
@@ -1516,9 +1515,7 @@ impl App {
                         (Ok(na), Ok(nb)) => {
                             na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal)
                         }
-                        _ => av
-                            .to_ascii_lowercase()
-                            .cmp(&bv.to_ascii_lowercase()),
+                        _ => av.to_ascii_lowercase().cmp(&bv.to_ascii_lowercase()),
                     }
                 });
                 if grid.sort_desc {
@@ -1606,8 +1603,7 @@ impl App {
             return;
         }
         if self.state.selected_table().is_none() {
-            self.state
-                .set_notification("No table selected".to_string());
+            self.state.set_notification("No table selected".to_string());
             return;
         }
         self.state.edit_mode = Some(crate::state::edit_mode::EditMode::new());
@@ -1853,12 +1849,19 @@ impl App {
                 .as_ref()
                 .map(|em| em.pending.clone())
                 .unwrap_or_default();
-            (db, table.table_name, pk_idx, pk_column, column_types, rows, pending)
+            (
+                db,
+                table.table_name,
+                pk_idx,
+                pk_column,
+                column_types,
+                rows,
+                pending,
+            )
         };
 
         if pending.is_empty() {
-            self.state
-                .set_notification("No pending edits".to_string());
+            self.state.set_notification("No pending edits".to_string());
             return;
         }
 
@@ -2088,8 +2091,7 @@ impl App {
     /// an `UPDATE table SET col=val,... WHERE pk=original_pk` SQL.
     fn open_update_form(&mut self) {
         let Some(table) = self.state.selected_table().cloned() else {
-            self.state
-                .set_notification("No table selected".to_string());
+            self.state.set_notification("No table selected".to_string());
             return;
         };
         if table.columns.is_empty() {
@@ -2100,8 +2102,7 @@ impl App {
         let data_idx = match self.active_data_row_index() {
             Some(i) => i,
             None => {
-                self.state
-                    .set_notification("No row selected".to_string());
+                self.state.set_notification("No row selected".to_string());
                 return;
             }
         };
@@ -2126,7 +2127,11 @@ impl App {
             .enumerate()
             .map(|(i, c)| {
                 let type_label = type_tag(&c.col_type);
-                let pk_marker = if i == pk_idx { " — PK (read-only)" } else { "" };
+                let pk_marker = if i == pk_idx {
+                    " — PK (read-only)"
+                } else {
+                    ""
+                };
                 let mut field = crate::state::modal::FormField::new(format!(
                     "{} ({}{pk_marker})",
                     c.col_name, type_label
@@ -2184,8 +2189,8 @@ impl App {
                 .set_notification("No database selected".to_string());
             return;
         };
-        let field = crate::state::modal::FormField::new("New alias")
-            .with_placeholder("e.g. my-app-prod");
+        let field =
+            crate::state::modal::FormField::new("New alias").with_placeholder("e.g. my-app-prod");
         let action = crate::state::modal::ModalAction::AddDatabaseAlias {
             database: db_name.clone(),
         };
@@ -2206,10 +2211,9 @@ impl App {
         verb: &str,
         action: crate::state::modal::ModalAction,
     ) {
-        let field = crate::state::modal::FormField::new(format!(
-            "Type '{expected}' to confirm {verb}"
-        ))
-        .with_placeholder("required");
+        let field =
+            crate::state::modal::FormField::new(format!("Type '{expected}' to confirm {verb}"))
+                .with_placeholder("required");
         self.state.modal = Some(crate::state::modal::Modal::form(
             title.into(),
             vec![field],
@@ -2259,8 +2263,7 @@ impl App {
     fn open_delete_confirm(&mut self) {
         // Pull the data we need before borrowing mutably.
         let Some(table) = self.state.selected_table().cloned() else {
-            self.state
-                .set_notification("No table selected".to_string());
+            self.state.set_notification("No table selected".to_string());
             return;
         };
         if table.columns.is_empty() {
@@ -2272,8 +2275,7 @@ impl App {
         let data_idx = match self.active_data_row_index() {
             Some(i) => i,
             None => {
-                self.state
-                    .set_notification("No row selected".to_string());
+                self.state.set_notification("No row selected".to_string());
                 return;
             }
         };
@@ -2327,8 +2329,7 @@ impl App {
     /// statement and runs it via [`spawn_write_sql`].
     fn open_insert_form(&mut self) {
         let Some(table) = self.state.selected_table().cloned() else {
-            self.state
-                .set_notification("No table selected".to_string());
+            self.state.set_notification("No table selected".to_string());
             return;
         };
 
@@ -2418,8 +2419,7 @@ impl App {
         let db = match self.state.selected_database() {
             Some(d) => d.to_string(),
             None => {
-                self.state
-                    .set_error("No database selected".to_string());
+                self.state.set_error("No database selected".to_string());
                 return;
             }
         };
@@ -2427,7 +2427,10 @@ impl App {
 
         match modal {
             Modal::Form { fields, action, .. } => match action {
-                ModalAction::CallReducer { reducer, param_types } => {
+                ModalAction::CallReducer {
+                    reducer,
+                    param_types,
+                } => {
                     let args: Vec<serde_json::Value> = fields
                         .iter()
                         .zip(param_types.iter())
@@ -2435,7 +2438,10 @@ impl App {
                         .collect();
                     self.spawn_call_reducer(db, reducer, args, op_label);
                 }
-                ModalAction::InsertRow { table, column_types } => {
+                ModalAction::InsertRow {
+                    table,
+                    column_types,
+                } => {
                     let columns: Vec<String> = fields
                         .iter()
                         .map(|f| extract_field_name(&f.label))
@@ -2582,8 +2588,7 @@ impl App {
                     // Refresh the sidebar so the new alias can be
                     // discovered without a restart.
                     if let Ok(Ok(dbs)) =
-                        tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.list_databases())
-                            .await
+                        tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.list_databases()).await
                     {
                         send_event(&tx, AppEvent::DatabasesLoaded(dbs));
                     }
@@ -2628,15 +2633,7 @@ impl App {
                     // updates immediately. The bootstrap helper
                     // already does ping → list_databases under a
                     // timeout.
-                    match tokio::time::timeout(
-                        HTTP_REQUEST_TIMEOUT,
-                        client.list_databases(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(dbs)) => send_event(&tx, AppEvent::DatabasesLoaded(dbs)),
-                        _ => {}
-                    }
+                    if let Ok(Ok(dbs)) = tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.list_databases()).await { send_event(&tx, AppEvent::DatabasesLoaded(dbs)) }
                 }
                 Ok(Err(e)) => send_event(
                     &tx,
@@ -2741,7 +2738,7 @@ impl App {
     /// shared by multiple matches and surfaces the candidate list as a
     /// notification, or (c) shows a "no match" notification.
     fn complete_sql_input(&mut self) {
-        use crate::ui::components::completion::{complete, build_candidates, CompletionResult};
+        use crate::ui::components::completion::{build_candidates, complete, CompletionResult};
 
         let (range, word) = self.sql_input.current_word();
         if word.is_empty() {
@@ -2789,7 +2786,8 @@ impl App {
         let db = match self.state.selected_database() {
             Some(d) => d.to_string(),
             None => {
-                self.state.set_error("No database selected — pick one from the sidebar".to_string());
+                self.state
+                    .set_error("No database selected — pick one from the sidebar".to_string());
                 return;
             }
         };
@@ -2805,8 +2803,7 @@ impl App {
 
         tokio::spawn(async move {
             let outcome =
-                tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.query_sql(&db, &sql_clone))
-                    .await;
+                tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.query_sql(&db, &sql_clone)).await;
             match outcome {
                 Ok(Ok(result)) => send_event(
                     &tx,
@@ -2840,9 +2837,7 @@ impl App {
                 // If the previous schema fetch failed, `r` should
                 // retry it instead of running a no-op table load
                 // against a schema we don't have.
-                if self.state.schema_load_failed
-                    || self.state.current_schema.is_none()
-                {
+                if self.state.schema_load_failed || self.state.current_schema.is_none() {
                     self.load_schema().await;
                 } else {
                     self.load_table_data().await;
@@ -2896,18 +2891,11 @@ impl App {
         let client = self.client.clone();
         let tx = self.event_tx.clone();
         tokio::spawn(async move {
-            match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.get_logs(&db, 500, false))
-                .await
+            match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.get_logs(&db, 500, false)).await
             {
                 Ok(Ok(logs)) => send_event(&tx, AppEvent::LogsLoaded(logs)),
-                Ok(Err(e)) => send_event(
-                    &tx,
-                    AppEvent::Error(format!("Logs fetch failed: {e:#}")),
-                ),
-                Err(_) => send_event(
-                    &tx,
-                    AppEvent::Error("Logs fetch timed out".to_string()),
-                ),
+                Ok(Err(e)) => send_event(&tx, AppEvent::Error(format!("Logs fetch failed: {e:#}"))),
+                Err(_) => send_event(&tx, AppEvent::Error("Logs fetch timed out".to_string())),
             }
         });
     }
@@ -3002,9 +2990,7 @@ impl App {
                 );
             }
             WsEvent::Reconnecting { attempt, delay_ms } => {
-                tracing::info!(
-                    "WebSocket reconnect attempt {attempt} in {delay_ms}ms"
-                );
+                tracing::info!("WebSocket reconnect attempt {attempt} in {delay_ms}ms");
                 self.state.ws_reconnect_attempt = attempt;
                 self.state.ws_reconnect_deadline =
                     Some(Instant::now() + Duration::from_millis(delay_ms));
@@ -3068,9 +3054,7 @@ impl App {
                 }
                 send_event(
                     &self.event_tx,
-                    AppEvent::Notification(format!(
-                        "Live subscription active — {total_rows} rows"
-                    )),
+                    AppEvent::Notification(format!("Live subscription active — {total_rows} rows")),
                 );
             }
             WsServerMessage::TransactionUpdate(payload) => {
@@ -3122,10 +3106,7 @@ impl App {
                 });
             }
             WsServerMessage::IdentityToken(payload) => {
-                tracing::info!(
-                    "WebSocket identity confirmed: {:?}",
-                    payload.identity
-                );
+                tracing::info!("WebSocket identity confirmed: {:?}", payload.identity);
             }
         }
     }
@@ -3189,10 +3170,7 @@ impl App {
                         .as_ref()
                         .and_then(|s| s.last_table.as_deref())
                         .and_then(|name| {
-                            self.state
-                                .tables
-                                .iter()
-                                .position(|t| t.table_name == name)
+                            self.state.tables.iter().position(|t| t.table_name == name)
                         });
                     self.state.selected_table_idx = Some(restored.unwrap_or(0));
                 }
@@ -3218,7 +3196,11 @@ impl App {
                 self.state.set_error(msg);
             }
 
-            AppEvent::QueryResult { result, duration, sql } => {
+            AppEvent::QueryResult {
+                result,
+                duration,
+                sql,
+            } => {
                 self.state.query_loading = false;
                 let row_count = result.row_count();
                 self.state.query_result = Some(result);
@@ -3234,7 +3216,8 @@ impl App {
                     row_count: Some(row_count),
                     error: None,
                 });
-                self.state.set_notification(format!("{row_count} rows returned"));
+                self.state
+                    .set_notification(format!("{row_count} rows returned"));
             }
 
             AppEvent::QueryError { sql, error } => {
@@ -3290,9 +3273,7 @@ impl App {
                 // Many writes invalidate the table-browse view, so a
                 // gentle refresh is useful — but only when the user
                 // is still looking at the Tables tab.
-                if self.state.current_tab == Tab::Tables
-                    && self.state.selected_table().is_some()
-                {
+                if self.state.current_tab == Tab::Tables && self.state.selected_table().is_some() {
                     self.load_table_data().await;
                 }
             }
@@ -3350,12 +3331,7 @@ fn pick_primary_key(table: &crate::api::types::TableInfo) -> (usize, String) {
     }
     // 1. autoinc wins (now that `is_autoinc` is actually set by the
     //    parser from the `sequences` array).
-    if let Some((i, c)) = table
-        .columns
-        .iter()
-        .enumerate()
-        .find(|(_, c)| c.is_autoinc)
-    {
+    if let Some((i, c)) = table.columns.iter().enumerate().find(|(_, c)| c.is_autoinc) {
         return (i, c.col_name.clone());
     }
     // 2. naming convention.
@@ -3631,15 +3607,24 @@ fn parse_prometheus_metrics(text: &str) -> crate::state::MetricsSnapshot {
         } else if key.contains("memory_bytes") {
             snapshot.memory_bytes = val as u64;
         } else {
-            snapshot.extra.insert(key.to_string(), serde_json::json!(val));
+            snapshot
+                .extra
+                .insert(key.to_string(), serde_json::json!(val));
         }
     }
     snapshot
 }
 
 // ── Tests for modal helpers ──────────────────────────────────────────────────
-
+//
+// Kept inline (rather than in a separate file) so the tests sit
+// next to the `json_to_sql_literal` / `sql_literal` / `pick_primary_key`
+// free functions they exercise. `draw_frame` follows this block on
+// purpose — it's the last item in the file and logically closes out
+// the app module, so we suppress clippy's "items after test module"
+// lint here rather than fragmenting the code with a second file.
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod modal_helper_tests {
     use super::*;
 
@@ -3766,18 +3751,9 @@ mod modal_helper_tests {
 
     #[test]
     fn type_tag_handles_string_and_object_forms() {
-        assert_eq!(
-            type_tag(&serde_json::json!("String")),
-            "String"
-        );
-        assert_eq!(
-            type_tag(&serde_json::json!({"U64": []})),
-            "U64"
-        );
-        assert_eq!(
-            type_tag(&serde_json::json!(null)),
-            "Unknown"
-        );
+        assert_eq!(type_tag(&serde_json::json!("String")), "String");
+        assert_eq!(type_tag(&serde_json::json!({"U64": []})), "U64");
+        assert_eq!(type_tag(&serde_json::json!(null)), "Unknown");
     }
 
     #[test]
@@ -3851,9 +3827,18 @@ mod modal_helper_tests {
 
     #[test]
     fn json_literal_scalars() {
-        assert_eq!(json_to_sql_literal(&serde_json::json!(null)).unwrap(), "NULL");
-        assert_eq!(json_to_sql_literal(&serde_json::json!(true)).unwrap(), "TRUE");
-        assert_eq!(json_to_sql_literal(&serde_json::json!(false)).unwrap(), "FALSE");
+        assert_eq!(
+            json_to_sql_literal(&serde_json::json!(null)).unwrap(),
+            "NULL"
+        );
+        assert_eq!(
+            json_to_sql_literal(&serde_json::json!(true)).unwrap(),
+            "TRUE"
+        );
+        assert_eq!(
+            json_to_sql_literal(&serde_json::json!(false)).unwrap(),
+            "FALSE"
+        );
         assert_eq!(json_to_sql_literal(&serde_json::json!(42)).unwrap(), "42");
         assert_eq!(json_to_sql_literal(&serde_json::json!(-17)).unwrap(), "-17");
         assert_eq!(json_to_sql_literal(&serde_json::json!(1.5)).unwrap(), "1.5");
@@ -3962,23 +3947,14 @@ mod modal_helper_tests {
     fn sql_literal_identity_type_emits_hex() {
         // A user typing a 0x-prefixed hex value into an Identity
         // form field must not end up single-quoted.
-        assert_eq!(
-            sql_literal("0xdeadbeef", "Identity"),
-            "0xdeadbeef"
-        );
-        assert_eq!(
-            sql_literal("0xfeed", "ConnectionId"),
-            "0xfeed"
-        );
+        assert_eq!(sql_literal("0xdeadbeef", "Identity"), "0xdeadbeef");
+        assert_eq!(sql_literal("0xfeed", "ConnectionId"), "0xfeed");
     }
 
     #[test]
     fn sql_literal_identity_type_without_prefix_adds_0x() {
         // Same thing but without the `0x` the user omitted.
-        assert_eq!(
-            sql_literal("deadbeef", "Identity"),
-            "0xdeadbeef"
-        );
+        assert_eq!(sql_literal("deadbeef", "Identity"), "0xdeadbeef");
     }
 
     #[test]
@@ -4003,18 +3979,13 @@ pub fn draw_frame(
 ) {
     use crate::ui::{
         components::{
-            help::HelpOverlay, modal::render_modal, palette::render_palette,
-            status_bar::StatusBar,
+            help::HelpOverlay, modal::render_modal, palette::render_palette, status_bar::StatusBar,
         },
         layout::render_layout,
         sidebar::render_sidebar,
         tabs::{
-            live::render_live,
-            logs::render_logs,
-            metrics::render_metrics,
-            module::render_module,
-            sql::render_sql,
-            tables::render_tables,
+            live::render_live, logs::render_logs, metrics::render_metrics, module::render_module,
+            sql::render_sql, tables::render_tables,
         },
     };
     use ratatui::layout::{Constraint, Direction, Layout};
@@ -4027,7 +3998,7 @@ pub fn draw_frame(
         .constraints([Constraint::Min(0), Constraint::Length(1)])
         .split(area);
 
-    let main_area   = outer[0];
+    let main_area = outer[0];
     let status_area = outer[1];
 
     // ── Render chrome (title bar, tab bar, sidebar border) ────────────────
@@ -4039,7 +4010,12 @@ pub fn draw_frame(
     // ── Tab content ───────────────────────────────────────────────────────
     match state.current_tab {
         crate::state::Tab::Tables => {
-            render_tables(content_areas.content, frame.buffer_mut(), state, tables_grid);
+            render_tables(
+                content_areas.content,
+                frame.buffer_mut(),
+                state,
+                tables_grid,
+            );
         }
         crate::state::Tab::Sql => {
             render_sql(

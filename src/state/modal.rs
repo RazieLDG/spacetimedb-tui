@@ -86,10 +86,7 @@ pub enum ModalAction {
     },
     /// Delete a single row identified by `where_sql` (already
     /// quoted / formatted by the caller). Confirm dialog only.
-    DeleteRow {
-        table: String,
-        where_sql: String,
-    },
+    DeleteRow { table: String, where_sql: String },
     /// Permanently delete an entire database.
     ///
     /// Always wrapped in a one-field [`Modal::Form`] where the user
@@ -104,16 +101,12 @@ pub enum ModalAction {
     /// instead of `DROP TABLE` because SpacetimeDB tables are part
     /// of the published module schema and cannot be dropped via SQL.
     /// Same typed-confirm guard as [`DeleteDatabase`].
-    TruncateTable {
-        table: String,
-    },
+    TruncateTable { table: String },
     /// Attach a new alias (human name) to a database via
     /// `POST /v1/database/<database>/names`. One-field form where
     /// the user types the desired new alias. Non-destructive — no
     /// typed-confirm required.
-    AddDatabaseAlias {
-        database: String,
-    },
+    AddDatabaseAlias { database: String },
     /// Sentinel used by the spreadsheet edit-mode exit path — when
     /// the user leaves edit mode with uncommitted changes we pop a
     /// confirm dialog; accepting it drops the pending edits.
@@ -177,11 +170,7 @@ impl Modal {
     }
 
     /// Convenience constructor for a form dialog.
-    pub fn form(
-        title: impl Into<String>,
-        fields: Vec<FormField>,
-        action: ModalAction,
-    ) -> Self {
+    pub fn form(title: impl Into<String>, fields: Vec<FormField>, action: ModalAction) -> Self {
         Modal::Form {
             title: title.into(),
             fields,

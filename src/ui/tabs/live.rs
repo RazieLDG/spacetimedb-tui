@@ -34,7 +34,11 @@ pub fn render_live(area: Rect, buf: &mut Buffer, app: &AppState) {
     let border_normal = rgb(theme.border_normal);
 
     let focused = app.focus == FocusPanel::Main;
-    let border_color = if focused { border_focused } else { border_normal };
+    let border_color = if focused {
+        border_focused
+    } else {
+        border_normal
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -53,10 +57,7 @@ pub fn render_live(area: Rect, buf: &mut Buffer, app: &AppState) {
     // Split: transactions get 2/3 of the height, clients get the rest.
     let sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Ratio(2, 3),
-            Constraint::Ratio(1, 3),
-        ])
+        .constraints([Constraint::Ratio(2, 3), Constraint::Ratio(1, 3)])
         .split(inner);
 
     render_tx_feed(sections[0], buf, app);
@@ -118,10 +119,7 @@ fn render_tx_feed(area: Rect, buf: &mut Buffer, app: &AppState) {
             Some(false) => Span::styled(" ✗ ", Style::default().fg(error_fg)),
             None => Span::styled(" • ", Style::default().fg(fg_muted)),
         };
-        let ts_span = Span::styled(
-            format!("{ts} "),
-            Style::default().fg(fg_muted),
-        );
+        let ts_span = Span::styled(format!("{ts} "), Style::default().fg(fg_muted));
         let caller_preview: String = if entry.caller.is_empty() {
             "(system)".to_string()
         } else {
@@ -167,15 +165,10 @@ fn render_client_list(area: Rect, buf: &mut Buffer, app: &AppState) {
     let fg_primary = rgb(theme.fg_primary);
     let border_normal = rgb(theme.border_normal);
 
-    let block = Block::default()
-        .borders(Borders::NONE)
-        .title(Span::styled(
-            format!(
-                " 👥 Connected clients ({}) ",
-                app.live_clients.len()
-            ),
-            Style::default().fg(accent).add_modifier(Modifier::BOLD),
-        ));
+    let block = Block::default().borders(Borders::NONE).title(Span::styled(
+        format!(" 👥 Connected clients ({}) ", app.live_clients.len()),
+        Style::default().fg(accent).add_modifier(Modifier::BOLD),
+    ));
     // Draw a top separator manually since BORDERS::NONE skips it.
     if area.height > 0 {
         for x in area.x..area.x + area.width {
@@ -189,10 +182,7 @@ fn render_client_list(area: Rect, buf: &mut Buffer, app: &AppState) {
     let title = block;
     // Title goes on the separator line itself.
     {
-        let t = format!(
-            " 👥 Connected clients ({}) ",
-            app.live_clients.len()
-        );
+        let t = format!(" 👥 Connected clients ({}) ", app.live_clients.len());
         buf.set_line(
             area.x + 2,
             area.y,
@@ -227,14 +217,8 @@ fn render_client_list(area: Rect, buf: &mut Buffer, app: &AppState) {
             .unwrap_or_else(|| "?".to_string());
         let line = Line::from(vec![
             Span::styled(" • ", Style::default().fg(accent)),
-            Span::styled(
-                format!("{id_preview:<22}"),
-                Style::default().fg(fg_primary),
-            ),
-            Span::styled(
-                format!(" connected {since}"),
-                Style::default().fg(fg_muted),
-            ),
+            Span::styled(format!("{id_preview:<22}"), Style::default().fg(fg_primary)),
+            Span::styled(format!(" connected {since}"), Style::default().fg(fg_muted)),
         ]);
         buf.set_line(area.x, y, &line, area.width);
     }

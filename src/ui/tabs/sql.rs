@@ -41,7 +41,11 @@ pub fn render_sql(
     let border_normal = rgb(theme.border_normal);
 
     let focused = app.focus == FocusPanel::Main || app.focus == FocusPanel::SqlInput;
-    let border_color = if focused { border_focused } else { border_normal };
+    let border_color = if focused {
+        border_focused
+    } else {
+        border_normal
+    };
 
     let outer_block = Block::default()
         .borders(Borders::ALL)
@@ -73,7 +77,7 @@ pub fn render_sql(
         .split(inner);
 
     let history_area = sections[0];
-    let input_area   = sections[1];
+    let input_area = sections[1];
     let results_area = sections[2];
 
     // ── History panel ─────────────────────────────────────────────────────
@@ -107,10 +111,7 @@ fn render_history(area: Rect, buf: &mut Buffer, app: &AppState) {
     let block = Block::default()
         .borders(Borders::BOTTOM)
         .border_style(Style::default().fg(border_normal))
-        .title(Span::styled(
-            " History ",
-            Style::default().fg(fg_muted),
-        ));
+        .title(Span::styled(" History ", Style::default().fg(fg_muted)));
     let inner = block.inner(area);
     block.render(area, buf);
 
@@ -148,18 +149,19 @@ fn render_history(area: Rect, buf: &mut Buffer, app: &AppState) {
         }
 
         // Highlight the currently browsed history entry
-        let is_selected = app.history_cursor.map(|c| {
-            // history_cursor counts from end: 0 = latest
-            total.saturating_sub(1).saturating_sub(c) == skip + row
-        }).unwrap_or(false);
+        let is_selected = app
+            .history_cursor
+            .map(|c| {
+                // history_cursor counts from end: 0 = latest
+                total.saturating_sub(1).saturating_sub(c) == skip + row
+            })
+            .unwrap_or(false);
 
         let bg = if is_selected { history_sel } else { history_bg };
 
         // Fill row
         for x in inner.x..inner.x + inner.width {
-            buf[(x, y)]
-                .set_char(' ')
-                .set_style(Style::default().bg(bg));
+            buf[(x, y)].set_char(' ').set_style(Style::default().bg(bg));
         }
 
         let dur = format_duration(entry.duration);
@@ -173,15 +175,17 @@ fn render_history(area: Rect, buf: &mut Buffer, app: &AppState) {
             format!("{} ", entry.executed_at.format("%H:%M:%S")),
             Style::default().fg(fg_muted).bg(bg),
         );
-        let dur_span = Span::styled(
-            format!("[{dur}] "),
-            Style::default().fg(fg_muted).bg(bg),
-        );
+        let dur_span = Span::styled(format!("[{dur}] "), Style::default().fg(fg_muted).bg(bg));
         let sql_span = Span::styled(
             truncate_str(&entry.sql, inner.width as usize - 20),
-            Style::default().fg(fg_primary).bg(bg).add_modifier(
-                if is_selected { Modifier::BOLD } else { Modifier::empty() }
-            ),
+            Style::default()
+                .fg(fg_primary)
+                .bg(bg)
+                .add_modifier(if is_selected {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
         );
 
         let line = Line::from(vec![status_span, time_span, dur_span, sql_span]);
@@ -216,8 +220,7 @@ fn render_results(
                 return;
             }
 
-            let headers: Vec<String> =
-                qr.column_names().iter().map(|s| s.to_string()).collect();
+            let headers: Vec<String> = qr.column_names().iter().map(|s| s.to_string()).collect();
             let rows: Vec<Vec<String>> = qr
                 .rows
                 .iter()

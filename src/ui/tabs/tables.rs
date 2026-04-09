@@ -40,7 +40,11 @@ pub fn render_tables(
 
     // Outer block
     let focused = matches!(app.focus, crate::state::FocusPanel::Main);
-    let border_color = if focused { border_focused } else { border_normal };
+    let border_color = if focused {
+        border_focused
+    } else {
+        border_normal
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
@@ -208,10 +212,7 @@ fn render_info_bar(area: Rect, buf: &mut Buffer, app: &AppState) {
     }
 
     // Right-align hint
-    let hint = Span::styled(
-        " r:refresh  n:next  p:prev ",
-        Style::default().fg(fg_muted),
-    );
+    let hint = Span::styled(" r:refresh  n:next  p:prev ", Style::default().fg(fg_muted));
     let hint_w = hint.content.len() as u16;
     let hint_x = area.x + area.width.saturating_sub(hint_w);
 
@@ -240,11 +241,7 @@ fn build_table_data(app: &AppState) -> Option<(Vec<String>, Vec<Vec<String>>, St
     let rows: Vec<Vec<String>> = qr
         .rows
         .iter()
-        .map(|row| {
-            row.iter()
-                .map(value_to_display)
-                .collect()
-        })
+        .map(|row| row.iter().map(value_to_display).collect())
         .collect();
 
     let title = app

@@ -20,6 +20,14 @@ on:
         required: true
         default: "v0.0.0-dev"
 
+# Creating a GitHub release + uploading assets requires the workflow
+# token to have `contents: write`. Repos with the default-restricted
+# permission policy get the read-only token, which is why `Create
+# draft release` used to fail with HTTP 403. Grant it explicitly at
+# the workflow level so every job inherits the elevated scope.
+permissions:
+  contents: write
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0

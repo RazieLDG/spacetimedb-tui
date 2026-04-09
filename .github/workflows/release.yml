@@ -1,0 +1,168 @@
+name: Release
+
+# Builds a signed-nothing pre-built binary for each tier-1 desktop
+# target whenever a semver tag (`v*`) is pushed. Attaches the
+# archives to the auto-created GitHub Release so users can grab a
+# ready-to-run `spacetimedb-tui` without needing a Rust toolchain.
+#
+# Trigger manually for a test run via the "workflow_dispatch" entry
+# below — that path still builds every target but uploads to a
+# draft release instead of publishing.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag name for a manual dispatch (e.g. v0.1.0-test)"
+        required: true
+        default: "v0.0.0-dev"
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  # Name of the binary produced by `cargo build --release`.
+  # Must match `[[bin]] name = …` in Cargo.toml.
+  BIN_NAME: spacetimedb-tui
+
+jobs:
+  # ────────────────────────────────────────────────────────────────
+  # Step 1: create the GitHub release (draft) once, up front. Each
+  # build job below uploads its asset to this release.
+  # ────────────────────────────────────────────────────────────────
+  create-release:
+    name: Create GitHub release
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.release.outputs.upload_url }}
+      tag: ${{ steps.resolve-tag.outputs.tag }}
+    steps:
+      - name: Resolve tag name
+        id: resolve-tag
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create draft release
+        id: release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.resolve-tag.outputs.tag }}
+          name: ${{ steps.resolve-tag.outputs.tag }}
+          draft: true
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ────────────────────────────────────────────────────────────────
+  # Step 2: native-build the binary on each target platform and
+  # upload the archive to the release. Each job is independent so a
+  # failing target doesn't block the rest of the matrix.
+  # ────────────────────────────────────────────────────────────────
+  build:
+    name: Build ${{ matrix.target }}
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 — glibc, native OpenSSL via `native-tls`.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+
+          # macOS Intel — still maintained for users on older hardware.
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+
+          # macOS Apple Silicon — `macos-latest` is aarch64 as of
+          # 2024. Uses SecTransport for TLS, no extra deps.
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+
+          # Windows x86_64 — MSVC toolchain, schannel for TLS.
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain for ${{ matrix.target }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # ──────────────────────────────────────────────────────────
+      # Archive the binary. Unix → tar.gz, Windows → zip. Both use
+      # the same naming scheme so the release listing stays tidy:
+      #   spacetimedb-tui-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+      # ──────────────────────────────────────────────────────────
+      - name: Package archive (Unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          staging="${BIN_NAME}-${{ needs.create-release.outputs.tag }}-${{ matrix.target }}"
+          mkdir -p "$staging"
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "$staging/"
+          cp README.md LICENSE "$staging/" 2>/dev/null || true
+          tar czf "${staging}.tar.gz" "$staging"
+          echo "ASSET=${staging}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package archive (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $staging = "$env:BIN_NAME-${{ needs.create-release.outputs.tag }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\$env:BIN_NAME.exe" $staging
+          if (Test-Path README.md) { Copy-Item README.md $staging }
+          if (Test-Path LICENSE)   { Copy-Item LICENSE   $staging }
+          Compress-Archive -Path $staging -DestinationPath "$staging.zip"
+          "ASSET=$staging.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.create-release.outputs.tag }}
+          files: ${{ env.ASSET }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ────────────────────────────────────────────────────────────────
+  # Step 3: promote the draft to published once every build job
+  # has uploaded its asset. Only runs on real tag pushes — manual
+  # dispatches leave the draft behind so humans can review it.
+  # ────────────────────────────────────────────────────────────────
+  publish:
+    name: Publish release
+    needs: [create-release, build]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - name: Mark release as published
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.create-release.outputs.tag }}
+          draft: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

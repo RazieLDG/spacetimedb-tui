@@ -21,10 +21,16 @@ use serde::{Deserialize, Serialize};
 // Filesystem helpers
 // ---------------------------------------------------------------------------
 
-/// Return `~/.config/spacetimedb-tui/`. `None` when `$HOME` is unset.
+/// Return the platform-specific config directory for the TUI:
+///
+/// - **Linux**:   `~/.config/spacetimedb-tui/`
+/// - **macOS**:   `~/Library/Application Support/spacetimedb-tui/`
+/// - **Windows**: `%APPDATA%\spacetimedb-tui\`
+///
+/// Returns `None` on the rare systems where `dirs` cannot locate a
+/// config root (e.g. a stripped-down container with no `$HOME`).
 pub fn config_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".config/spacetimedb-tui"))
+    dirs::config_dir().map(|d| d.join("spacetimedb-tui"))
 }
 
 fn config_path() -> Option<PathBuf> {

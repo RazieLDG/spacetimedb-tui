@@ -70,7 +70,7 @@ const SECTIONS: &[Section] = &[
             Binding { key: "Ctrl+U",          desc: "Kill to start of line" },
             Binding { key: "Ctrl+W",          desc: "Delete previous word" },
             Binding { key: "Ctrl+A / Home",   desc: "Move cursor to start" },
-            Binding { key: "Ctrl+E / End",    desc: "Move cursor to end" },
+            Binding { key: "Ctrl+E / End",    desc: "Move cursor to end (SQL input only)" },
         ],
     },
     Section {
@@ -96,7 +96,7 @@ const SECTIONS: &[Section] = &[
             Binding { key: "U (shift-u)",     desc: "Update selected row (opens edit form)" },
             Binding { key: "d",               desc: "Delete selected row (asks for y/n confirm)" },
             Binding { key: "D (shift-d)",     desc: "Truncate table (typed-confirm: type the name)" },
-            Binding { key: "Ctrl+E",          desc: "Enter spreadsheet edit mode (cell-by-cell)" },
+            Binding { key: "Ctrl+E",          desc: "Enter spreadsheet edit mode (Main focus only — in SQL input it moves cursor to end)" },
         ],
     },
     Section {
@@ -260,15 +260,17 @@ impl Widget for HelpOverlay {
             buf.set_line(inner.x, y, line, inner.width);
         }
 
-        // Scroll hint
-        if total_lines > visible_h {
+        // Scroll hint — clamped to the last row of the inner area so
+        // an `inner.height == 0` edge case (e.g. a 1-row popup on a
+        // tiny terminal) can't underflow and overwrite the border.
+        if total_lines > visible_h && inner.height > 0 {
             let hint = format!(
                 " {}/{} ↑↓ scroll ",
                 scroll + visible_h.min(total_lines - scroll),
                 total_lines
             );
             let hint_x = inner.x + inner.width.saturating_sub(hint.len() as u16);
-            let hint_y = inner.y + inner.height - 1;
+            let hint_y = inner.y + inner.height.saturating_sub(1);
             let hint_line = Line::from(Span::styled(hint, Style::default().fg(FG_MUTED)));
             buf.set_line(hint_x, hint_y, &hint_line, inner.width);
         }

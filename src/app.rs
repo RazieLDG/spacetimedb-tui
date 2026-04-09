@@ -882,12 +882,33 @@ impl App {
                 if col_count == 0 {
                     return;
                 }
+                // Snapshot the underlying data row the cursor points at
+                // *before* mutating the sort state — we'll translate it
+                // back into a display row after the permutation changes
+                // so the cursor appears to stay on the "same" record
+                // instead of jumping to a random position.
+                let anchor_data_row = self.active_data_row_index();
                 let grid = if self.state.current_tab == Tab::Tables {
                     &mut self.tables_grid
                 } else {
                     &mut self.sql_grid
                 };
                 grid.cycle_sort(grid.selected_col);
+
+                // Re-map the anchor through the new permutation. If
+                // anything goes sideways (empty rows, missing anchor)
+                // the cursor stays where it was — no worse than the
+                // old behaviour.
+                if let Some(data_idx) = anchor_data_row {
+                    if let Some(new_display) = self.display_row_for_data_idx(data_idx) {
+                        let grid = if self.state.current_tab == Tab::Tables {
+                            &mut self.tables_grid
+                        } else {
+                            &mut self.sql_grid
+                        };
+                        grid.selected_row = new_display;
+                    }
+                }
                 let col_name = self
                     .active_grid()
                     .and_then(|(qr, g)| {
@@ -1321,6 +1342,47 @@ impl App {
             grid.sort_desc,
             grid.selected_row,
         )
+    }
+
+    /// Reverse of [`active_data_row_index`]: given an underlying
+    /// `data_idx` (stable across sort permutations), return the
+    /// display row index it currently lives at under the active
+    /// grid's sort state. Used by the `s` key binding to keep the
+    /// cell cursor anchored to the same record when the permutation
+    /// changes.
+    fn display_row_for_data_idx(&self, data_idx: usize) -> Option<usize> {
+        let (qr, grid) = self.active_grid()?;
+        if qr.rows.is_empty() || data_idx >= qr.rows.len() {
+            return None;
+        }
+        let Some(sort_col) = grid.sort_col else {
+            return Some(data_idx);
+        };
+        let string_rows: Vec<Vec<String>> = qr
+            .rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(crate::ui::tabs::tables::value_to_display)
+                    .collect()
+            })
+            .collect();
+        // Rebuild the permutation the renderer uses and scan for
+        // the display index whose mapped data index matches.
+        // O(n²) in the worst case but data grids cap at a few
+        // hundred rows — acceptable for a one-shot key event.
+        for display_idx in 0..string_rows.len() {
+            if crate::ui::components::table_grid::sorted_data_index(
+                &string_rows,
+                Some(sort_col),
+                grid.sort_desc,
+                display_idx,
+            ) == Some(data_idx)
+            {
+                return Some(display_idx);
+            }
+        }
+        None
     }
 
     /// Copy the currently-highlighted cell to the terminal clipboard.
@@ -2134,29 +2196,43 @@ impl App {
         ));
     }
 
+    /// Shared constructor for the "type the name to confirm" modal
+    /// flow used by destructive admin ops. The dispatcher checks
+    /// `fields[0].input.value == expected` before running `action`.
+    fn open_typed_confirm_form(
+        &mut self,
+        title: impl Into<String>,
+        expected: &str,
+        verb: &str,
+        action: crate::state::modal::ModalAction,
+    ) {
+        let field = crate::state::modal::FormField::new(format!(
+            "Type '{expected}' to confirm {verb}"
+        ))
+        .with_placeholder("required");
+        self.state.modal = Some(crate::state::modal::Modal::form(
+            title.into(),
+            vec![field],
+            action,
+        ));
+    }
+
     /// Open a typed-confirm form to permanently delete the currently
     /// selected database. The user has to type the database name
-    /// verbatim into a single form field — a plain `[y/n]` would
-    /// be too easy to trigger by accident, and the operation is
-    /// irreversible.
+    /// verbatim — a plain `[y/n]` would be too easy to trigger by
+    /// accident and the operation is irreversible.
     fn open_delete_db_form(&mut self) {
         let Some(db_name) = self.state.selected_database().map(str::to_string) else {
             self.state
                 .set_notification("No database selected".to_string());
             return;
         };
-        let field = crate::state::modal::FormField::new(format!(
-            "Type '{db_name}' to confirm DELETE"
-        ))
-        .with_placeholder("required");
-        let action = crate::state::modal::ModalAction::DeleteDatabase {
-            database: db_name.clone(),
-        };
-        self.state.modal = Some(crate::state::modal::Modal::form(
+        self.open_typed_confirm_form(
             format!("⚠ DELETE DATABASE {db_name}"),
-            vec![field],
-            action,
-        ));
+            &db_name.clone(),
+            "DELETE",
+            crate::state::modal::ModalAction::DeleteDatabase { database: db_name },
+        );
     }
 
     /// Open a typed-confirm form to delete every row from the
@@ -2170,18 +2246,12 @@ impl App {
             self.state.set_notification("No table selected".to_string());
             return;
         };
-        let field = crate::state::modal::FormField::new(format!(
-            "Type '{table}' to confirm TRUNCATE"
-        ))
-        .with_placeholder("required");
-        let action = crate::state::modal::ModalAction::TruncateTable {
-            table: table.clone(),
-        };
-        self.state.modal = Some(crate::state::modal::Modal::form(
+        self.open_typed_confirm_form(
             format!("⚠ TRUNCATE TABLE {table}"),
-            vec![field],
-            action,
-        ));
+            &table.clone(),
+            "TRUNCATE",
+            crate::state::modal::ModalAction::TruncateTable { table },
+        );
     }
 
     /// Open a confirm dialog to delete the currently selected row.
@@ -3395,10 +3465,31 @@ fn coerce_field_to_json(raw: &str, type_tag: &str) -> serde_json::Value {
 /// Build a SQL literal from a raw input string and a type tag.
 /// Numerics are emitted bare, booleans become `TRUE`/`FALSE`, and
 /// everything else is single-quoted with embedded quotes doubled.
+///
+/// `Identity` / `ConnectionId` / `Address` columns get a hex-literal
+/// path: if the user typed `"0xabc…"` or a bare `"abc…"` the emitted
+/// literal is `0xabc…` (valid SpacetimeDB hex syntax) rather than a
+/// single-quoted string — which the server would reject.
 fn sql_literal(raw: &str, type_tag: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return "NULL".to_string();
+    }
+    // Identity / ConnectionId / Address want a hex literal, not a
+    // quoted string. Accept both "0xabc…" and bare "abc…" and always
+    // emit the `0x`-prefixed form. Checked *before* the numeric
+    // prefix branch below because `"Identity"` starts with `I` and
+    // would otherwise get mis-classified as an integer type.
+    if type_tag == "Identity" || type_tag == "ConnectionId" || type_tag.contains("Address") {
+        let body = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+        if !body.is_empty() && body.chars().all(|c| c.is_ascii_hexdigit()) {
+            return format!("0x{body}");
+        }
+        // Fall through to quoted-string form if the input doesn't
+        // look like hex — surfaces the problem as a SQL error
+        // rather than sending a silently-wrong literal.
+        let escaped = trimmed.replace('\'', "''");
+        return format!("'{escaped}'");
     }
     if type_tag.starts_with('U') || type_tag.starts_with('I') || type_tag.starts_with('F') {
         return trimmed.to_string();
@@ -3450,6 +3541,18 @@ fn json_to_sql_literal(v: &serde_json::Value) -> Result<String, String> {
                 if !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()) {
                     return Ok(s.clone());
                 }
+            }
+            // Bare-hex heuristic (no `0x` prefix): some server versions
+            // serialise `Identity` / `ConnectionId` as a bare hex string
+            // like `"c2005e40a5b1..."`. Re-add the prefix so the literal
+            // is valid SpacetimeDB hex syntax.
+            //
+            // Require ≥8 chars and even length so short ambiguous
+            // strings (`"ab"`, `"cafe"`, `"deadbeef"` as a nickname)
+            // still fall through to the quoted-string branch unless
+            // they're long enough to be obviously an identity hash.
+            if s.len() >= 16 && s.len() % 2 == 0 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Ok(format!("0x{s}"));
             }
             let escaped = s.replace('\'', "''");
             Ok(format!("'{escaped}'"))
@@ -3827,6 +3930,64 @@ mod modal_helper_tests {
         let v = serde_json::json!({"WeirdCustomType": {"foo": 1}});
         let err = json_to_sql_literal(&v).unwrap_err();
         assert!(err.contains("complex value"));
+    }
+
+    #[test]
+    fn json_literal_bare_hex_long_string_gets_prefix() {
+        // Some server versions emit Identity as a bare hex string
+        // without the `0x` prefix. A 64-char all-hex string must
+        // round-trip as a hex literal, not a quoted one.
+        let v = serde_json::json!("c2005e40a5b1576e629a78ae0deef2fbbd6449ba1f150a8dcf76d312c47e2f");
+        let lit = json_to_sql_literal(&v).unwrap();
+        assert!(lit.starts_with("0x"));
+    }
+
+    #[test]
+    fn json_literal_short_hex_like_string_stays_quoted() {
+        // Short strings that *happen* to be hex-only (`"cafe"`,
+        // `"deadbeef"` as a nickname) must still be treated as
+        // regular strings — the heuristic is only safe for lengths
+        // that are clearly identity hashes.
+        for short in ["ab", "cafe", "deadbeef"] {
+            let v = serde_json::json!(short);
+            let lit = json_to_sql_literal(&v).unwrap();
+            assert!(
+                lit.starts_with('\''),
+                "{short:?} → {lit:?} should be quoted, not hex"
+            );
+        }
+    }
+
+    #[test]
+    fn sql_literal_identity_type_emits_hex() {
+        // A user typing a 0x-prefixed hex value into an Identity
+        // form field must not end up single-quoted.
+        assert_eq!(
+            sql_literal("0xdeadbeef", "Identity"),
+            "0xdeadbeef"
+        );
+        assert_eq!(
+            sql_literal("0xfeed", "ConnectionId"),
+            "0xfeed"
+        );
+    }
+
+    #[test]
+    fn sql_literal_identity_type_without_prefix_adds_0x() {
+        // Same thing but without the `0x` the user omitted.
+        assert_eq!(
+            sql_literal("deadbeef", "Identity"),
+            "0xdeadbeef"
+        );
+    }
+
+    #[test]
+    fn sql_literal_identity_type_non_hex_falls_through_to_quoted() {
+        // Garbage input for an Identity column shouldn't silently
+        // produce a bad hex literal — let the server reject a
+        // quoted string so the user sees an error.
+        let lit = sql_literal("not-hex!", "Identity");
+        assert_eq!(lit, "'not-hex!'");
     }
 }
 

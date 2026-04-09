@@ -84,6 +84,12 @@ pub struct TableInfo {
     pub table_access: String,
     /// Resolved column definitions (populated from typespace after parsing).
     pub columns: Vec<ColumnInfo>,
+    /// Primary-key column ids as reported by the server
+    /// (JSON field: `"primary_key": [u16, …]`). Empty for tables
+    /// without a PK. Populated by `parse_schema_response` from the
+    /// raw v9 wire format — not something `resolve_columns` can set.
+    #[serde(default)]
+    pub primary_key_cols: Vec<u16>,
     /// Raw index definitions.
     #[serde(default)]
     pub indexes: Vec<Value>,

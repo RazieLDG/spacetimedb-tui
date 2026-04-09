@@ -72,10 +72,13 @@ pub enum ModalAction {
         table: String,
         pk_column: String,
         column_types: Vec<String>,
-        /// Original PK value, captured at modal-open time so the
-        /// WHERE clause survives any edits the user makes to the
-        /// PK field.
-        original_pk: String,
+        /// Pre-formatted SQL literal for the WHERE clause, captured
+        /// at modal-open time from the row's raw JSON value via
+        /// `json_to_sql_literal`. Stored as a ready-to-paste literal
+        /// (e.g. `0xdeadbeef`, `42`, `'alice'`) so the dispatcher
+        /// doesn't have to re-derive it — and so editing the PK
+        /// field in the form can't corrupt the WHERE clause.
+        pk_sql_literal: String,
         /// Index of the PK column inside `column_types` / `fields`,
         /// so the dispatcher knows which field to skip when
         /// generating the SET clause.

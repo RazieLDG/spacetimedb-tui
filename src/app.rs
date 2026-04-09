@@ -1801,6 +1801,7 @@ impl App {
         }
 
         let mut spawned = 0usize;
+        let mut skipped_errors: Vec<String> = Vec::new();
         for edit in &pending {
             let Some(row) = rows.get(edit.data_row_idx) else {
                 continue;
@@ -1814,18 +1815,36 @@ impl App {
                 .and_then(|t| t.columns.get(edit.col_idx).map(|c| c.col_name.clone()))
                 .unwrap_or_default();
             let new_literal = sql_literal(&edit.new_value, col_type);
-            let pk_type = column_types.get(pk_idx).cloned().unwrap_or_default();
-            let pk_raw = row
-                .get(pk_idx)
-                .map(crate::ui::tabs::tables::value_to_display)
-                .unwrap_or_default();
-            let pk_literal = sql_literal(&pk_raw, &pk_type);
+            // Build the WHERE literal from the raw JSON value so
+            // Identity / ConnectionId / U256 PKs round-trip
+            // correctly. A complex-shaped PK (array, nested object
+            // we don't recognise) is skipped with a per-edit error
+            // so the rest of the batch still goes through.
+            let pk_literal = match row.get(pk_idx).map(json_to_sql_literal) {
+                Some(Ok(lit)) => lit,
+                Some(Err(e)) => {
+                    skipped_errors.push(format!("{col_name}: {e}"));
+                    continue;
+                }
+                None => {
+                    skipped_errors.push(format!("{col_name}: no PK value"));
+                    continue;
+                }
+            };
             let sql = format!(
                 "UPDATE {table} SET {col_name} = {new_literal} WHERE {pk_column} = {pk_literal}"
             );
             let op_label = format!("edit {table}.{col_name}");
             self.spawn_write_sql(db.clone(), sql, op_label);
             spawned += 1;
+        }
+
+        if !skipped_errors.is_empty() {
+            self.state.set_error(format!(
+                "Skipped {} edit(s): {}",
+                skipped_errors.len(),
+                skipped_errors.join("; ")
+            ));
         }
 
         if spawned > 0 {
@@ -2064,16 +2083,27 @@ impl App {
             .iter()
             .map(|c| type_tag(&c.col_type))
             .collect();
-        let original_pk = row
-            .get(pk_idx)
-            .map(crate::ui::tabs::tables::value_to_display)
-            .unwrap_or_default();
+        // Build the PK WHERE literal directly from the raw JSON
+        // value so Identity / ConnectionId / U256 PKs round-trip
+        // correctly. Display strings (`value_to_display`) mangle
+        // these into `{__identity__:0xabc}` which the server
+        // cannot parse.
+        let pk_sql_literal = match row.get(pk_idx).and_then(|v| json_to_sql_literal(v).ok()) {
+            Some(lit) => lit,
+            None => {
+                self.state.set_error(format!(
+                    "Cannot edit row: primary key of {} has no SQL literal form",
+                    table.table_name
+                ));
+                return;
+            }
+        };
 
         let action = crate::state::modal::ModalAction::UpdateRow {
             table: table.table_name.clone(),
             pk_column,
             column_types,
-            original_pk,
+            pk_sql_literal,
             pk_index: pk_idx,
         };
         self.state.modal = Some(crate::state::modal::Modal::form(
@@ -2188,13 +2218,20 @@ impl App {
         };
 
         let (pk_idx, pk_name) = pick_primary_key(&table);
-        let pk_col = &table.columns[pk_idx];
-        let pk_type = type_tag(&pk_col.col_type);
-        let pk_value_raw = row
-            .get(pk_idx)
-            .map(crate::ui::tabs::tables::value_to_display)
-            .unwrap_or_default();
-        let pk_literal = sql_literal(&pk_value_raw, &pk_type);
+        // Build the WHERE literal directly from the raw JSON value
+        // so Identity / ConnectionId / U256 PKs are emitted as real
+        // SQL literals (`0xdeadbeef`) instead of the mangled display
+        // form (`{__identity__:0xdeadbeef}`).
+        let pk_literal = match row.get(pk_idx).and_then(|v| json_to_sql_literal(v).ok()) {
+            Some(lit) => lit,
+            None => {
+                self.state.set_error(format!(
+                    "Cannot delete row: primary key of {} has no SQL literal form",
+                    table.table_name
+                ));
+                return;
+            }
+        };
         let where_sql = format!("{pk_name} = {pk_literal}");
 
         let prompt = format!(
@@ -2349,7 +2386,7 @@ impl App {
                     table,
                     pk_column,
                     column_types,
-                    original_pk,
+                    pk_sql_literal,
                     pk_index,
                 } => {
                     // Skip the PK field when generating the SET clause
@@ -2368,10 +2405,13 @@ impl App {
                         self.state.set_notification("Nothing to update".to_string());
                         return;
                     }
-                    let pk_type = column_types.get(pk_index).cloned().unwrap_or_default();
-                    let where_value = sql_literal(&original_pk, &pk_type);
+                    // `pk_sql_literal` was built at modal-open time
+                    // from the row's raw JSON Value, so it already
+                    // handles Identity / ConnectionId / U256 PKs
+                    // correctly without going through the display-
+                    // string round trip.
                     let sql = format!(
-                        "UPDATE {table} SET {} WHERE {pk_column} = {where_value}",
+                        "UPDATE {table} SET {} WHERE {pk_column} = {pk_sql_literal}",
                         assignments.join(", ")
                     );
                     self.spawn_write_sql(db, sql, op_label);
@@ -3223,7 +3263,23 @@ impl App {
 /// WHERE clause targets the right column instead of always assuming
 /// it's column zero.
 fn pick_primary_key(table: &crate::api::types::TableInfo) -> (usize, String) {
-    // 1. autoinc wins.
+    // 0. Server-declared primary key wins (populated by the v9
+    //    schema parser from the table's `primary_key: [u16, ...]`
+    //    field). Composite PKs aren't supported by the write-op
+    //    SQL builders yet — we take the first column in that case
+    //    so at least single-column lookups work.
+    if let Some(&col_id) = table.primary_key_cols.first() {
+        if let Some((i, c)) = table
+            .columns
+            .iter()
+            .enumerate()
+            .find(|(_, c)| c.col_id as u16 == col_id)
+        {
+            return (i, c.col_name.clone());
+        }
+    }
+    // 1. autoinc wins (now that `is_autoinc` is actually set by the
+    //    parser from the `sequences` array).
     if let Some((i, c)) = table
         .columns
         .iter()
@@ -3357,6 +3413,93 @@ fn sql_literal(raw: &str, type_tag: &str) -> String {
     format!("'{escaped}'")
 }
 
+/// Convert a raw JSON `Value` directly into a SpacetimeDB SQL literal.
+///
+/// Goes further than [`sql_literal`]: instead of flattening the value
+/// to a display string first (which corrupts `Identity` / `ConnectionId` /
+/// `U256` into garbage like `{__identity__:0xabc}`), this inspects the
+/// value's shape and emits the correct SQL form:
+///
+/// | JSON shape                           | Emits              |
+/// |--------------------------------------|--------------------|
+/// | `null`                               | `NULL`             |
+/// | `true` / `false`                     | `TRUE` / `FALSE`   |
+/// | integer / float                      | bare number        |
+/// | `"0xdead"` hex-looking string        | `0xdead`           |
+/// | regular string                       | `'…'` (escaped)    |
+/// | `{"__identity__": "0xabc"}`          | `0xabc`            |
+/// | `{"__connection_id__": "0xabc"}`     | `0xabc`            |
+/// | `{"U256": "12345"}` / `{"I128": …}`  | bare number        |
+/// | array / unknown object               | Err(…) with reason |
+///
+/// Used by the row-level write helpers (delete / update / edit-mode
+/// save) so their WHERE clauses actually match the row on the server
+/// instead of getting rejected for a bogus string literal.
+fn json_to_sql_literal(v: &serde_json::Value) -> Result<String, String> {
+    use serde_json::Value;
+    match v {
+        Value::Null => Ok("NULL".to_string()),
+        Value::Bool(true) => Ok("TRUE".to_string()),
+        Value::Bool(false) => Ok("FALSE".to_string()),
+        Value::Number(n) => Ok(n.to_string()),
+        Value::String(s) => {
+            // Accept hex-looking strings verbatim so `Identity` /
+            // `ConnectionId` values survive round-tripping without
+            // being wrapped in single quotes.
+            if let Some(hex) = s.strip_prefix("0x") {
+                if !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Ok(s.clone());
+                }
+            }
+            let escaped = s.replace('\'', "''");
+            Ok(format!("'{escaped}'"))
+        }
+        Value::Object(o) => {
+            // SpacetimeDB's JSON encoding for the scalar SATS types
+            // that need special-casing. The key tells us the wire tag.
+            if let Some(key) = o.keys().next() {
+                let inner = &o[key];
+                match key.as_str() {
+                    // Identity / ConnectionId come through in a
+                    // couple of shapes depending on the server
+                    // version: `{"__identity__": "0xabc"}`, the
+                    // tagged form `{"Identity": "0xabc"}`, or a
+                    // bare object with a single hex string value.
+                    "__identity__" | "Identity" | "__connection_id__" | "ConnectionId" => {
+                        if let Some(s) = inner.as_str() {
+                            // Ensure the leading `0x` for the literal.
+                            if s.starts_with("0x") {
+                                return Ok(s.to_string());
+                            }
+                            return Ok(format!("0x{s}"));
+                        }
+                    }
+                    // Large integer SATS types sometimes serialise
+                    // as `{"U256": "12345"}` to preserve precision.
+                    "U128" | "U256" | "I128" | "I256" => {
+                        if let Some(s) = inner.as_str() {
+                            return Ok(s.to_string());
+                        }
+                        if let Some(n) = inner.as_u64() {
+                            return Ok(n.to_string());
+                        }
+                        if let Some(n) = inner.as_i64() {
+                            return Ok(n.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Err(format!(
+                "complex value {v} has no SQL literal form — edit via the SQL console instead"
+            ))
+        }
+        Value::Array(_) => Err(format!(
+            "array value {v} has no SQL literal form — SpacetimeDB SQL doesn't support array literals"
+        )),
+    }
+}
+
 // ── Metrics Parser ────────────────────────────────────────────────────────────
 
 fn parse_prometheus_metrics(text: &str) -> crate::state::MetricsSnapshot {
@@ -3400,8 +3543,16 @@ mod modal_helper_tests {
     use crate::api::types::{ColumnInfo, TableInfo};
 
     fn make_col(name: &str, autoinc: bool) -> ColumnInfo {
+        make_col_at(0, name, autoinc)
+    }
+
+    /// Build a test column with an explicit `col_id`. Needed for
+    /// the declared-PK path — `pick_primary_key` matches the PK
+    /// entry against `ColumnInfo.col_id`, so every column in a
+    /// PK-test fixture needs a distinct id.
+    fn make_col_at(col_id: u32, name: &str, autoinc: bool) -> ColumnInfo {
         ColumnInfo {
-            col_id: 0,
+            col_id,
             col_name: name.to_string(),
             col_type: serde_json::json!("U64"),
             is_autoinc: autoinc,
@@ -3415,9 +3566,39 @@ mod modal_helper_tests {
             table_type: "user".to_string(),
             table_access: "public".to_string(),
             columns: cols,
+            primary_key_cols: vec![],
             indexes: vec![],
             constraints: vec![],
         }
+    }
+
+    /// Same as `make_table` but pre-populated with a declared
+    /// server-side primary key (the `primary_key: [col_id, ...]`
+    /// array that v9 schemas carry). Used by the "prefers declared
+    /// PK" regression test.
+    fn make_table_with_pk(name: &str, cols: Vec<ColumnInfo>, pk_col_ids: Vec<u16>) -> TableInfo {
+        let mut t = make_table(name, cols);
+        t.primary_key_cols = pk_col_ids;
+        t
+    }
+
+    #[test]
+    fn pick_primary_key_prefers_declared_server_pk() {
+        // When the v9 schema carries a `primary_key: [col_id]`
+        // entry, that wins over every heuristic — including
+        // autoinc matches on a different column.
+        let t = make_table_with_pk(
+            "sessions",
+            vec![
+                make_col_at(0, "created_at", false),
+                make_col_at(1, "auto_id", true), // autoinc, but NOT the declared PK
+                make_col_at(2, "session_token", false),
+            ],
+            vec![2], // server says col_id 2 is the primary key
+        );
+        let (idx, name) = pick_primary_key(&t);
+        assert_eq!(idx, 2);
+        assert_eq!(name, "session_token");
     }
 
     #[test]
@@ -3561,6 +3742,91 @@ mod modal_helper_tests {
     #[test]
     fn sql_literal_empty_is_null() {
         assert_eq!(sql_literal("  ", "String"), "NULL");
+    }
+
+    // ── json_to_sql_literal ────────────────────────────────────────────
+
+    #[test]
+    fn json_literal_scalars() {
+        assert_eq!(json_to_sql_literal(&serde_json::json!(null)).unwrap(), "NULL");
+        assert_eq!(json_to_sql_literal(&serde_json::json!(true)).unwrap(), "TRUE");
+        assert_eq!(json_to_sql_literal(&serde_json::json!(false)).unwrap(), "FALSE");
+        assert_eq!(json_to_sql_literal(&serde_json::json!(42)).unwrap(), "42");
+        assert_eq!(json_to_sql_literal(&serde_json::json!(-17)).unwrap(), "-17");
+        assert_eq!(json_to_sql_literal(&serde_json::json!(1.5)).unwrap(), "1.5");
+    }
+
+    #[test]
+    fn json_literal_plain_string_is_single_quoted() {
+        let lit = json_to_sql_literal(&serde_json::json!("alice")).unwrap();
+        assert_eq!(lit, "'alice'");
+    }
+
+    #[test]
+    fn json_literal_string_escapes_embedded_quotes() {
+        let lit = json_to_sql_literal(&serde_json::json!("O'Brien")).unwrap();
+        assert_eq!(lit, "'O''Brien'");
+    }
+
+    #[test]
+    fn json_literal_hex_string_passes_through() {
+        // Identity / ConnectionId serialised as a bare hex string
+        // must round-trip as a raw `0x…` literal — *not* as a
+        // single-quoted string.
+        let lit = json_to_sql_literal(&serde_json::json!("0xdeadbeef")).unwrap();
+        assert_eq!(lit, "0xdeadbeef");
+    }
+
+    #[test]
+    fn json_literal_identity_object_tagged_form() {
+        // `{"Identity": "0xabc"}` → `0xabc`
+        let v = serde_json::json!({"Identity": "0xdeadbeef"});
+        assert_eq!(json_to_sql_literal(&v).unwrap(), "0xdeadbeef");
+    }
+
+    #[test]
+    fn json_literal_identity_object_dunder_form() {
+        // `{"__identity__": "0xabc"}` → `0xabc`
+        let v = serde_json::json!({"__identity__": "0xc2005e40a5b1"});
+        assert_eq!(json_to_sql_literal(&v).unwrap(), "0xc2005e40a5b1");
+    }
+
+    #[test]
+    fn json_literal_identity_object_without_0x_prefix() {
+        // If the server drops the `0x` prefix, re-add it so the
+        // literal is still valid SpacetimeDB hex syntax.
+        let v = serde_json::json!({"__identity__": "deadbeef"});
+        assert_eq!(json_to_sql_literal(&v).unwrap(), "0xdeadbeef");
+    }
+
+    #[test]
+    fn json_literal_connection_id_object() {
+        let v = serde_json::json!({"ConnectionId": "0xfeed"});
+        assert_eq!(json_to_sql_literal(&v).unwrap(), "0xfeed");
+    }
+
+    #[test]
+    fn json_literal_u256_string_form() {
+        // Large integers come back as strings to preserve precision.
+        let v = serde_json::json!({"U256": "123456789012345678901234567890"});
+        assert_eq!(
+            json_to_sql_literal(&v).unwrap(),
+            "123456789012345678901234567890"
+        );
+    }
+
+    #[test]
+    fn json_literal_array_is_error() {
+        let v = serde_json::json!([1, 2, 3]);
+        let err = json_to_sql_literal(&v).unwrap_err();
+        assert!(err.contains("array"));
+    }
+
+    #[test]
+    fn json_literal_unknown_object_is_error() {
+        let v = serde_json::json!({"WeirdCustomType": {"foo": 1}});
+        let err = json_to_sql_literal(&v).unwrap_err();
+        assert!(err.contains("complex value"));
     }
 }
 

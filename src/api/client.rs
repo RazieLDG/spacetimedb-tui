@@ -725,12 +725,49 @@ fn parse_schema_response(raw: Value) -> Result<SchemaResponse> {
             .cloned()
             .unwrap_or_default();
 
+        // Primary-key columns come through as `"primary_key": [u16, ...]`
+        // in the v9 wire format (see `RawTableDefV9.g.cs`). Empty list
+        // for PK-less tables. Tolerate both a bare number and a wrapped
+        // object form defensively — future server versions may shift.
+        let primary_key_cols: Vec<u16> = t
+            .get("primary_key")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|n| n.as_u64().map(|u| u as u16)).collect())
+            .unwrap_or_default();
+
+        // Discover autoinc columns via the `sequences` array. Each
+        // sequence targets one column (`column` field is the ColId),
+        // and any such column is effectively `is_autoinc = true` from
+        // the TUI's point of view.
+        let autoinc_cols: Vec<u16> = t
+            .get("sequences")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| s.get("column").and_then(|c| c.as_u64()).map(|u| u as u16))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Back-fill the `is_autoinc` flag on the already-resolved
+        // column list.
+        let columns: Vec<crate::api::types::ColumnInfo> = columns
+            .into_iter()
+            .map(|mut c| {
+                if autoinc_cols.contains(&(c.col_id as u16)) {
+                    c.is_autoinc = true;
+                }
+                c
+            })
+            .collect();
+
         tables.push(crate::api::types::TableInfo {
             table_name,
             product_type_ref,
             table_type,
             table_access,
             columns,
+            primary_key_cols,
             indexes,
             constraints,
         });

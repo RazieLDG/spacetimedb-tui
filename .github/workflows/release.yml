@@ -87,8 +87,12 @@ jobs:
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
 
-          # macOS Intel — still maintained for users on older hardware.
-          - os: macos-13
+          # macOS Intel — GitHub retired the `macos-13` Intel runner
+          # in 2025, so we cross-compile x86_64 from the Apple Silicon
+          # runner instead. macOS ships a universal SDK + linker that
+          # handles the other arch out of the box; `rustup target add`
+          # is enough to get the Rust std library.
+          - os: macos-latest
             target: x86_64-apple-darwin
             archive: tar.gz
 

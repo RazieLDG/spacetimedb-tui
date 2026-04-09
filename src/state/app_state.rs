@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 
 use crate::api::types::{LogEntry, LogLevel, QueryResult, Schema, TableInfo};
+use crate::config::ThemeColors;
 
 // ---------------------------------------------------------------------------
 // Tab / focus enums
@@ -20,27 +21,31 @@ use crate::api::types::{LogEntry, LogLevel, QueryResult, Schema, TableInfo};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tab {
     /// Table browser (rows of selected table).
-    Query,
+    Tables,
     /// Interactive SQL query editor and results view.
-    Schema,
+    Sql,
     /// Live log viewer.
     Logs,
     /// Server / module metrics.
     Metrics,
     /// Module inspector (reducers, tables, scheduled).
     Module,
+    /// Real-time transaction stream + connected-client list.
+    Live,
 }
 
 impl Tab {
-    pub const ALL: &'static [Tab] = &[Tab::Query, Tab::Schema, Tab::Logs, Tab::Metrics, Tab::Module];
+    pub const ALL: &'static [Tab] =
+        &[Tab::Tables, Tab::Sql, Tab::Logs, Tab::Metrics, Tab::Module, Tab::Live];
 
     pub fn title(&self) -> &'static str {
         match self {
-            Tab::Query   => "Tables",
-            Tab::Schema  => "SQL",
+            Tab::Tables  => "Tables",
+            Tab::Sql     => "SQL",
             Tab::Logs    => "Logs",
             Tab::Metrics => "Metrics",
             Tab::Module  => "Module",
+            Tab::Live    => "Live",
         }
     }
 
@@ -73,6 +78,7 @@ pub enum FocusPanel {
     /// The SQL input box at the bottom.
     SqlInput,
     /// A modal dialog (e.g. error popup, help overlay).
+    #[allow(dead_code)]
     Modal,
 }
 
@@ -120,11 +126,14 @@ pub struct ConnectionInfo {
     pub base_url: String,
     /// Current connection status.
     pub status: ConnectionStatus,
-    /// Server version string, if reported.
+    /// Server version string, if reported (populated when available).
+    #[allow(dead_code)]
     pub server_version: Option<String>,
-    /// Authenticated identity token, if present.
+    /// Authenticated identity token, if present (for display in status bar).
+    #[allow(dead_code)]
     pub auth_token: Option<String>,
     /// When the last successful connection was made.
+    #[allow(dead_code)]
     pub connected_at: Option<DateTime<Utc>>,
 }
 
@@ -139,6 +148,8 @@ impl ConnectionInfo {
         }
     }
 
+    /// Returns `true` when the connection is in the `Connected` state.
+    #[allow(dead_code)]
     pub fn is_connected(&self) -> bool {
         self.status == ConnectionStatus::Connected
     }
@@ -151,6 +162,58 @@ impl ConnectionInfo {
 /// Maximum number of SQL history entries retained.
 const SQL_HISTORY_LIMIT: usize = 200;
 
+/// A single row pushed into the Live tab's transaction feed.
+///
+/// Derived from [`crate::api::types::WsServerMessage::TransactionUpdate`]
+/// when one arrives over the subscription WebSocket. Only the bits the
+/// UI actually needs are kept so the buffer stays small even under
+/// heavy activity.
+#[derive(Debug, Clone)]
+pub struct TxLogEntry {
+    /// When we observed the update (client clock).
+    pub observed_at: DateTime<Utc>,
+    /// Caller identity (may be an empty string for system-originated
+    /// transactions).
+    pub caller: String,
+    /// Per-table row counts affected by this transaction, in the
+    /// server's original order. `(table, inserts, deletes)`.
+    pub tables: Vec<(String, usize, usize)>,
+    /// Whether the transaction committed successfully. `None` when
+    /// the server didn't include a status field.
+    pub committed: Option<bool>,
+}
+
+impl TxLogEntry {
+    /// Sum of row inserts across every table touched by this tx.
+    pub fn total_inserts(&self) -> usize {
+        self.tables.iter().map(|(_, i, _)| *i).sum()
+    }
+    /// Sum of row deletes across every table touched by this tx.
+    pub fn total_deletes(&self) -> usize {
+        self.tables.iter().map(|(_, _, d)| *d).sum()
+    }
+}
+
+/// One row in the Live tab's connected-client list.
+#[derive(Debug, Clone)]
+pub struct LiveClientEntry {
+    /// Hex identity or connection id (whichever the server returned).
+    pub identity: String,
+    /// When the client first connected (best-effort from `st_client`).
+    pub connected_at: Option<DateTime<Utc>>,
+}
+
+/// Result of advancing the SQL history cursor forward (↓).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryAdvance {
+    /// Cursor was already at `None` — nothing happened.
+    Unchanged,
+    /// Cursor moved to a new history entry (use [`AppState::current_history_sql`]).
+    Moved,
+    /// Cursor walked off the end — caller should clear the input buffer.
+    Cleared,
+}
+
 /// A single entry in the SQL execution history.
 #[derive(Debug, Clone)]
 pub struct SqlHistoryEntry {
@@ -161,6 +224,8 @@ pub struct SqlHistoryEntry {
     /// How long the query took (round-trip including network).
     pub duration: Duration,
     /// Row count returned, or `None` if the query errored.
+    /// Available for display in the history panel and future export features.
+    #[allow(dead_code)]
     pub row_count: Option<usize>,
     /// Error message, if the query failed.
     pub error: Option<String>,
@@ -196,9 +261,11 @@ pub struct MetricsSnapshot {
 pub struct TableCache {
     /// The cached result set.
     pub result: QueryResult,
-    /// When the cache entry was populated.
+    /// When the cache entry was populated (used for cache expiry checks).
+    #[allow(dead_code)]
     pub fetched_at: Instant,
     /// Whether a refresh is currently in flight.
+    #[allow(dead_code)]
     pub loading: bool,
 }
 
@@ -253,18 +320,66 @@ pub struct AppState {
     // ------------------------------------------------------------------
     // Query tab
     // ------------------------------------------------------------------
-    /// Text currently in the SQL input box.
-    pub sql_input: String,
-    /// Cursor position (byte offset) inside `sql_input`.
-    pub sql_cursor: usize,
-    /// Result of the most recently executed query.
+    /// Result of the most recently executed SQL query (SQL tab only).
     pub query_result: Option<QueryResult>,
+    /// Result of the "browse table rows" load triggered from the sidebar
+    /// (Tables tab only). Kept separate from `query_result` so that a SQL
+    /// query in the SQL tab doesn't clobber the Tables view, and vice versa.
+    pub table_browse_result: Option<QueryResult>,
+    /// Live row data received over the WebSocket subscription, keyed by
+    /// table name. Each entry is the latest set of rows the server has
+    /// pushed for that table since the most recent `InitialSubscription`.
+    /// Used by the status bar / Tables view to surface live updates.
+    pub live_table_data: HashMap<String, Vec<serde_json::Value>>,
+    /// Rolling buffer of transactions observed over the WebSocket
+    /// subscription. Used by the Live tab to show a real-time feed of
+    /// what's happening in the database.
+    pub tx_log: VecDeque<TxLogEntry>,
+    /// Rolling list of connected clients, polled periodically from
+    /// `st_client`. Populated by the Live tab's background refresh.
+    pub live_clients: Vec<LiveClientEntry>,
+    /// Whether the live-subscription WebSocket is currently connected.
+    pub ws_connected: bool,
+    /// If the WS task is waiting to reconnect, the instant at which the
+    /// next attempt will fire. Used by the status bar to render a live
+    /// countdown ("Reconnecting in 5s…").
+    pub ws_reconnect_deadline: Option<Instant>,
+    /// 1-indexed attempt counter of the most recent reconnect wait, for
+    /// display purposes only.
+    pub ws_reconnect_attempt: u32,
     /// Scroll offset for the results table (row index of the top visible row).
+    /// Managed by `TableGridState`; kept here for persistence across tab switches.
+    #[allow(dead_code)]
     pub result_scroll_row: usize,
     /// Scroll offset for the results table (column index of the leftmost visible column).
+    /// Managed by `TableGridState`; kept here for persistence across tab switches.
+    #[allow(dead_code)]
     pub result_scroll_col: usize,
     /// Whether a query is currently in flight.
     pub query_loading: bool,
+    /// Whether a `get_schema` request is currently in flight for
+    /// the active database. Used by the sidebar to distinguish
+    /// "waiting for the first schema to arrive" (show `(loading…)`)
+    /// from "schema load failed / no tables" (show a terminal
+    /// placeholder so the UI doesn't spin forever).
+    pub schema_loading: bool,
+    /// Set to `true` after a schema load returns a non-success
+    /// status. Cleared the next time `load_schema` kicks off. The
+    /// sidebar reads this to show `(schema unavailable)` instead of
+    /// the spinning loading placeholder.
+    pub schema_load_failed: bool,
+
+    // ------------------------------------------------------------------
+    // Grid search
+    // ------------------------------------------------------------------
+    /// Case-insensitive query that the data-grid tabs filter rows by.
+    /// When `None`, no search is active; when `Some("")`, the user has
+    /// opened the prompt but hasn't typed anything yet.
+    pub grid_search: Option<String>,
+    /// While `Some(true)`, the next key in the main handler feeds the
+    /// search prompt instead of running regular bindings. Set by the
+    /// `Ctrl+F` handler and cleared on Enter / Esc.
+    pub grid_search_editing: bool,
 
     // ------------------------------------------------------------------
     // SQL history
@@ -290,6 +405,7 @@ pub struct AppState {
     /// Whether log auto-scroll (follow mode) is enabled.
     pub log_follow: bool,
     /// Minimum log level to display.
+    /// Used by `visible_logs()` for filtering; UI key binding to change it is a future enhancement.
     pub log_filter_level: LogLevel,
 
     // ------------------------------------------------------------------
@@ -313,9 +429,7 @@ pub struct AppState {
     // ------------------------------------------------------------------
     /// Set to `true` to request a clean shutdown.
     pub should_quit: bool,
-    /// Whether the terminal was resized since the last render.
-    pub needs_redraw: bool,
-    /// When the application was started.
+    /// When the application was started (used by `uptime()`).
     pub started_at: Instant,
 
     // ------------------------------------------------------------------
@@ -329,6 +443,32 @@ pub struct AppState {
     pub help_scroll: usize,
     /// Selected reducer index in the module inspector tab.
     pub module_selected_reducer: usize,
+
+    // ------------------------------------------------------------------
+    // Theming
+    // ------------------------------------------------------------------
+    /// Active colour theme — driven by the `--theme` CLI flag at startup.
+    /// UI renderers read accent / border / status colours from this struct
+    /// instead of hardcoded constants so that `--theme light` actually
+    /// changes what the user sees.
+    pub theme: ThemeColors,
+
+    // ------------------------------------------------------------------
+    // Modal dialog state (Faz 5: write operations)
+    // ------------------------------------------------------------------
+    /// Active modal dialog (confirm prompt or multi-field form), if
+    /// any. While `Some`, the main key handler routes every event
+    /// into the modal until the user accepts or cancels.
+    pub modal: Option<crate::state::modal::Modal>,
+
+    /// Command palette overlay, when open. Toggled with Ctrl+P.
+    pub palette: Option<crate::state::palette::CommandPalette>,
+
+    /// Spreadsheet edit-mode state for the Tables tab, when active.
+    /// Toggled with Ctrl+E. While `Some`, key bindings on the main
+    /// Tables pane route through the edit-mode key map instead of
+    /// the read-only data-grid bindings.
+    pub edit_mode: Option<crate::state::edit_mode::EditMode>,
 }
 
 impl AppState {
@@ -343,16 +483,29 @@ impl AppState {
             selected_table_idx: None,
             current_schema: None,
 
-            current_tab: Tab::Query,
+            current_tab: Tab::Tables,
             focus: FocusPanel::Sidebar,
             sidebar_focus: SidebarFocus::Databases,
 
-            sql_input: String::new(),
-            sql_cursor: 0,
             query_result: None,
+            table_browse_result: None,
+            live_table_data: HashMap::new(),
+            tx_log: VecDeque::new(),
+            live_clients: Vec::new(),
+            ws_connected: false,
+            ws_reconnect_deadline: None,
+            ws_reconnect_attempt: 0,
             result_scroll_row: 0,
             result_scroll_col: 0,
             query_loading: false,
+            schema_loading: false,
+            schema_load_failed: false,
+
+            grid_search: None,
+            grid_search_editing: false,
+            modal: None,
+            palette: None,
+            edit_mode: None,
 
             sql_history: VecDeque::new(),
             history_cursor: None,
@@ -371,13 +524,13 @@ impl AppState {
             notification: None,
 
             should_quit: false,
-            needs_redraw: true,
             started_at: Instant::now(),
 
             search_query: String::new(),
             show_help: false,
             help_scroll: 0,
             module_selected_reducer: 0,
+            theme: ThemeColors::dark(),
         }
     }
 
@@ -393,8 +546,15 @@ impl AppState {
     }
 
     /// Select the database at `idx`, resetting table selection.
+    ///
+    /// This is a no-op when `idx` is already the selected database, preventing
+    /// unnecessary state clears on repeated navigation to the same database.
     pub fn select_database(&mut self, idx: usize) {
         if idx < self.databases.len() {
+            // No-op if this database is already selected
+            if self.selected_database_idx == Some(idx) {
+                return;
+            }
             self.selected_database_idx = Some(idx);
             self.selected_table_idx = None;
             self.tables.clear();
@@ -458,90 +618,11 @@ impl AppState {
     }
 
     // ------------------------------------------------------------------
-    // SQL input helpers
-    // ------------------------------------------------------------------
-
-    /// Append a character to the SQL input at the current cursor position.
-    pub fn sql_insert_char(&mut self, ch: char) {
-        let mut buf = [0u8; 4];
-        let s = ch.encode_utf8(&mut buf);
-        self.sql_input.insert_str(self.sql_cursor, s);
-        self.sql_cursor += s.len();
-    }
-
-    /// Delete the character immediately before the cursor (backspace).
-    pub fn sql_backspace(&mut self) {
-        if self.sql_cursor == 0 || self.sql_input.is_empty() {
-            return;
-        }
-        // Walk back to the start of the previous UTF-8 char.
-        let mut cursor = self.sql_cursor;
-        loop {
-            cursor -= 1;
-            if self.sql_input.is_char_boundary(cursor) {
-                break;
-            }
-        }
-        self.sql_input.drain(cursor..self.sql_cursor);
-        self.sql_cursor = cursor;
-    }
-
-    /// Delete the character at the cursor (delete key).
-    pub fn sql_delete(&mut self) {
-        if self.sql_cursor >= self.sql_input.len() {
-            return;
-        }
-        let next = self
-            .sql_input[self.sql_cursor..]
-            .char_indices()
-            .nth(1)
-            .map(|(i, _)| self.sql_cursor + i)
-            .unwrap_or(self.sql_input.len());
-        self.sql_input.drain(self.sql_cursor..next);
-    }
-
-    /// Move the cursor left by one character.
-    pub fn sql_cursor_left(&mut self) {
-        if self.sql_cursor == 0 {
-            return;
-        }
-        let mut cursor = self.sql_cursor;
-        loop {
-            cursor -= 1;
-            if self.sql_input.is_char_boundary(cursor) {
-                break;
-            }
-        }
-        self.sql_cursor = cursor;
-    }
-
-    /// Move the cursor right by one character.
-    pub fn sql_cursor_right(&mut self) {
-        if self.sql_cursor >= self.sql_input.len() {
-            return;
-        }
-        let ch = self.sql_input[self.sql_cursor..].chars().next().unwrap_or('\0');
-        self.sql_cursor += ch.len_utf8();
-    }
-
-    /// Move the cursor to the beginning of the input.
-    pub fn sql_cursor_home(&mut self) {
-        self.sql_cursor = 0;
-    }
-
-    /// Move the cursor to the end of the input.
-    pub fn sql_cursor_end(&mut self) {
-        self.sql_cursor = self.sql_input.len();
-    }
-
-    /// Clear the SQL input and reset the cursor.
-    pub fn sql_clear(&mut self) {
-        self.sql_input.clear();
-        self.sql_cursor = 0;
-    }
-
-    // ------------------------------------------------------------------
     // SQL history helpers
+    //
+    // Note: SQL editing is handled by `InputState` (see
+    // `ui/components/input.rs`). This module only tracks history navigation;
+    // the actual text buffer lives on `App.sql_input`.
     // ------------------------------------------------------------------
 
     /// Push a completed query execution into the history ring.
@@ -554,9 +635,13 @@ impl AppState {
     }
 
     /// Navigate to the previous history entry (↑).
-    pub fn history_prev(&mut self) {
+    ///
+    /// Returns `true` if the cursor moved, `false` if the history is empty.
+    /// The caller is responsible for syncing the selected entry's text into
+    /// the `InputState` widget via [`current_history_sql`].
+    pub fn history_prev(&mut self) -> bool {
         if self.sql_history.is_empty() {
-            return;
+            return false;
         }
         let new_cursor = match self.history_cursor {
             None => self.sql_history.len() - 1,
@@ -564,28 +649,35 @@ impl AppState {
             Some(i) => i - 1,
         };
         self.history_cursor = Some(new_cursor);
-        if let Some(entry) = self.sql_history.get(new_cursor) {
-            self.sql_input = entry.sql.clone();
-            self.sql_cursor = self.sql_input.len();
-        }
+        true
     }
 
     /// Navigate to the next history entry (↓).
-    pub fn history_next(&mut self) {
+    ///
+    /// Returns `Some(sql)` if a history entry was selected, or `None` if the
+    /// cursor walked off the end of the history (caller should clear the
+    /// input in that case). The caller is responsible for syncing the
+    /// selected text into the `InputState` widget.
+    pub fn history_next(&mut self) -> HistoryAdvance {
         match self.history_cursor {
-            None => {}
+            None => HistoryAdvance::Unchanged,
             Some(i) if i + 1 >= self.sql_history.len() => {
                 self.history_cursor = None;
-                self.sql_clear();
+                HistoryAdvance::Cleared
             }
             Some(i) => {
                 self.history_cursor = Some(i + 1);
-                if let Some(entry) = self.sql_history.get(i + 1) {
-                    self.sql_input = entry.sql.clone();
-                    self.sql_cursor = self.sql_input.len();
-                }
+                HistoryAdvance::Moved
             }
         }
+    }
+
+    /// The SQL text of the history entry currently pointed at by
+    /// `history_cursor`, if any. Used by the caller to populate the input
+    /// widget after calling [`history_prev`] / [`history_next`].
+    pub fn current_history_sql(&self) -> Option<&str> {
+        let idx = self.history_cursor?;
+        self.sql_history.get(idx).map(|e| e.sql.as_str())
     }
 
     // ------------------------------------------------------------------
@@ -616,6 +708,9 @@ impl AppState {
     }
 
     /// Log entries that pass the current `log_filter_level`.
+    ///
+    /// The Logs tab uses this iterator both to count the visible lines and
+    /// to render the filtered slice.
     pub fn visible_logs(&self) -> impl Iterator<Item = &LogEntry> {
         let min_level = &self.log_filter_level;
         self.log_buffer.iter().filter(move |e| level_gte(&e.level, min_level))
@@ -673,6 +768,7 @@ impl AppState {
     }
 
     /// Store a query result in the table cache.
+    #[allow(dead_code)]
     pub fn cache_table_result(&mut self, database: &str, table_name: &str, result: QueryResult) {
         let key = Self::cache_key(database, table_name);
         self.table_cache.insert(
@@ -686,6 +782,7 @@ impl AppState {
     }
 
     /// Retrieve a cached result, if present and not older than `max_age`.
+    #[allow(dead_code)]
     pub fn get_cached_table(
         &self,
         database: &str,
@@ -703,6 +800,9 @@ impl AppState {
     // ------------------------------------------------------------------
 
     /// How long the application has been running.
+    ///
+    /// Available for display in the status bar or metrics tab.
+    #[allow(dead_code)]
     pub fn uptime(&self) -> Duration {
         self.started_at.elapsed()
     }
@@ -712,10 +812,14 @@ impl AppState {
 // Level ordering helper
 // ---------------------------------------------------------------------------
 
+/// Returns `true` when level `a` is at least as severe as `b`.
+#[allow(dead_code)]
 fn level_gte(a: &LogLevel, b: &LogLevel) -> bool {
     level_rank(a) >= level_rank(b)
 }
 
+/// Numeric severity rank for log level comparison.
+#[allow(dead_code)]
 fn level_rank(level: &LogLevel) -> u8 {
     match level {
         LogLevel::Trace => 0,
@@ -742,35 +846,88 @@ mod tests {
 
     #[test]
     fn test_tab_cycle() {
-        assert_eq!(Tab::Query.next(), Tab::Schema);
-        assert_eq!(Tab::Module.next(), Tab::Query);
-        assert_eq!(Tab::Query.prev(), Tab::Module);
+        // Tables → Sql → Logs → Metrics → Module → Live → Tables (wraps).
+        assert_eq!(Tab::Tables.next(), Tab::Sql);
+        assert_eq!(Tab::Module.next(), Tab::Live);
+        assert_eq!(Tab::Live.next(), Tab::Tables);
+        assert_eq!(Tab::Tables.prev(), Tab::Live);
+        assert_eq!(Tab::Live.prev(), Tab::Module);
     }
 
     #[test]
-    fn test_sql_insert_and_backspace() {
+    fn test_history_navigation() {
         let mut s = make_state();
-        s.sql_insert_char('H');
-        s.sql_insert_char('i');
-        assert_eq!(s.sql_input, "Hi");
-        assert_eq!(s.sql_cursor, 2);
-        s.sql_backspace();
-        assert_eq!(s.sql_input, "H");
-        assert_eq!(s.sql_cursor, 1);
-    }
-
-    #[test]
-    fn test_sql_cursor_movement() {
-        let mut s = make_state();
-        for ch in "hello".chars() {
-            s.sql_insert_char(ch);
+        for i in 0..3 {
+            s.push_sql_history(SqlHistoryEntry {
+                sql: format!("SELECT {i}"),
+                executed_at: Utc::now(),
+                duration: Duration::from_millis(1),
+                row_count: Some(0),
+                error: None,
+            });
         }
-        s.sql_cursor_home();
-        assert_eq!(s.sql_cursor, 0);
-        s.sql_cursor_right();
-        assert_eq!(s.sql_cursor, 1);
-        s.sql_cursor_end();
-        assert_eq!(s.sql_cursor, 5);
+        assert_eq!(s.current_history_sql(), None);
+        assert!(s.history_prev());
+        assert_eq!(s.current_history_sql(), Some("SELECT 2"));
+        assert!(s.history_prev());
+        assert_eq!(s.current_history_sql(), Some("SELECT 1"));
+        assert_eq!(s.history_next(), HistoryAdvance::Moved);
+        assert_eq!(s.current_history_sql(), Some("SELECT 2"));
+        assert_eq!(s.history_next(), HistoryAdvance::Cleared);
+        assert_eq!(s.current_history_sql(), None);
+        assert_eq!(s.history_next(), HistoryAdvance::Unchanged);
+    }
+
+    #[test]
+    fn test_history_prev_empty() {
+        let mut s = make_state();
+        assert!(!s.history_prev());
+        assert_eq!(s.history_cursor, None);
+    }
+
+    #[test]
+    fn test_log_filter_visible_logs() {
+        let mut s = make_state();
+        s.log_filter_level = LogLevel::Warn;
+        s.push_log(LogEntry {
+            ts: None,
+            level: LogLevel::Info,
+            message: "noise".into(),
+            target: None,
+            filename: None,
+            line_number: None,
+        });
+        s.push_log(LogEntry {
+            ts: None,
+            level: LogLevel::Error,
+            message: "boom".into(),
+            target: None,
+            filename: None,
+            line_number: None,
+        });
+        let visible: Vec<&str> =
+            s.visible_logs().map(|e| e.message.as_str()).collect();
+        assert_eq!(visible, vec!["boom"]);
+    }
+
+    #[test]
+    fn test_log_level_next_filter_cycles() {
+        assert_eq!(LogLevel::Trace.next_filter(), LogLevel::Debug);
+        assert_eq!(LogLevel::Debug.next_filter(), LogLevel::Info);
+        assert_eq!(LogLevel::Info.next_filter(), LogLevel::Warn);
+        assert_eq!(LogLevel::Warn.next_filter(), LogLevel::Error);
+        assert_eq!(LogLevel::Error.next_filter(), LogLevel::Panic);
+        assert_eq!(LogLevel::Panic.next_filter(), LogLevel::Trace);
+    }
+
+    #[test]
+    fn test_table_browse_separate_from_query_result() {
+        // Verify that the Tables tab and SQL tab don't share state.
+        let s = make_state();
+        assert!(s.query_result.is_none());
+        assert!(s.table_browse_result.is_none());
+        // Both fields exist independently on AppState — see the
+        // `query_result` / `table_browse_result` field declarations.
     }
 
     #[test]

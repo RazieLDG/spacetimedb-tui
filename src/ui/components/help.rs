@@ -36,15 +36,26 @@ const SECTIONS: &[Section] = &[
         title: "Navigation",
         bindings: &[
             Binding { key: "Tab / Shift+Tab", desc: "Switch panel focus" },
-            Binding { key: "1-5",             desc: "Jump to tab (Tables/SQL/Logs/Metrics/Module)" },
+            Binding { key: "1-6",             desc: "Jump to tab (Tables/SQL/Logs/Metrics/Module/Live)" },
             Binding { key: "j / ↓",           desc: "Move selection down" },
             Binding { key: "k / ↑",           desc: "Move selection up" },
-            Binding { key: "h / ←",           desc: "Scroll / move left" },
-            Binding { key: "l / →",           desc: "Scroll / move right" },
+            Binding { key: "h / ←",           desc: "Sidebar: step up (Tables → Databases) / focus sidebar from main" },
+            Binding { key: "l / →",           desc: "Focus main pane" },
             Binding { key: "g / Home",        desc: "Jump to first item" },
             Binding { key: "G / End",         desc: "Jump to last item" },
             Binding { key: "Enter",           desc: "Select / confirm" },
-            Binding { key: "Esc",             desc: "Cancel / close modal" },
+            Binding { key: "Esc / Backspace", desc: "Sidebar: step up tree; otherwise focus sidebar" },
+            Binding { key: "/ (slash)",       desc: "Sidebar search: filter databases / tables as you type" },
+        ],
+    },
+    Section {
+        title: "Help overlay",
+        bindings: &[
+            Binding { key: "?",               desc: "Toggle this overlay" },
+            Binding { key: "j / k / ↓ ↑",     desc: "Scroll the help text line by line" },
+            Binding { key: "g / Home",        desc: "Jump to the top" },
+            Binding { key: "G / End",         desc: "Jump to the bottom" },
+            Binding { key: "Esc / q",         desc: "Close the overlay" },
         ],
     },
     Section {
@@ -52,27 +63,92 @@ const SECTIONS: &[Section] = &[
         bindings: &[
             Binding { key: ":",               desc: "Enter SQL mode (focus input)" },
             Binding { key: "Enter",           desc: "Execute SQL query" },
+            Binding { key: "Tab",             desc: "Autocomplete keyword / table / column" },
             Binding { key: "↑ / ↓",           desc: "Browse query history" },
+            Binding { key: "Ctrl+L",          desc: "Clear entire input" },
             Binding { key: "Ctrl+K",          desc: "Kill to end of line" },
             Binding { key: "Ctrl+U",          desc: "Kill to start of line" },
+            Binding { key: "Ctrl+W",          desc: "Delete previous word" },
             Binding { key: "Ctrl+A / Home",   desc: "Move cursor to start" },
             Binding { key: "Ctrl+E / End",    desc: "Move cursor to end" },
         ],
     },
     Section {
-        title: "Tables",
+        title: "Data grid (Tables / SQL)",
         bindings: &[
-            Binding { key: "/ (slash)",       desc: "Search / filter tables" },
+            Binding { key: "h / l / ← →",     desc: "Move cell cursor across columns" },
+            Binding { key: "j / k / ↓ ↑",     desc: "Move cell cursor across rows" },
+            Binding { key: "y",               desc: "Copy selected cell to clipboard (OSC 52)" },
+            Binding { key: "Y (shift-y)",     desc: "Copy selected row as TSV" },
+            Binding { key: "e",               desc: "Export current results as CSV to ./exports/" },
+            Binding { key: "E (shift-e)",     desc: "Export current results as JSON to ./exports/" },
+            Binding { key: "Ctrl+F",          desc: "Open grid search prompt" },
+            Binding { key: "n / N",           desc: "Jump to next / previous search match" },
+            Binding { key: "s",               desc: "Cycle sort on selected column (off→asc→desc)" },
             Binding { key: "r",               desc: "Refresh current table data" },
-            Binding { key: "n / p",           desc: "Next / previous page" },
+            Binding { key: "n / p",           desc: "Next / previous page (when no search active)" },
+        ],
+    },
+    Section {
+        title: "Write ops (Tables tab)",
+        bindings: &[
+            Binding { key: "i",               desc: "Insert new row (opens form)" },
+            Binding { key: "U (shift-u)",     desc: "Update selected row (opens edit form)" },
+            Binding { key: "d",               desc: "Delete selected row (asks for y/n confirm)" },
+            Binding { key: "D (shift-d)",     desc: "Truncate table (typed-confirm: type the name)" },
+            Binding { key: "Ctrl+E",          desc: "Enter spreadsheet edit mode (cell-by-cell)" },
+        ],
+    },
+    Section {
+        title: "Spreadsheet edit mode (Tables tab)",
+        bindings: &[
+            Binding { key: "h / j / k / l",   desc: "Move cell cursor (Vim style)" },
+            Binding { key: "Enter / i",       desc: "Open inline editor on selected cell" },
+            Binding { key: "Enter",           desc: "Commit inline editor value to pending list" },
+            Binding { key: "Esc (in editor)", desc: "Cancel inline edit without committing" },
+            Binding { key: "s",               desc: "Save all pending edits (spawn UPDATE statements)" },
+            Binding { key: "u",               desc: "Revert pending edit on active cell" },
+            Binding { key: "Ctrl+E / Esc",    desc: "Exit edit mode (asks if pending edits > 0)" },
+        ],
+    },
+    Section {
+        title: "Admin ops (sidebar — Databases)",
+        bindings: &[
+            Binding { key: "a",               desc: "Add a new alias / human name to the selected database" },
+            Binding { key: "D (shift-d)",     desc: "DELETE database (typed-confirm: type the name)" },
+        ],
+    },
+    Section {
+        title: "Module tab — reducer calls",
+        bindings: &[
+            Binding { key: "j / k",           desc: "Move between reducers" },
+            Binding { key: "Enter",           desc: "Open reducer call form" },
+        ],
+    },
+    Section {
+        title: "Modal dialogs",
+        bindings: &[
+            Binding { key: "Tab / ↓",         desc: "Next field (form)" },
+            Binding { key: "Shift+Tab / ↑",   desc: "Previous field (form)" },
+            Binding { key: "Enter",           desc: "Submit form / confirm" },
+            Binding { key: "y",               desc: "Confirm (yes/no prompts)" },
+            Binding { key: "n / Esc",         desc: "Cancel modal" },
         ],
     },
     Section {
         title: "Logs",
         bindings: &[
             Binding { key: "Space",           desc: "Pause / resume auto-scroll" },
+            Binding { key: "f",               desc: "Cycle minimum log level filter" },
             Binding { key: "r",               desc: "Refresh logs" },
             Binding { key: "c",               desc: "Clear log buffer" },
+        ],
+    },
+    Section {
+        title: "Live",
+        bindings: &[
+            Binding { key: "6",               desc: "Jump to the Live tab (tx feed + clients)" },
+            Binding { key: "r",               desc: "Force re-subscribe to the WebSocket feed" },
         ],
     },
     Section {
@@ -80,6 +156,8 @@ const SECTIONS: &[Section] = &[
         bindings: &[
             Binding { key: "q",               desc: "Quit the application" },
             Binding { key: "Ctrl+C",          desc: "Force quit" },
+            Binding { key: "Ctrl+R",          desc: "Force WebSocket reconnect" },
+            Binding { key: "Ctrl+P",          desc: "Open command palette (fuzzy search)" },
             Binding { key: "?",               desc: "Toggle this help overlay" },
             Binding { key: "r",               desc: "Refresh current view" },
         ],
@@ -98,13 +176,29 @@ impl HelpOverlay {
     pub fn new(scroll: usize) -> Self {
         Self { scroll }
     }
+
+    /// Total number of lines the overlay would render with the
+    /// current section list. Used by `app.rs` to clamp the scroll
+    /// offset so a user mashing `↓` doesn't push the state into
+    /// nonsense values that take dozens of `↑` presses to recover.
+    pub fn total_lines() -> usize {
+        let mut n = 0usize;
+        for section in SECTIONS {
+            n += 1; // header
+            n += section.bindings.len();
+            n += 1; // blank line between sections
+        }
+        n
+    }
 }
 
 impl Widget for HelpOverlay {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        // Centre the popup
-        let popup_w = area.width.min(62);
-        let popup_h = area.height.min(32);
+        // Centre the popup — grow to consume almost the whole screen
+        // so the long binding list fits without forcing the user to
+        // scroll through a narrow peephole.
+        let popup_w = area.width.saturating_sub(4).min(78);
+        let popup_h = area.height.saturating_sub(2);
         let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
         let popup_y = area.y + (area.height.saturating_sub(popup_h)) / 2;
         let popup_area = Rect::new(popup_x, popup_y, popup_w, popup_h);

@@ -4,12 +4,13 @@
 //! truth for all TUI state.  Import from here rather than from the sub-module
 //! directly.
 
-#![allow(dead_code)]
-
 pub mod app_state;
+pub mod edit_mode;
+pub mod modal;
+pub mod palette;
 
 // Re-export the most commonly used items.
 pub use app_state::{
-    AppState, ConnectionStatus, FocusPanel, MetricsSnapshot, SidebarFocus,
-    SqlHistoryEntry, Tab,
+    AppState, ConnectionStatus, FocusPanel, HistoryAdvance, MetricsSnapshot, SidebarFocus,
+    SqlHistoryEntry, Tab, TxLogEntry,
 };

@@ -21,7 +21,6 @@ use crate::state::{AppState, FocusPanel};
 const ACCENT: Color = Color::Cyan;
 const BORDER_FOCUSED: Color = Color::Cyan;
 const BORDER_NORMAL: Color = Color::Rgb(40, 50, 65);
-const FG_PRIMARY: Color = Color::Rgb(220, 220, 220);
 const FG_MUTED: Color = Color::Rgb(110, 110, 110);
 const FG_VALUE: Color = Color::Rgb(229, 192, 123);
 const SUCCESS: Color = Color::Rgb(152, 195, 121);
@@ -142,26 +141,36 @@ fn render_card(area: Rect, buf: &mut Buffer, label: &str, value: &str, icon: &st
 
 // ── Sparklines ────────────────────────────────────────────────────────────────
 
+/// Convert a series of cumulative counters into per-tick deltas, so a
+/// sparkline actually moves up and down with activity instead of
+/// drawing a monotone ramp. The first sample gets a delta of 0 because
+/// we don't know what came before it.
+fn deltas(series: impl Iterator<Item = u64>) -> Vec<u64> {
+    let mut out = Vec::new();
+    let mut prev: Option<u64> = None;
+    for v in series {
+        match prev {
+            None => out.push(0),
+            Some(p) => out.push(v.saturating_sub(p)),
+        }
+        prev = Some(v);
+    }
+    out
+}
+
 fn render_sparklines(area: Rect, buf: &mut Buffer, app: &AppState) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
-    // Build sparkline data from the history VecDeque<MetricsSnapshot>
-    let reducer_data: Vec<u64> = app
-        .metrics_history
-        .iter()
-        .map(|s| s.total_reducer_calls)
-        .collect();
-    let energy_data: Vec<u64> = app
-        .metrics_history
-        .iter()
-        .map(|s| s.total_energy_used)
-        .collect();
+    // Build per-tick deltas from the cumulative history so the chart
+    // shows real activity instead of an ever-rising ramp.
+    let reducer_deltas = deltas(app.metrics_history.iter().map(|s| s.total_reducer_calls));
+    let energy_deltas = deltas(app.metrics_history.iter().map(|s| s.total_energy_used));
 
-    render_sparkline_panel(cols[0], buf, "Reducer Calls (cumulative)", &reducer_data, ACCENT);
-    render_sparkline_panel(cols[1], buf, "Energy Used (cumulative)", &energy_data, FG_VALUE);
+    render_sparkline_panel(cols[0], buf, "Reducer Δ /10s", &reducer_deltas, ACCENT);
+    render_sparkline_panel(cols[1], buf, "Energy Δ /10s", &energy_deltas, FG_VALUE);
 }
 
 fn render_sparkline_panel(
@@ -219,7 +228,7 @@ fn render_extra_metrics(area: Rect, buf: &mut Buffer, app: &AppState) {
     // Fill background
     for y in inner.y..inner.y + inner.height {
         for x in inner.x..inner.x + inner.width {
-            buf.get_mut(x, y)
+            buf[(x, y)]
                 .set_char(' ')
                 .set_style(Style::default().bg(Color::Rgb(16, 20, 30)));
         }
@@ -227,14 +236,13 @@ fn render_extra_metrics(area: Rect, buf: &mut Buffer, app: &AppState) {
 
     let m = &app.metrics;
 
-    // Build key-value lines
-    let mut lines: Vec<Line> = Vec::new();
-
-    // Always-present fields
-    lines.push(kv_line("connected_clients", &m.connected_clients.to_string()));
-    lines.push(kv_line("total_reducer_calls", &m.total_reducer_calls.to_string()));
-    lines.push(kv_line("total_energy_used", &m.total_energy_used.to_string()));
-    lines.push(kv_line("memory_bytes", &format_bytes(m.memory_bytes)));
+    // Build key-value lines — always-present fields first
+    let mut lines: Vec<Line> = vec![
+        kv_line("connected_clients", &m.connected_clients.to_string()),
+        kv_line("total_reducer_calls", &m.total_reducer_calls.to_string()),
+        kv_line("total_energy_used", &m.total_energy_used.to_string()),
+        kv_line("memory_bytes", &format_bytes(m.memory_bytes)),
+    ];
 
     if let Some(ref ts) = m.sampled_at {
         lines.push(kv_line("sampled_at", &ts.to_rfc3339()));
@@ -282,5 +290,37 @@ fn format_bytes(b: u64) -> String {
         format!("{:.1} KB", b as f64 / KB as f64)
     } else {
         format!("{b} B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deltas_are_pairwise_differences() {
+        let out = deltas([10u64, 12, 15, 15, 20].into_iter());
+        assert_eq!(out, vec![0, 2, 3, 0, 5]);
+    }
+
+    #[test]
+    fn deltas_handle_counter_reset_as_zero() {
+        // Counter reset (e.g. server restart) — `saturating_sub` keeps
+        // us from panicking and surfaces the dip as a zero-delta.
+        let out = deltas([100u64, 50, 60].into_iter());
+        assert_eq!(out, vec![0, 0, 10]);
+    }
+
+    #[test]
+    fn deltas_empty_input() {
+        let out = deltas(std::iter::empty::<u64>());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn format_bytes_picks_human_unit() {
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(2048), "2.0 KB");
+        assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MB");
     }
 }

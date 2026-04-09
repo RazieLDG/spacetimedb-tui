@@ -21,17 +21,9 @@ use crate::ui::components::input::{InputState, InputWidget};
 use crate::ui::components::table_grid::{render_empty, TableGrid, TableGridState};
 use crate::ui::tabs::tables::value_to_display;
 
-// ── Theme ─────────────────────────────────────────────────────────────────────
-const ACCENT: Color = Color::Cyan;
-const FG_MUTED: Color = Color::Rgb(110, 110, 110);
-const FG_PRIMARY: Color = Color::Rgb(220, 220, 220);
-const SUCCESS: Color = Color::Rgb(152, 195, 121);
-const ERROR_FG: Color = Color::Rgb(224, 108, 117);
-const WARNING: Color = Color::Rgb(229, 192, 123);
-const BORDER_FOCUSED: Color = Color::Cyan;
-const BORDER_NORMAL: Color = Color::Rgb(40, 50, 65);
-const HISTORY_BG: Color = Color::Rgb(20, 26, 38);
-const HISTORY_SEL: Color = Color::Rgb(36, 50, 70);
+fn rgb((r, g, b): (u8, u8, u8)) -> Color {
+    Color::Rgb(r, g, b)
+}
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -43,15 +35,20 @@ pub fn render_sql(
     input_state: &InputState,
     grid_state: &mut TableGridState,
 ) {
+    let theme = &app.theme;
+    let accent = rgb(theme.accent);
+    let border_focused = rgb(theme.border_focused);
+    let border_normal = rgb(theme.border_normal);
+
     let focused = app.focus == FocusPanel::Main || app.focus == FocusPanel::SqlInput;
-    let border_color = if focused { BORDER_FOCUSED } else { BORDER_NORMAL };
+    let border_color = if focused { border_focused } else { border_normal };
 
     let outer_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
         .title(Span::styled(
             " ⌨  SQL Console ",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ));
     let inner = outer_block.inner(area);
     outer_block.render(area, buf);
@@ -62,7 +59,7 @@ pub fn render_sql(
 
     // ── Layout ────────────────────────────────────────────────────────────
     // history (min 3) | input (3) | results (rest, min 3)
-    let history_h = inner.height.min(8).max(3);
+    let history_h = inner.height.clamp(3, 8);
     let input_h = 3u16;
     let results_h = inner.height.saturating_sub(history_h + input_h);
 
@@ -85,9 +82,10 @@ pub fn render_sql(
     // ── Input widget ──────────────────────────────────────────────────────
     let sql_focused = app.focus == FocusPanel::SqlInput;
     InputWidget::new(input_state)
-        .title("SQL  (Enter=execute  ↑↓=history  Ctrl+K=clear)")
+        .title("SQL  (Enter=run  Tab=complete  ↑↓=history  Ctrl+K=clear)")
         .placeholder("SELECT * FROM <table> LIMIT 100")
         .focused(sql_focused)
+        .highlight_sql(true)
         .render(input_area, buf);
 
     // ── Results panel ─────────────────────────────────────────────────────
@@ -97,12 +95,21 @@ pub fn render_sql(
 // ── History ───────────────────────────────────────────────────────────────────
 
 fn render_history(area: Rect, buf: &mut Buffer, app: &AppState) {
+    let theme = &app.theme;
+    let border_normal = rgb(theme.border_normal);
+    let fg_muted = rgb(theme.fg_muted);
+    let fg_primary = rgb(theme.fg_primary);
+    let success = rgb(theme.success);
+    let error_fg = rgb(theme.error);
+    let history_bg = rgb(theme.bg_secondary);
+    let history_sel = rgb(theme.bg_selected);
+
     let block = Block::default()
         .borders(Borders::BOTTOM)
-        .border_style(Style::default().fg(BORDER_NORMAL))
+        .border_style(Style::default().fg(border_normal))
         .title(Span::styled(
             " History ",
-            Style::default().fg(FG_MUTED),
+            Style::default().fg(fg_muted),
         ));
     let inner = block.inner(area);
     block.render(area, buf);
@@ -114,16 +121,16 @@ fn render_history(area: Rect, buf: &mut Buffer, app: &AppState) {
     // Fill background
     for y in inner.y..inner.y + inner.height {
         for x in inner.x..inner.x + inner.width {
-            buf.get_mut(x, y)
+            buf[(x, y)]
                 .set_char(' ')
-                .set_style(Style::default().bg(HISTORY_BG));
+                .set_style(Style::default().bg(history_bg));
         }
     }
 
     if app.sql_history.is_empty() {
         let line = Line::from(Span::styled(
             "  (no history yet — execute a query with Enter)",
-            Style::default().fg(FG_MUTED),
+            Style::default().fg(fg_muted),
         ));
         buf.set_line(inner.x, inner.y, &line, inner.width);
         return;
@@ -146,33 +153,33 @@ fn render_history(area: Rect, buf: &mut Buffer, app: &AppState) {
             total.saturating_sub(1).saturating_sub(c) == skip + row
         }).unwrap_or(false);
 
-        let bg = if is_selected { HISTORY_SEL } else { HISTORY_BG };
+        let bg = if is_selected { history_sel } else { history_bg };
 
         // Fill row
         for x in inner.x..inner.x + inner.width {
-            buf.get_mut(x, y)
+            buf[(x, y)]
                 .set_char(' ')
                 .set_style(Style::default().bg(bg));
         }
 
         let dur = format_duration(entry.duration);
         let status_span = if entry.error.is_some() {
-            Span::styled(" ✗ ", Style::default().fg(ERROR_FG).bg(bg))
+            Span::styled(" ✗ ", Style::default().fg(error_fg).bg(bg))
         } else {
-            Span::styled(" ✓ ", Style::default().fg(SUCCESS).bg(bg))
+            Span::styled(" ✓ ", Style::default().fg(success).bg(bg))
         };
 
         let time_span = Span::styled(
             format!("{} ", entry.executed_at.format("%H:%M:%S")),
-            Style::default().fg(FG_MUTED).bg(bg),
+            Style::default().fg(fg_muted).bg(bg),
         );
         let dur_span = Span::styled(
             format!("[{dur}] "),
-            Style::default().fg(FG_MUTED).bg(bg),
+            Style::default().fg(fg_muted).bg(bg),
         );
         let sql_span = Span::styled(
             truncate_str(&entry.sql, inner.width as usize - 20),
-            Style::default().fg(FG_PRIMARY).bg(bg).add_modifier(
+            Style::default().fg(fg_primary).bg(bg).add_modifier(
                 if is_selected { Modifier::BOLD } else { Modifier::empty() }
             ),
         );
@@ -218,11 +225,18 @@ fn render_results(
                 .collect();
 
             let dur = format_micros(qr.total_duration_micros);
-            let title = format!("Results — {} rows  ({})", rows.len(), dur);
+            let base_title = format!("Results — {} rows  ({})", rows.len(), dur);
+            let title = match app.grid_search.as_deref() {
+                Some(q) if app.grid_search_editing => format!("{base_title}  /{q}_"),
+                Some(q) if !q.is_empty() => format!("{base_title}  [/{q}]"),
+                _ => base_title,
+            };
 
             TableGrid::new(&headers, &rows)
                 .title(title)
                 .focused(focused)
+                .max_col_width(60)
+                .highlight_query(app.grid_search.as_deref())
                 .render(area, buf, grid_state);
         }
     }

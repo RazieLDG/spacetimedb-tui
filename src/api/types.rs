@@ -84,6 +84,12 @@ pub struct TableInfo {
     pub table_access: String,
     /// Resolved column definitions (populated from typespace after parsing).
     pub columns: Vec<ColumnInfo>,
+    /// Primary-key column ids as reported by the server
+    /// (JSON field: `"primary_key": [u16, …]`). Empty for tables
+    /// without a PK. Populated by `parse_schema_response` from the
+    /// raw v9 wire format — not something `resolve_columns` can set.
+    #[serde(default)]
+    pub primary_key_cols: Vec<u16>,
     /// Raw index definitions.
     #[serde(default)]
     pub indexes: Vec<Value>,
@@ -108,6 +114,9 @@ pub struct ColumnInfo {
 }
 
 /// Metadata for a single index inside a `TableInfo`.
+///
+/// Available for future use in the module inspector's index display.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct IndexInfo {
     pub index_id: u32,
@@ -187,11 +196,33 @@ impl std::fmt::Display for LogLevel {
     }
 }
 
+impl LogLevel {
+    /// Cycle to the next minimum-level filter, in increasing severity.
+    /// Wraps around: Panic → Trace.
+    pub fn next_filter(self) -> Self {
+        match self {
+            LogLevel::Trace => LogLevel::Debug,
+            LogLevel::Debug => LogLevel::Info,
+            LogLevel::Info => LogLevel::Warn,
+            LogLevel::Warn => LogLevel::Error,
+            LogLevel::Error => LogLevel::Panic,
+            LogLevel::Panic => LogLevel::Trace,
+            LogLevel::Unknown => LogLevel::Trace,
+        }
+    }
+}
+
 /// A single log line emitted by a SpacetimeDB module.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LogEntry {
     /// When the message was produced (may be absent in older server versions).
-    #[serde(default)]
+    ///
+    /// Newer SpacetimeDB builds emit `ts` as a `u64` **microseconds
+    /// since the Unix epoch** (e.g. `1775679485454488`), while older
+    /// builds emitted RFC 3339 strings. The custom deserializer
+    /// below accepts either form so we don't blow up the Logs tab
+    /// when the server format shifts under us.
+    #[serde(default, deserialize_with = "deserialize_log_timestamp")]
     pub ts: Option<DateTime<Utc>>,
     /// Log level.
     pub level: LogLevel,
@@ -208,8 +239,46 @@ pub struct LogEntry {
     pub line_number: Option<u32>,
 }
 
+/// Deserialize a SpacetimeDB log-line timestamp.
+///
+/// Accepts three on-the-wire forms:
+/// - `null` / missing → `None`
+/// - `u64` microseconds since epoch → `Some(DateTime)`
+/// - RFC 3339 string → `Some(DateTime)` (legacy format)
+fn deserialize_log_timestamp<'de, D>(d: D) -> Result<Option<DateTime<Utc>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let v: Option<Value> = Option::deserialize(d)?;
+    let Some(v) = v else {
+        return Ok(None);
+    };
+    match v {
+        Value::Null => Ok(None),
+        Value::Number(n) => {
+            let micros = n
+                .as_u64()
+                .or_else(|| n.as_i64().map(|i| i.max(0) as u64))
+                .ok_or_else(|| D::Error::custom("ts: not an integer"))?;
+            let secs = (micros / 1_000_000) as i64;
+            let nsecs = ((micros % 1_000_000) * 1_000) as u32;
+            DateTime::<Utc>::from_timestamp(secs, nsecs)
+                .map(Some)
+                .ok_or_else(|| D::Error::custom("ts: microseconds out of range"))
+        }
+        Value::String(s) => DateTime::parse_from_rfc3339(&s)
+            .map(|dt| Some(dt.with_timezone(&Utc)))
+            .map_err(|e| D::Error::custom(format!("ts: not RFC 3339: {e}"))),
+        other => Err(D::Error::custom(format!(
+            "ts: expected null / integer / string, got {other:?}"
+        ))),
+    }
+}
+
 impl LogEntry {
     /// Format the entry as a single display line.
+    #[allow(dead_code)]
     pub fn display_line(&self) -> String {
         let ts = self
             .ts
@@ -219,40 +288,124 @@ impl LogEntry {
     }
 }
 
+#[cfg(test)]
+mod log_entry_tests {
+    use super::*;
+
+    #[test]
+    fn log_entry_parses_integer_microsecond_ts() {
+        // Shape that newer SpacetimeDB builds actually emit —
+        // the exact integer from the user-reported regression.
+        let json = r#"{
+            "level": "Info",
+            "ts": 1775679485454488,
+            "target": "alice_swarm_stdb",
+            "filename": "src/lib.rs",
+            "line_number": 179,
+            "function": "client_connected",
+            "message": "Client connected"
+        }"#;
+        let entry: LogEntry = serde_json::from_str(json).expect("ts integer parses");
+        let ts = entry.ts.expect("ts present");
+        // Microseconds → (secs, nanos) round-trip.
+        assert_eq!(ts.timestamp(), 1_775_679_485);
+        assert_eq!(ts.timestamp_subsec_micros(), 454_488);
+    }
+
+    #[test]
+    fn log_entry_parses_rfc3339_string_ts() {
+        // Legacy RFC 3339 format still works.
+        let json = r#"{
+            "level": "Warn",
+            "ts": "2024-01-02T03:04:05.123Z",
+            "message": "hello"
+        }"#;
+        let entry: LogEntry = serde_json::from_str(json).expect("ts string parses");
+        let ts = entry.ts.expect("ts present");
+        assert_eq!(ts.timestamp(), 1_704_164_645);
+    }
+
+    #[test]
+    fn log_entry_tolerates_missing_ts() {
+        let json = r#"{ "level": "Info", "message": "no ts" }"#;
+        let entry: LogEntry = serde_json::from_str(json).expect("missing ts parses");
+        assert!(entry.ts.is_none());
+    }
+
+    #[test]
+    fn log_entry_tolerates_null_ts() {
+        let json = r#"{ "level": "Info", "ts": null, "message": "null ts" }"#;
+        let entry: LogEntry = serde_json::from_str(json).expect("null ts parses");
+        assert!(entry.ts.is_none());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // WebSocket / subscription message types
 // ---------------------------------------------------------------------------
 
 /// The type of a WebSocket message received from SpacetimeDB.
+///
+/// SpacetimeDB's `v1.json.spacetimedb` subprotocol uses SATS externally
+/// tagged enums — i.e. `{"IdentityToken": {...}}` rather than
+/// `{"type": "IdentityToken", ...}`. Every field with `#[serde(default)]`
+/// is tolerated so that field renames in newer server versions don't break
+/// the decoder entirely.
+///
+/// Messages we don't recognise (e.g. new variants added by a future server
+/// version) fail deserialisation and are surfaced as [`super::types::…`]'s
+/// `RawText` event by `decode_subscription_frame`, which is a safe no-op
+/// for the UI.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsServerMessage {
     /// Initial data snapshot after subscribing to a query.
-    InitialSubscription {
-        database_update: DatabaseUpdate,
-        request_id: u32,
-        total_host_execution_duration_micros: u64,
-    },
+    InitialSubscription(InitialSubscriptionPayload),
     /// Incremental update pushed by the server.
-    TransactionUpdate {
-        status: TransactionStatus,
-        timestamp: Value,
-        caller_identity: String,
-        caller_address: String,
-        reducer_call: Value,
-        energy_quanta_used: Value,
-        total_host_execution_duration_micros: u64,
-        database_update: DatabaseUpdate,
-    },
+    TransactionUpdate(TransactionUpdatePayload),
     /// Server acknowledges an identity.
-    IdentityToken {
-        identity: String,
-        token: String,
-        address: String,
-    },
-    /// Catch-all for unknown message types.
-    #[serde(other)]
-    Unknown,
+    IdentityToken(IdentityTokenPayload),
+}
+
+/// Payload of [`WsServerMessage::InitialSubscription`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InitialSubscriptionPayload {
+    #[serde(default)]
+    pub database_update: DatabaseUpdate,
+    #[serde(default)]
+    pub request_id: u32,
+    /// Server-side execution time. Newer servers use
+    /// `total_host_execution_duration` (nanos as i64); older ones used
+    /// `total_host_execution_duration_micros`. We don't need the value
+    /// directly, so leave it untyped.
+    #[serde(default)]
+    pub total_host_execution_duration: Option<Value>,
+}
+
+/// Payload of [`WsServerMessage::TransactionUpdate`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TransactionUpdatePayload {
+    #[serde(default)]
+    pub status: Option<TransactionStatus>,
+    #[serde(default)]
+    pub database_update: DatabaseUpdate,
+    /// Other fields (timestamp, caller identity, energy usage, …) are
+    /// preserved as raw JSON so future server additions don't break
+    /// decoding. The UI only needs `database_update` today.
+    #[serde(flatten, default)]
+    pub extra: std::collections::HashMap<String, Value>,
+}
+
+/// Payload of [`WsServerMessage::IdentityToken`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct IdentityTokenPayload {
+    #[serde(default)]
+    pub identity: Option<Value>,
+    #[serde(default)]
+    pub token: Option<String>,
+    /// Newer SpacetimeDB versions use `connection_id`, some older ones
+    /// used `address`. Accept either by flattening the rest of the payload.
+    #[serde(flatten, default)]
+    pub extra: std::collections::HashMap<String, Value>,
 }
 
 /// Status of a committed transaction.

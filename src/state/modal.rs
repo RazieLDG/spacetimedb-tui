@@ -1,0 +1,274 @@
+//! Modal dialog state — confirm prompts and multi-field forms.
+//!
+//! Lives in `state` rather than `ui` because it owns mutable input
+//! state that survives across renders. The renderer in `ui::components`
+//! reads it but does not own it.
+//!
+//! Two flavours:
+//! - [`Modal::Confirm`] — yes/no prompt with a free-form prompt and
+//!   a stashed [`ModalAction`] describing what to run on accept.
+//! - [`Modal::Form`] — N labelled text fields plus an `intent`
+//!   describing what to do with the filled-in values.
+//!
+//! Both variants funnel through [`ModalAction`] so the app event loop
+//! can dispatch them with a single match.
+
+use crate::ui::components::input::InputState;
+
+/// One labelled input field inside a [`Modal::Form`].
+#[derive(Debug, Clone)]
+pub struct FormField {
+    /// Display label shown next to the field, e.g. `"name (String)"`.
+    pub label: String,
+    /// The text the user is editing.
+    pub input: InputState,
+    /// Optional placeholder hint shown when the input is empty.
+    pub placeholder: Option<String>,
+}
+
+impl FormField {
+    pub fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            input: InputState::new(),
+            placeholder: None,
+        }
+    }
+
+    pub fn with_placeholder(mut self, placeholder: impl Into<String>) -> Self {
+        self.placeholder = Some(placeholder.into());
+        self
+    }
+}
+
+/// What to do when a modal is accepted (Enter / `y`).
+///
+/// We don't keep callbacks because that would require boxing
+/// closures with a tonne of lifetimes; instead we describe the
+/// intent and let the app event loop translate it back into the
+/// right async call.
+#[derive(Debug, Clone)]
+pub enum ModalAction {
+    /// Call the named reducer with the form's values, JSON-parsed in
+    /// declaration order. Used by Module-tab Enter.
+    CallReducer {
+        reducer: String,
+        /// SpacetimeDB type tag for each field, used to coerce the
+        /// raw input into a sensible JSON value (`"42"` → `42` for a
+        /// numeric param, `"hi"` → `"hi"` for a string param, etc.).
+        param_types: Vec<String>,
+    },
+    /// Insert a row into a table by translating the form fields into
+    /// an `INSERT INTO <table> (...) VALUES (...)` statement.
+    InsertRow {
+        table: String,
+        column_types: Vec<String>,
+    },
+    /// Update a single row by primary key. The PK column may be at
+    /// any index — `pk_index` tells the dispatcher which form field
+    /// is read-only and which `column_types[i]` to use for the
+    /// WHERE clause literal.
+    UpdateRow {
+        table: String,
+        pk_column: String,
+        column_types: Vec<String>,
+        /// Pre-formatted SQL literal for the WHERE clause, captured
+        /// at modal-open time from the row's raw JSON value via
+        /// `json_to_sql_literal`. Stored as a ready-to-paste literal
+        /// (e.g. `0xdeadbeef`, `42`, `'alice'`) so the dispatcher
+        /// doesn't have to re-derive it — and so editing the PK
+        /// field in the form can't corrupt the WHERE clause.
+        pk_sql_literal: String,
+        /// Index of the PK column inside `column_types` / `fields`,
+        /// so the dispatcher knows which field to skip when
+        /// generating the SET clause.
+        pk_index: usize,
+    },
+    /// Delete a single row identified by `where_sql` (already
+    /// quoted / formatted by the caller). Confirm dialog only.
+    DeleteRow {
+        table: String,
+        where_sql: String,
+    },
+    /// Permanently delete an entire database.
+    ///
+    /// Always wrapped in a one-field [`Modal::Form`] where the user
+    /// has to type the database name verbatim — accidental triggers
+    /// would be too dangerous for a plain y/n confirm.
+    DeleteDatabase {
+        /// Name (or hex identity) of the database to delete. Used
+        /// both for the API call and as the typed-confirm string.
+        database: String,
+    },
+    /// Delete every row from a table (`DELETE FROM <table>`). Used
+    /// instead of `DROP TABLE` because SpacetimeDB tables are part
+    /// of the published module schema and cannot be dropped via SQL.
+    /// Same typed-confirm guard as [`DeleteDatabase`].
+    TruncateTable {
+        table: String,
+    },
+    /// Attach a new alias (human name) to a database via
+    /// `POST /v1/database/<database>/names`. One-field form where
+    /// the user types the desired new alias. Non-destructive — no
+    /// typed-confirm required.
+    AddDatabaseAlias {
+        database: String,
+    },
+    /// Sentinel used by the spreadsheet edit-mode exit path — when
+    /// the user leaves edit mode with uncommitted changes we pop a
+    /// confirm dialog; accepting it drops the pending edits.
+    DiscardPendingEdits,
+}
+
+impl ModalAction {
+    /// Short human-readable label used in the status bar after the
+    /// op completes (e.g. `"call insert_user"`).
+    pub fn op_label(&self) -> String {
+        match self {
+            ModalAction::CallReducer { reducer, .. } => format!("call {reducer}"),
+            ModalAction::InsertRow { table, .. } => format!("insert into {table}"),
+            ModalAction::UpdateRow { table, .. } => format!("update {table}"),
+            ModalAction::DeleteRow { table, .. } => format!("delete from {table}"),
+            ModalAction::DeleteDatabase { database } => format!("delete db {database}"),
+            ModalAction::TruncateTable { table } => format!("truncate {table}"),
+            ModalAction::AddDatabaseAlias { database } => format!("alias {database}"),
+            ModalAction::DiscardPendingEdits => "discard edits".to_string(),
+        }
+    }
+}
+
+/// A live modal dialog. The app event loop checks
+/// `AppState.modal.is_some()` at the top of `handle_key` and routes
+/// every key into the modal until the user accepts or cancels.
+#[derive(Debug, Clone)]
+pub enum Modal {
+    /// Yes/no prompt. Accept runs `action`, cancel discards it.
+    Confirm {
+        /// Headline rendered in bold at the top of the popup.
+        title: String,
+        /// Free-form body, usually two short lines describing the
+        /// destructive op.
+        prompt: String,
+        action: ModalAction,
+    },
+    /// Multi-field form prompt. Accept runs `action` after building
+    /// values from the form fields.
+    Form {
+        title: String,
+        fields: Vec<FormField>,
+        /// Index of the field that currently owns the cursor.
+        focus: usize,
+        action: ModalAction,
+    },
+}
+
+impl Modal {
+    /// Convenience constructor for a confirm dialog.
+    pub fn confirm(
+        title: impl Into<String>,
+        prompt: impl Into<String>,
+        action: ModalAction,
+    ) -> Self {
+        Modal::Confirm {
+            title: title.into(),
+            prompt: prompt.into(),
+            action,
+        }
+    }
+
+    /// Convenience constructor for a form dialog.
+    pub fn form(
+        title: impl Into<String>,
+        fields: Vec<FormField>,
+        action: ModalAction,
+    ) -> Self {
+        Modal::Form {
+            title: title.into(),
+            fields,
+            focus: 0,
+            action,
+        }
+    }
+
+    /// The title shown in the popup border.
+    pub fn title(&self) -> &str {
+        match self {
+            Modal::Confirm { title, .. } | Modal::Form { title, .. } => title,
+        }
+    }
+
+    /// The action to dispatch when the user accepts.
+    pub fn action(&self) -> &ModalAction {
+        match self {
+            Modal::Confirm { action, .. } | Modal::Form { action, .. } => action,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn op_label_for_each_action() {
+        assert_eq!(
+            ModalAction::CallReducer {
+                reducer: "insert_user".to_string(),
+                param_types: vec![],
+            }
+            .op_label(),
+            "call insert_user"
+        );
+        assert_eq!(
+            ModalAction::InsertRow {
+                table: "users".to_string(),
+                column_types: vec![],
+            }
+            .op_label(),
+            "insert into users"
+        );
+        assert_eq!(
+            ModalAction::DeleteRow {
+                table: "users".to_string(),
+                where_sql: "id = 1".to_string(),
+            }
+            .op_label(),
+            "delete from users"
+        );
+        assert_eq!(
+            ModalAction::DeleteDatabase {
+                database: "alice-state".to_string(),
+            }
+            .op_label(),
+            "delete db alice-state"
+        );
+        assert_eq!(
+            ModalAction::TruncateTable {
+                table: "events".to_string(),
+            }
+            .op_label(),
+            "truncate events"
+        );
+        assert_eq!(
+            ModalAction::AddDatabaseAlias {
+                database: "mydb".to_string(),
+            }
+            .op_label(),
+            "alias mydb"
+        );
+    }
+
+    #[test]
+    fn confirm_modal_exposes_action_and_title() {
+        let m = Modal::confirm(
+            "Delete row?",
+            "users WHERE id = 1",
+            ModalAction::DeleteRow {
+                table: "users".to_string(),
+                where_sql: "id = 1".to_string(),
+            },
+        );
+        assert_eq!(m.title(), "Delete row?");
+        assert!(matches!(m.action(), ModalAction::DeleteRow { .. }));
+    }
+}

@@ -16,7 +16,6 @@ use crate::state::{AppState, FocusPanel};
 const ACCENT: Color = Color::Cyan;
 const BORDER_FOCUSED: Color = Color::Cyan;
 const BORDER_NORMAL: Color = Color::Rgb(40, 50, 65);
-const FG_PRIMARY: Color = Color::Rgb(220, 220, 220);
 const FG_MUTED: Color = Color::Rgb(110, 110, 110);
 const FG_REDUCER: Color = Color::Rgb(229, 192, 123);
 const FG_TABLE: Color = Color::Rgb(97, 175, 239);
@@ -124,7 +123,7 @@ fn render_reducers(
 
         // Fill row
         for x in inner.x..inner.x + inner.width {
-            buf.get_mut(x, y)
+            buf[(x, y)]
                 .set_char(' ')
                 .set_style(Style::default().bg(bg));
         }

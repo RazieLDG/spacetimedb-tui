@@ -5,7 +5,7 @@
 //! `anyhow::Result<T>` so that callers can use the `?` operator freely.
 
 use anyhow::{anyhow, bail, Context, Result};
-use reqwest::{header, Client, StatusCode};
+use reqwest::{header, Client};
 use serde_json::Value;
 use tracing::{debug, instrument, warn};
 
@@ -61,12 +61,14 @@ impl SpacetimeClient {
     }
 
     /// Convenience constructor using host + port.
+    #[allow(dead_code)]
     pub fn from_host_port(host: &str, port: u16, auth_token: Option<String>) -> Result<Self> {
         let base_url = format!("http://{}:{}", host, port);
         Self::new(base_url, auth_token)
     }
 
     /// The WebSocket base URL derived from the HTTP base URL.
+    #[allow(dead_code)]
     pub fn ws_base_url(&self) -> String {
         self.base_url
             .replacen("http://", "ws://", 1)
@@ -74,6 +76,7 @@ impl SpacetimeClient {
     }
 
     /// Attach (or replace) the bearer auth token.
+    #[allow(dead_code)]
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
         self.auth_token = Some(token.into());
         self
@@ -95,6 +98,12 @@ impl SpacetimeClient {
         self.maybe_auth(req)
     }
 
+    /// Build a `DELETE` request, attaching the auth token when present.
+    fn delete(&self, url: &str) -> reqwest::RequestBuilder {
+        let req = self.http.delete(url);
+        self.maybe_auth(req)
+    }
+
     fn maybe_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.auth_token {
             Some(token) => req.bearer_auth(token),
@@ -103,6 +112,7 @@ impl SpacetimeClient {
     }
 
     /// Send a request and deserialise the JSON body into `T`.
+    #[allow(dead_code)]
     async fn send_json<T>(&self, req: reqwest::RequestBuilder) -> Result<T>
     where
         T: serde::de::DeserializeOwned,
@@ -149,7 +159,14 @@ impl SpacetimeClient {
 
     /// Fetch the full schema (tables, reducers, typespace) for `database`.
     ///
-    /// SpacetimeDB endpoint: `GET /v1/database/<database>/schema`
+    /// SpacetimeDB endpoint: `GET /v1/database/<database>/schema?version=9`
+    ///
+    /// If version 9 returns a 500/501/503 (which happens on
+    /// databases that were published with a newer module format the
+    /// server knows about but our client doesn't), we surface a
+    /// clearer error message rather than leaking the raw body — and
+    /// still bail, because the rest of the UI can't function without
+    /// a schema anyway.
     #[instrument(skip(self), fields(db = %database))]
     pub async fn get_schema(&self, database: &str) -> Result<Schema> {
         let url = format!("{}/v1/database/{}/schema", self.base_url, database);
@@ -165,11 +182,211 @@ impl SpacetimeClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            bail!("Schema HTTP {status}: {body}");
+            let body_snip: String = body.chars().take(200).collect();
+            if status.as_u16() == 500 {
+                bail!(
+                    "Schema HTTP 500 for '{database}'. The server could not \
+                     serialise its schema — usually this means the database \
+                     was published with a module format this client doesn't \
+                     understand, or the module crashed on the server side. \
+                     Server body: {body_snip}"
+                );
+            }
+            if status.as_u16() == 404 {
+                bail!(
+                    "Schema HTTP 404 — database '{database}' does not exist \
+                     or is not visible to the current identity"
+                );
+            }
+            bail!("Schema HTTP {status}: {body_snip}");
         }
 
         let raw: Value = resp.json().await.context("Failed to decode schema response")?;
         parse_schema_response(raw)
+    }
+
+    /// Invoke a reducer (or procedure) in `database` with the supplied
+    /// JSON-encoded arguments.
+    ///
+    /// SpacetimeDB endpoint:
+    ///   `POST /v1/database/<database>/call/<reducer>`
+    /// Body: a JSON array `[arg0, arg1, …]` whose elements are the
+    /// already-encoded values of each parameter, in declaration order.
+    ///
+    /// On success returns the response body as a JSON `Value` so the
+    /// caller can surface whatever the server reported (transaction
+    /// id, energy used, error string, …) without us having to keep
+    /// up with the server's response schema.
+    #[instrument(skip(self, args), fields(db = %database, reducer = %reducer))]
+    pub async fn call_reducer(
+        &self,
+        database: &str,
+        reducer: &str,
+        args: &[Value],
+    ) -> Result<Value> {
+        let url = format!(
+            "{}/v1/database/{}/call/{}",
+            self.base_url, database, reducer
+        );
+        debug!("Calling reducer with {} args", args.len());
+
+        let body = serde_json::to_string(args)
+            .context("Failed to encode reducer arguments as JSON")?;
+
+        let resp = self
+            .post(&url)
+            .body(body)
+            .header(header::CONTENT_TYPE, "application/json")
+            .send()
+            .await
+            .context("Reducer call request failed")?;
+
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let snip: String = text.chars().take(200).collect();
+            if status.as_u16() == 404 {
+                bail!(
+                    "Reducer '{reducer}' not found in '{database}' (HTTP 404). \
+                     Check the spelling and that the module is published."
+                );
+            }
+            if status.as_u16() == 400 {
+                bail!(
+                    "Reducer '{reducer}' rejected the call (HTTP 400). \
+                     Argument count or types are likely wrong. Server said: {snip}"
+                );
+            }
+            bail!("Reducer call HTTP {status}: {snip}");
+        }
+        // The server may return an empty body on success — fall back to Null.
+        if text.trim().is_empty() {
+            return Ok(Value::Null);
+        }
+        serde_json::from_str(&text).context("Failed to decode reducer response")
+    }
+
+    /// Attach a new name (alias) to an existing database.
+    ///
+    /// SpacetimeDB endpoint: `POST /v1/database/<database>/names`
+    /// Body: a bare JSON string containing the new name.
+    ///
+    /// The docs use the word "domain" for what we call an alias —
+    /// a database can have any number of human-readable names and
+    /// every `GET /schema` / `POST /sql` call works with any of them.
+    #[instrument(skip(self), fields(db = %database, alias = %alias))]
+    pub async fn add_database_alias(&self, database: &str, alias: &str) -> Result<()> {
+        let url = format!("{}/v1/database/{}/names", self.base_url, database);
+        debug!("Adding alias '{alias}' to {database}");
+
+        // The endpoint expects a bare JSON string in the body, e.g. `"foo"`.
+        let body = serde_json::to_string(alias)
+            .context("Failed to encode alias as JSON string")?;
+
+        let resp = self
+            .post(&url)
+            .body(body)
+            .header(header::CONTENT_TYPE, "application/json")
+            .send()
+            .await
+            .context("Add-alias request failed")?;
+
+        let status = resp.status();
+        if status.is_success() {
+            // The server returns `{"Success": {...}}` on happy path
+            // but may return `{"PermissionDenied": {...}}` on refusal.
+            // We don't surface the body; the status is authoritative.
+            return Ok(());
+        }
+        let body = resp.text().await.unwrap_or_default();
+        let snip: String = body.chars().take(200).collect();
+        match status.as_u16() {
+            401 | 403 => bail!(
+                "Adding alias to '{database}' rejected (HTTP {status}). \
+                 The current token does not own this database."
+            ),
+            404 => bail!("Database '{database}' not found (HTTP 404)"),
+            409 => bail!(
+                "Alias '{alias}' already exists (HTTP 409). Pick a \
+                 different name or reuse the existing one."
+            ),
+            _ => bail!("Add-alias HTTP {status}: {snip}"),
+        }
+    }
+
+    /// List every alias / human name this database can be reached
+    /// under. Used by the sidebar to show the full list alongside
+    /// the selected identity.
+    ///
+    /// SpacetimeDB endpoint: `GET /v1/database/<database>/names`
+    /// Response: `{"names": ["alias1", "alias2", ...]}`
+    #[instrument(skip(self), fields(db = %database))]
+    pub async fn get_database_names(&self, database: &str) -> Result<Vec<String>> {
+        let url = format!("{}/v1/database/{}/names", self.base_url, database);
+        let resp = self
+            .get(&url)
+            .send()
+            .await
+            .context("get-names request failed")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            let snip: String = body.chars().take(200).collect();
+            bail!("get-names HTTP {status}: {snip}");
+        }
+        let raw: Value = resp.json().await.context("Failed to decode names response")?;
+        // Response wraps the list: `{"names":[...]}`. Tolerate a
+        // bare array too in case that ever changes.
+        let list = match raw {
+            Value::Object(ref o) => o
+                .get("names")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default(),
+            Value::Array(arr) => arr,
+            _ => Vec::new(),
+        };
+        Ok(list
+            .into_iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect())
+    }
+
+    /// Permanently delete a database.
+    ///
+    /// SpacetimeDB endpoint: `DELETE /v1/database/<database>`
+    /// Requires the bearer token to belong to the database's owner;
+    /// anonymous requests are rejected with HTTP 401 / 403.
+    ///
+    /// On the wire the server returns an empty body on success, so we
+    /// don't try to decode anything — only the HTTP status matters.
+    #[instrument(skip(self), fields(db = %database))]
+    pub async fn delete_database(&self, database: &str) -> Result<()> {
+        let url = format!("{}/v1/database/{}", self.base_url, database);
+        debug!("Deleting database");
+
+        let resp = self
+            .delete(&url)
+            .send()
+            .await
+            .context("Delete database request failed")?;
+
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let body = resp.text().await.unwrap_or_default();
+        let body_snip: String = body.chars().take(200).collect();
+        match status.as_u16() {
+            401 | 403 => bail!(
+                "Delete '{database}' rejected (HTTP {status}). The current \
+                 token does not own this database — try `spacetime login` \
+                 with the owner identity, or pass `--token` explicitly."
+            ),
+            404 => bail!("Database '{database}' not found (HTTP 404)"),
+            _ => bail!("Delete database HTTP {status}: {body_snip}"),
+        }
     }
 
     /// Retrieve the last `num_lines` log lines for `database`.
@@ -276,29 +493,6 @@ impl SpacetimeClient {
         Ok(names)
     }
 
-    /// Resolve a database identity to its registered name(s).
-    ///
-    /// SpacetimeDB 2.0 endpoint: `GET /v1/database/{identity}/names`
-    async fn get_database_names(&self, identity: &str) -> Result<Vec<String>> {
-        let url = format!("{}/v1/database/{}/names", self.base_url, identity);
-        let resp = self
-            .get(&url)
-            .send()
-            .await
-            .context("get_database_names request failed")?;
-        if !resp.status().is_success() {
-            bail!("HTTP {}", resp.status());
-        }
-        let raw: Value = resp.json().await.context("Failed to decode names response")?;
-        // Response: {"names": ["db-name"]}
-        let names = raw
-            .get("names")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
-            .unwrap_or_default();
-        Ok(names)
-    }
-
     /// Ping the server and return `true` if it responds.
     pub async fn ping(&self) -> bool {
         let url = format!("{}/v1/ping", self.base_url);
@@ -318,6 +512,7 @@ impl SpacetimeClient {
     }
 
     /// Return the configured base URL.
+    #[allow(dead_code)]
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
@@ -411,11 +606,32 @@ fn parse_query_result(raw: Value) -> Result<QueryResult> {
                 total_duration_micros: 0,
             });
         }
+        Value::Null => {
+            // Some mutation responses come back as a bare `null`.
+            return Ok(QueryResult {
+                schema: Vec::new(),
+                rows: Vec::new(),
+                total_duration_micros: 0,
+            });
+        }
         other => bail!("Unexpected SQL response shape: {other}"),
     };
 
     // schema can be an array (v1) or {"elements": [...]} object (v9).
-    let schema_val = obj.get("schema").ok_or_else(|| anyhow!("SQL response missing 'schema'"))?;
+    // Mutation statements (INSERT / UPDATE / DELETE) don't return a
+    // schema at all — fall back to an empty result instead of bailing,
+    // so the TUI's write-op pipeline can treat them as a success.
+    let Some(schema_val) = obj.get("schema") else {
+        let total_duration_micros = obj
+            .get("total_duration_micros")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        return Ok(QueryResult {
+            schema: Vec::new(),
+            rows: Vec::new(),
+            total_duration_micros,
+        });
+    };
     let elements: &[Value] = if let Some(arr) = schema_val.as_array() {
         arr
     } else if let Some(arr) = schema_val.get("elements").and_then(|e| e.as_array()) {
@@ -509,12 +725,49 @@ fn parse_schema_response(raw: Value) -> Result<SchemaResponse> {
             .cloned()
             .unwrap_or_default();
 
+        // Primary-key columns come through as `"primary_key": [u16, ...]`
+        // in the v9 wire format (see `RawTableDefV9.g.cs`). Empty list
+        // for PK-less tables. Tolerate both a bare number and a wrapped
+        // object form defensively — future server versions may shift.
+        let primary_key_cols: Vec<u16> = t
+            .get("primary_key")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|n| n.as_u64().map(|u| u as u16)).collect())
+            .unwrap_or_default();
+
+        // Discover autoinc columns via the `sequences` array. Each
+        // sequence targets one column (`column` field is the ColId),
+        // and any such column is effectively `is_autoinc = true` from
+        // the TUI's point of view.
+        let autoinc_cols: Vec<u16> = t
+            .get("sequences")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| s.get("column").and_then(|c| c.as_u64()).map(|u| u as u16))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Back-fill the `is_autoinc` flag on the already-resolved
+        // column list.
+        let columns: Vec<crate::api::types::ColumnInfo> = columns
+            .into_iter()
+            .map(|mut c| {
+                if autoinc_cols.contains(&(c.col_id as u16)) {
+                    c.is_autoinc = true;
+                }
+                c
+            })
+            .collect();
+
         tables.push(crate::api::types::TableInfo {
             table_name,
             product_type_ref,
             table_type,
             table_access,
             columns,
+            primary_key_cols,
             indexes,
             constraints,
         });
@@ -668,6 +921,9 @@ fn parse_ndjson_logs(text: &str) -> Result<Vec<LogEntry>> {
 /// - `["name1", "name2"]`
 /// - `{"databases": ["name1", ...]}`
 /// - `{"databases": [{"database_identity": "...", "database_name": "name"}, ...]}`
+///
+/// Currently used in unit tests; available for future use in database listing.
+#[cfg_attr(not(test), allow(dead_code))]
 fn extract_database_names(raw: Value) -> Result<Vec<String>> {
     let arr = match raw {
         Value::Array(a) => a,
@@ -732,6 +988,46 @@ mod tests {
         let raw = json!([]);
         let result = parse_query_result(raw).unwrap();
         assert_eq!(result.row_count(), 0);
+    }
+
+    #[test]
+    fn test_parse_query_result_mutation_response_no_schema() {
+        // Regression guard: UPDATE / INSERT / DELETE responses don't
+        // include a `schema` field. Before this fix, the parser bailed
+        // with "SQL response missing 'schema'", which surfaced in the
+        // spreadsheet edit mode as a WriteOpError even though the
+        // mutation had actually committed on the server side.
+        let raw = json!({
+            "total_duration_micros": 42
+        });
+        let result = parse_query_result(raw).expect("mutation response parses");
+        assert_eq!(result.schema.len(), 0);
+        assert_eq!(result.rows.len(), 0);
+        assert_eq!(result.total_duration_micros, 42);
+    }
+
+    #[test]
+    fn test_parse_query_result_mutation_response_array_wrapper() {
+        // Same idea but wrapped in the `[...]` envelope the server
+        // sometimes uses for SELECT results. The first element has
+        // no schema → still treated as a successful mutation.
+        let raw = json!([{
+            "total_duration_micros": 17,
+            "rows": []
+        }]);
+        let result = parse_query_result(raw).expect("wrapped mutation parses");
+        assert_eq!(result.schema.len(), 0);
+        assert_eq!(result.rows.len(), 0);
+        assert_eq!(result.total_duration_micros, 17);
+    }
+
+    #[test]
+    fn test_parse_query_result_bare_null_is_empty() {
+        // Tolerate a bare JSON null — observed on some endpoints.
+        let raw = json!(null);
+        let result = parse_query_result(raw).expect("null parses");
+        assert_eq!(result.schema.len(), 0);
+        assert_eq!(result.rows.len(), 0);
     }
 
     #[test]

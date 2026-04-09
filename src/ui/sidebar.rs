@@ -20,16 +20,20 @@ use ratatui::{
 use crate::state::{AppState, FocusPanel, SidebarFocus};
 
 // ── Theme ─────────────────────────────────────────────────────────────────────
+// Most static palette stays here; the row-selected background is pulled from
+// `app.theme` at render time so that `--theme light` / `--theme high-contrast`
+// flip the visible highlight colour.
 const ACCENT: Color = Color::Cyan;
-const SELECTED_BG: Color = Color::Rgb(44, 62, 80);
 const SELECTED_FG: Color = Color::White;
 const DB_FG: Color = Color::Rgb(97, 175, 239);
 const TABLE_FG: Color = Color::Rgb(200, 200, 200);
 const MUTED: Color = Color::Rgb(110, 110, 110);
 const SECTION_FG: Color = Color::Rgb(86, 182, 194);
-const BORDER_FOCUSED: Color = Color::Cyan;
-const BORDER_NORMAL: Color = Color::Rgb(40, 50, 65);
 const SEARCH_BG: Color = Color::Rgb(28, 40, 58);
+
+fn rgb((r, g, b): (u8, u8, u8)) -> Color {
+    Color::Rgb(r, g, b)
+}
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -104,6 +108,8 @@ fn render_tree(area: Rect, buf: &mut Buffer, app: &AppState, focused: bool) {
         return;
     }
 
+    let selected_bg = rgb(app.theme.bg_selected);
+
     // Determine scroll so the selected item is always visible.
     let visible_h = area.height as usize;
     let selected_idx = find_selected_idx(&items, app);
@@ -114,7 +120,7 @@ fn render_tree(area: Rect, buf: &mut Buffer, app: &AppState, focused: bool) {
         let is_selected = Some(scroll + screen_row) == selected_idx;
 
         let bg = if is_selected && focused {
-            SELECTED_BG
+            selected_bg
         } else {
             Color::Reset
         };
@@ -126,7 +132,7 @@ fn render_tree(area: Rect, buf: &mut Buffer, app: &AppState, focused: bool) {
 
         // Fill row background
         for x in area.x..area.x + area.width {
-            buf.get_mut(x, y)
+            buf[(x, y)]
                 .set_char(' ')
                 .set_style(Style::default().bg(bg));
         }
@@ -216,8 +222,19 @@ fn build_items(app: &AppState) -> Vec<TreeItem> {
         // If this DB is selected, show its tables below it
         if is_selected_db {
             if app.tables.is_empty() {
+                // Three terminal states the placeholder can be in:
+                //   1. schema fetch in flight → spinner
+                //   2. schema fetch failed    → error hint
+                //   3. neither flag set       → truly empty schema
+                let placeholder = if app.schema_loading {
+                    "      (loading…)"
+                } else if app.schema_load_failed {
+                    "      (schema unavailable — press r to retry)"
+                } else {
+                    "      (no tables)"
+                };
                 items.push(TreeItem {
-                    label: "      (loading…)".to_string(),
+                    label: placeholder.to_string(),
                     fg: MUTED,
                     is_db: false,
                     idx: usize::MAX,

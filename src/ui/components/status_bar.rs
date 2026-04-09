@@ -12,14 +12,16 @@ use ratatui::{
 use crate::state::{AppState, ConnectionStatus};
 
 // ── Theme ─────────────────────────────────────────────────────────────────────
+// Most rendering still uses these constants; the few user-facing colours
+// that change between themes (accent, success/warning/error, foreground)
+// are pulled from `app.theme` at render time so that `--theme light` /
+// `--theme high-contrast` actually flip the visible palette.
 const BG: Color = Color::Rgb(22, 30, 42);
-const FG_PRIMARY: Color = Color::Rgb(200, 200, 200);
-const FG_MUTED: Color = Color::Rgb(110, 110, 110);
-const ACCENT: Color = Color::Cyan;
-const SUCCESS: Color = Color::Rgb(152, 195, 121);
-const WARNING: Color = Color::Rgb(229, 192, 123);
-const ERROR_FG: Color = Color::Rgb(224, 108, 117);
 const SEP: Color = Color::Rgb(60, 60, 60);
+
+fn rgb((r, g, b): (u8, u8, u8)) -> Color {
+    Color::Rgb(r, g, b)
+}
 
 // ── Widget ─────────────────────────────────────────────────────────────────────
 
@@ -48,16 +50,23 @@ impl<'a> Widget for StatusBar<'a> {
         }
 
         let app = self.state;
+        let theme = &app.theme;
+        let accent = rgb(theme.accent);
+        let success = rgb(theme.success);
+        let warning = rgb(theme.warning);
+        let error_fg = rgb(theme.error);
+        let fg_primary = rgb(theme.fg_primary);
+        let fg_muted = rgb(theme.fg_muted);
 
         // ── Left section ─────────────────────────────────────────────────
         let mut left_spans: Vec<Span> = Vec::new();
 
         // Connection status pill
         let (conn_text, conn_color) = match &app.connection.status {
-            ConnectionStatus::Connected => ("● Connected", SUCCESS),
-            ConnectionStatus::Connecting => ("◌ Connecting…", WARNING),
-            ConnectionStatus::Disconnected => ("○ Disconnected", FG_MUTED),
-            ConnectionStatus::Error(_) => ("✗ Error", ERROR_FG),
+            ConnectionStatus::Connected => ("● Connected", success),
+            ConnectionStatus::Connecting => ("◌ Connecting…", warning),
+            ConnectionStatus::Disconnected => ("○ Disconnected", fg_muted),
+            ConnectionStatus::Error(_) => ("✗ Error", error_fg),
         };
         left_spans.push(Span::styled(
             format!(" {conn_text} "),
@@ -65,11 +74,36 @@ impl<'a> Widget for StatusBar<'a> {
         ));
         left_spans.push(sep());
 
+        // Live WebSocket subscription pill — shows one of three states:
+        //   ● LIVE              — subscribed, receiving updates
+        //   ◌ reconnect in Ns   — waiting to reconnect after a drop
+        //   ○ live              — idle (no connection)
+        let (live_text, live_color) = if app.ws_connected {
+            (" ● LIVE ".to_string(), success)
+        } else if let Some(deadline) = app.ws_reconnect_deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let secs = remaining.as_secs().max(1);
+            (
+                format!(" ◌ reconnect in {secs}s "),
+                warning,
+            )
+        } else {
+            (" ○ live ".to_string(), fg_muted)
+        };
+        left_spans.push(Span::styled(
+            live_text,
+            Style::default()
+                .fg(live_color)
+                .bg(BG)
+                .add_modifier(Modifier::BOLD),
+        ));
+        left_spans.push(sep());
+
         // Database name
         if let Some(db) = app.selected_database() {
             left_spans.push(Span::styled(
                 format!(" 🗄 {db} "),
-                Style::default().fg(ACCENT).bg(BG),
+                Style::default().fg(accent).bg(BG),
             ));
             left_spans.push(sep());
         }
@@ -78,7 +112,7 @@ impl<'a> Widget for StatusBar<'a> {
         if let Some(tbl) = app.selected_table() {
             left_spans.push(Span::styled(
                 format!(" 📋 {} ", tbl.table_name),
-                Style::default().fg(FG_PRIMARY).bg(BG),
+                Style::default().fg(fg_primary).bg(BG),
             ));
             left_spans.push(sep());
         }
@@ -95,14 +129,14 @@ impl<'a> Widget for StatusBar<'a> {
             };
             left_spans.push(Span::styled(
                 format!(" ⏱ {dur_str} "),
-                Style::default().fg(FG_MUTED).bg(BG),
+                Style::default().fg(fg_muted).bg(BG),
             ));
             left_spans.push(sep());
 
             // Row count
             left_spans.push(Span::styled(
                 format!(" {} rows ", qr.row_count()),
-                Style::default().fg(FG_MUTED).bg(BG),
+                Style::default().fg(fg_muted).bg(BG),
             ));
         }
 
@@ -112,7 +146,20 @@ impl<'a> Widget for StatusBar<'a> {
             left_spans.push(Span::styled(
                 " ⟳ loading… ",
                 Style::default()
-                    .fg(WARNING)
+                    .fg(warning)
+                    .bg(BG)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+
+        // Spreadsheet edit mode indicator — always visible while edit
+        // mode is open, with a live pending-edit counter.
+        if let Some(ref em) = app.edit_mode {
+            left_spans.push(sep());
+            left_spans.push(Span::styled(
+                format!(" ✎ EDIT — {} pending ", em.pending_count()),
+                Style::default()
+                    .fg(Color::Rgb(255, 220, 100))
                     .bg(BG)
                     .add_modifier(Modifier::BOLD),
             ));
@@ -125,7 +172,7 @@ impl<'a> Widget for StatusBar<'a> {
         let tbl_count = app.tables.len();
         right_spans.push(Span::styled(
             format!(" tables:{tbl_count} "),
-            Style::default().fg(FG_MUTED).bg(BG),
+            Style::default().fg(fg_muted).bg(BG),
         ));
         right_spans.push(sep());
 
@@ -133,7 +180,7 @@ impl<'a> Widget for StatusBar<'a> {
         let client_count = app.metrics.connected_clients;
         right_spans.push(Span::styled(
             format!(" clients:{client_count} "),
-            Style::default().fg(FG_MUTED).bg(BG),
+            Style::default().fg(fg_muted).bg(BG),
         ));
         right_spans.push(sep());
 
@@ -142,20 +189,20 @@ impl<'a> Widget for StatusBar<'a> {
             let truncated: String = err.chars().take(40).collect();
             right_spans.push(Span::styled(
                 format!(" ⚠ {truncated} "),
-                Style::default().fg(ERROR_FG).bg(BG).add_modifier(Modifier::BOLD),
+                Style::default().fg(error_fg).bg(BG).add_modifier(Modifier::BOLD),
             ));
         } else if let Some((ref notif, _)) = app.notification {
             let truncated: String = notif.chars().take(40).collect();
             right_spans.push(Span::styled(
                 format!(" ✓ {truncated} "),
-                Style::default().fg(SUCCESS).bg(BG),
+                Style::default().fg(success).bg(BG),
             ));
         }
 
         // Help hint
         right_spans.push(Span::styled(
             " ? help ",
-            Style::default().fg(FG_MUTED).bg(BG),
+            Style::default().fg(fg_muted).bg(BG),
         ));
 
         // ── Render both sides ─────────────────────────────────────────────

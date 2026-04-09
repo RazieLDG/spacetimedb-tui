@@ -129,6 +129,37 @@ impl InputState {
         self.value.drain(..self.cursor);
         self.cursor = 0;
     }
+
+    /// Return the byte range of the "word token" that the cursor is
+    /// currently inside of or immediately after, together with the word
+    /// text itself. A word here is a maximal run of ASCII alphanumerics
+    /// or `_`, matching the characters that can appear in SQL
+    /// identifiers and keywords.
+    ///
+    /// Used by the Tab-complete machinery in `app.rs` to figure out
+    /// which prefix the user is trying to finish.
+    pub fn current_word(&self) -> (std::ops::Range<usize>, &str) {
+        let bytes = self.value.as_bytes();
+        let end = self.cursor.min(bytes.len());
+        let mut start = end;
+        while start > 0 {
+            let b = bytes[start - 1];
+            if b.is_ascii_alphanumeric() || b == b'_' {
+                start -= 1;
+            } else {
+                break;
+            }
+        }
+        (start..end, &self.value[start..end])
+    }
+
+    /// Replace the byte `range` with `replacement` and park the cursor
+    /// at the end of the newly-inserted text. Used to commit an
+    /// auto-completion result in place of a prefix token.
+    pub fn replace_range(&mut self, range: std::ops::Range<usize>, replacement: &str) {
+        self.value.replace_range(range.clone(), replacement);
+        self.cursor = range.start + replacement.len();
+    }
 }
 
 // ── Widget ─────────────────────────────────────────────────────────────────────
@@ -139,6 +170,7 @@ pub struct InputWidget<'a> {
     title: Option<&'a str>,
     placeholder: Option<&'a str>,
     focused: bool,
+    highlight_sql: bool,
 }
 
 impl<'a> InputWidget<'a> {
@@ -148,6 +180,7 @@ impl<'a> InputWidget<'a> {
             title: None,
             placeholder: None,
             focused: false,
+            highlight_sql: false,
         }
     }
 
@@ -164,6 +197,28 @@ impl<'a> InputWidget<'a> {
     pub fn focused(mut self, f: bool) -> Self {
         self.focused = f;
         self
+    }
+
+    /// Enable SQL syntax highlighting: keywords, identifiers, strings,
+    /// numbers and punctuation each get their own colour via the
+    /// [`super::syntax`] tokenizer. The cursor is painted on top.
+    pub fn highlight_sql(mut self, enabled: bool) -> Self {
+        self.highlight_sql = enabled;
+        self
+    }
+}
+
+/// Pick a foreground colour for a given token kind using the same
+/// "One Dark"-ish palette as the rest of the UI.
+fn token_color(kind: super::syntax::TokenKind) -> Color {
+    use super::syntax::TokenKind;
+    match kind {
+        TokenKind::Keyword => Color::Rgb(198, 120, 221),   // purple
+        TokenKind::Identifier => Color::Rgb(220, 220, 220),
+        TokenKind::StringLit => Color::Rgb(152, 195, 121), // green
+        TokenKind::Number => Color::Rgb(229, 192, 123),    // yellow
+        TokenKind::Punct => Color::Rgb(86, 182, 194),      // cyan
+        TokenKind::Whitespace => Color::Rgb(220, 220, 220),
     }
 }
 
@@ -197,103 +252,103 @@ impl<'a> Widget for InputWidget<'a> {
         let cursor_pos = self.state.cursor;
         let available_w = inner.width as usize;
 
-        // Compute display offset so cursor is always visible.
-        // We scroll horizontally if the text is longer than the widget.
+        // Empty input → render the placeholder (if any) and bail out.
+        if text.is_empty() {
+            if let Some(ph) = self.placeholder {
+                let line = Line::from(Span::styled(ph, Style::default().fg(FG_MUTED)));
+                buf.set_line(inner.x, inner.y, &line, inner.width);
+            }
+            // When focused but empty, still draw the cursor at col 0.
+            if self.focused {
+                buf[(inner.x, inner.y)]
+                    .set_char(' ')
+                    .set_style(
+                        Style::default()
+                            .fg(CURSOR_FG)
+                            .bg(CURSOR_BG)
+                            .add_modifier(Modifier::BOLD),
+                    );
+            }
+            return;
+        }
+
+        // Horizontal scroll so the cursor stays visible.
         let text_before_cursor = &text[..cursor_pos];
         let display_cursor_x = text_before_cursor.width();
-
         let scroll_x = if display_cursor_x >= available_w {
             display_cursor_x - available_w + 1
         } else {
             0
         };
 
-        // Build the visible slice of text
-        let mut spans: Vec<Span> = Vec::new();
-
-        if text.is_empty() {
-            if let Some(ph) = self.placeholder {
-                spans.push(Span::styled(ph, Style::default().fg(FG_MUTED)));
-            }
-        } else {
-            // Simpler approach: render char by char with display positions
-            let mut x_pos = 0usize; // display position
-            let mut byte_pos = 0usize;
-            let mut before_str = String::new();
-            let mut cursor_char = ' ';
-            let mut after_str = String::new();
-            let mut phase = 0u8; // 0=before, 1=cursor, 2=after
-
-            for ch in text.chars() {
-                let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
-                let display_x = x_pos.saturating_sub(scroll_x);
-
-                if display_x >= available_w {
-                    break;
-                }
-
-                if x_pos >= scroll_x {
-                    match phase {
-                        0 if byte_pos < cursor_pos => {
-                            before_str.push(ch);
-                        }
-                        0 | 1 if byte_pos == cursor_pos => {
-                            cursor_char = ch;
-                            phase = 1;
-                        }
-                        _ => {
-                            if phase == 1 {
-                                phase = 2;
-                            }
-                            after_str.push(ch);
-                        }
+        // Build a per-byte colour map so we can colour each char with
+        // either its syntax token colour (when highlight_sql is on) or
+        // a flat foreground.
+        let mut byte_color: Vec<Color> = vec![FG_PRIMARY; text.len()];
+        if self.highlight_sql {
+            for tok in super::syntax::tokenize(text) {
+                let colour = token_color(tok.kind);
+                for i in tok.range {
+                    if i < byte_color.len() {
+                        byte_color[i] = colour;
                     }
                 }
-
-                x_pos += cw;
-                byte_pos += ch.len_utf8();
-            }
-
-            // Handle cursor at end of text
-            if byte_pos == cursor_pos && phase == 0 {
-                cursor_char = ' ';
-                phase = 1;
-            }
-
-            if !before_str.is_empty() {
-                spans.push(Span::styled(
-                    before_str,
-                    Style::default().fg(FG_PRIMARY),
-                ));
-            }
-
-            if self.focused {
-                spans.push(Span::styled(
-                    cursor_char.to_string(),
-                    Style::default()
-                        .fg(CURSOR_FG)
-                        .bg(CURSOR_BG)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            } else {
-                // No cursor when not focused — just show the char normally
-                if cursor_char != ' ' || !after_str.is_empty() {
-                    spans.push(Span::styled(
-                        cursor_char.to_string(),
-                        Style::default().fg(FG_PRIMARY),
-                    ));
-                }
-            }
-
-            if !after_str.is_empty() {
-                spans.push(Span::styled(
-                    after_str,
-                    Style::default().fg(FG_PRIMARY),
-                ));
             }
         }
 
-        let line = Line::from(spans);
-        buf.set_line(inner.x, inner.y, &line, inner.width);
+        // Walk the characters, placing each one into the buffer at the
+        // correct display column. Characters scrolled off to the left
+        // are skipped; characters that run past the right edge are
+        // truncated.
+        let mut x_pos: usize = 0; // display column relative to text start
+        let mut byte_pos: usize = 0;
+        let mut cursor_drawn = false;
+
+        for ch in text.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+            let screen_col = x_pos as isize - scroll_x as isize;
+
+            // Paint this character if it's on-screen.
+            if screen_col >= 0 && (screen_col as usize) < available_w {
+                let cell_x = inner.x + screen_col as u16;
+                let is_cursor = self.focused && byte_pos == cursor_pos;
+                let style = if is_cursor {
+                    cursor_drawn = true;
+                    Style::default()
+                        .fg(CURSOR_FG)
+                        .bg(CURSOR_BG)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(byte_color[byte_pos])
+                };
+                buf[(cell_x, inner.y)].set_char(ch).set_style(style);
+                // For double-width characters, clear the second cell so
+                // we don't leave stale content behind.
+                if cw == 2 && (screen_col as usize + 1) < available_w {
+                    buf[(cell_x + 1, inner.y)]
+                        .set_char(' ')
+                        .set_style(Style::default());
+                }
+            }
+
+            x_pos += cw;
+            byte_pos += ch.len_utf8();
+        }
+
+        // Draw the cursor at end-of-text if we haven't already drawn it.
+        if self.focused && !cursor_drawn && cursor_pos == text.len() {
+            let screen_col = x_pos as isize - scroll_x as isize;
+            if screen_col >= 0 && (screen_col as usize) < available_w {
+                let cell_x = inner.x + screen_col as u16;
+                buf[(cell_x, inner.y)]
+                    .set_char(' ')
+                    .set_style(
+                        Style::default()
+                            .fg(CURSOR_FG)
+                            .bg(CURSOR_BG)
+                            .add_modifier(Modifier::BOLD),
+                    );
+            }
+        }
     }
 }

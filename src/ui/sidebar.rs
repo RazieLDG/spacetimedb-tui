@@ -83,7 +83,10 @@ fn render_search_bar(area: Rect, buf: &mut Buffer, query: &str) {
     block.render(area, buf);
 
     let line = Line::from(vec![
-        Span::styled("/ ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "/ ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(query, Style::default().fg(SELECTED_FG).bg(SEARCH_BG)),
     ]);
     buf.set_line(inner.x, inner.y, &line, inner.width);
@@ -100,10 +103,7 @@ fn render_tree(area: Rect, buf: &mut Buffer, app: &AppState, focused: bool) {
     let items = build_items(app);
 
     if items.is_empty() {
-        let msg = Line::from(Span::styled(
-            "  (no databases)",
-            Style::default().fg(MUTED),
-        ));
+        let msg = Line::from(Span::styled("  (no databases)", Style::default().fg(MUTED)));
         buf.set_line(area.x, area.y, &msg, area.width);
         return;
     }
@@ -132,9 +132,7 @@ fn render_tree(area: Rect, buf: &mut Buffer, app: &AppState, focused: bool) {
 
         // Fill row background
         for x in area.x..area.x + area.width {
-            buf[(x, y)]
-                .set_char(' ')
-                .set_style(Style::default().bg(bg));
+            buf[(x, y)].set_char(' ').set_style(Style::default().bg(bg));
         }
 
         let style = if is_selected && focused {
@@ -153,10 +151,7 @@ fn render_tree(area: Rect, buf: &mut Buffer, app: &AppState, focused: bool) {
         let ind = format!("{pct}%");
         let ind_x = area.x + area.width.saturating_sub(ind.len() as u16 + 1);
         let ind_y = area.y + area.height - 1;
-        let ind_line = Line::from(Span::styled(
-            format!(" {ind}"),
-            Style::default().fg(MUTED),
-        ));
+        let ind_line = Line::from(Span::styled(format!(" {ind}"), Style::default().fg(MUTED)));
         buf.set_line(ind_x, ind_y, &ind_line, ind.len() as u16 + 1);
     }
 }
@@ -272,16 +267,12 @@ fn build_items(app: &AppState) -> Vec<TreeItem> {
 /// Find the flat index of the currently selected item.
 fn find_selected_idx(items: &[TreeItem], app: &AppState) -> Option<usize> {
     match app.sidebar_focus {
-        SidebarFocus::Databases => {
-            items.iter().position(|it| {
-                it.is_db && Some(it.idx) == app.selected_database_idx
-            })
-        }
-        SidebarFocus::Tables => {
-            items.iter().position(|it| {
-                !it.is_db && it.idx != usize::MAX && Some(it.idx) == app.selected_table_idx
-            })
-        }
+        SidebarFocus::Databases => items
+            .iter()
+            .position(|it| it.is_db && Some(it.idx) == app.selected_database_idx),
+        SidebarFocus::Tables => items.iter().position(|it| {
+            !it.is_db && it.idx != usize::MAX && Some(it.idx) == app.selected_table_idx
+        }),
     }
 }
 

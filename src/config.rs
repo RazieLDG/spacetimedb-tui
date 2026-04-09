@@ -80,13 +80,13 @@ fn parse_spacetime_cli_toml(content: &str) -> Option<SpacetimeCliConfig> {
             if in_server {
                 match key {
                     "nickname" => cur_nick = val,
-                    "host"     => cur_host = val,
+                    "host" => cur_host = val,
                     "protocol" => cur_proto = val,
                     _ => {}
                 }
             } else {
                 match key {
-                    "default_server"    => default_server = Some(val),
+                    "default_server" => default_server = Some(val),
                     "spacetimedb_token" => token = Some(val),
                     _ => {}
                 }
@@ -109,7 +109,12 @@ fn parse_spacetime_cli_toml(content: &str) -> Option<SpacetimeCliConfig> {
         (None, None, false)
     };
 
-    Some(SpacetimeCliConfig { token, host, port, uses_tls })
+    Some(SpacetimeCliConfig {
+        token,
+        host,
+        port,
+        uses_tls,
+    })
 }
 
 /// Parse `key = "value"` (or `key = value`) from a single TOML line.
@@ -351,10 +356,7 @@ impl ThemeColors {
     /// treated as a stem and loaded from `<themes_dir>/<name>.toml`.
     /// Returns `None` if neither lookup succeeds — the caller should
     /// fall back to a built-in default and surface a warning.
-    pub fn resolve_named(
-        name: &str,
-        themes_dir: Option<&std::path::Path>,
-    ) -> Option<Self> {
+    pub fn resolve_named(name: &str, themes_dir: Option<&std::path::Path>) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
             "dark" => Some(Self::dark()),
             "light" => Some(Self::light()),

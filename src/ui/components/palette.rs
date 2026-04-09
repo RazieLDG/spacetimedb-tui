@@ -51,16 +51,19 @@ pub fn render_palette(area: Rect, buf: &mut Buffer, palette: &CommandPalette) {
         &Line::from(vec![
             Span::styled(
                 prompt,
-                Style::default().fg(ACCENT).bg(BG).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(ACCENT)
+                    .bg(BG)
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                typed.clone(),
-                Style::default().fg(FG_PRIMARY).bg(BG),
-            ),
+            Span::styled(typed.clone(), Style::default().fg(FG_PRIMARY).bg(BG)),
             // Visible cursor block
             Span::styled(
                 "▏",
-                Style::default().fg(ACCENT).bg(BG).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(ACCENT)
+                    .bg(BG)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]),
         inner.width,
@@ -101,7 +104,9 @@ pub fn render_palette(area: Rect, buf: &mut Buffer, palette: &CommandPalette) {
 
         // Fill the row background.
         for x in inner.x..inner.x + inner.width {
-            buf[(x, y)].set_char(' ').set_style(Style::default().bg(row_bg));
+            buf[(x, y)]
+                .set_char(' ')
+                .set_style(Style::default().bg(row_bg));
         }
 
         let arrow = if is_selected { "▶ " } else { "  " };
@@ -144,5 +149,10 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
     let h = h.min(area.height);
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(h) / 2;
-    Rect { x, y, width: w, height: h }
+    Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    }
 }

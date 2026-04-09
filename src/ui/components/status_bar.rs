@@ -70,7 +70,10 @@ impl<'a> Widget for StatusBar<'a> {
         };
         left_spans.push(Span::styled(
             format!(" {conn_text} "),
-            Style::default().fg(conn_color).bg(BG).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(conn_color)
+                .bg(BG)
+                .add_modifier(Modifier::BOLD),
         ));
         left_spans.push(sep());
 
@@ -83,10 +86,7 @@ impl<'a> Widget for StatusBar<'a> {
         } else if let Some(deadline) = app.ws_reconnect_deadline {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             let secs = remaining.as_secs().max(1);
-            (
-                format!(" ◌ reconnect in {secs}s "),
-                warning,
-            )
+            (format!(" ◌ reconnect in {secs}s "), warning)
         } else {
             (" ○ live ".to_string(), fg_muted)
         };
@@ -189,7 +189,10 @@ impl<'a> Widget for StatusBar<'a> {
             let truncated: String = err.chars().take(40).collect();
             right_spans.push(Span::styled(
                 format!(" ⚠ {truncated} "),
-                Style::default().fg(error_fg).bg(BG).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(error_fg)
+                    .bg(BG)
+                    .add_modifier(Modifier::BOLD),
             ));
         } else if let Some((ref notif, _)) = app.notification {
             let truncated: String = notif.chars().take(40).collect();
@@ -210,11 +213,7 @@ impl<'a> Widget for StatusBar<'a> {
         let right_line = Line::from(right_spans);
 
         // Measure right side width
-        let right_w: usize = right_line
-            .spans
-            .iter()
-            .map(|s| s.content.len())
-            .sum();
+        let right_w: usize = right_line.spans.iter().map(|s| s.content.len()).sum();
 
         buf.set_line(area.x, area.y, &left_line, area.width);
 

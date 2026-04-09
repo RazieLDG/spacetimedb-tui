@@ -29,7 +29,11 @@ const SECTION_FG: Color = Color::Rgb(86, 182, 194);
 /// Render the module inspector tab.
 pub fn render_module(area: Rect, buf: &mut Buffer, app: &AppState, selected_reducer: usize) {
     let focused = app.focus == FocusPanel::Main;
-    let border_color = if focused { BORDER_FOCUSED } else { BORDER_NORMAL };
+    let border_color = if focused {
+        BORDER_FOCUSED
+    } else {
+        BORDER_NORMAL
+    };
 
     let outer = Block::default()
         .borders(Borders::ALL)
@@ -119,13 +123,15 @@ fn render_reducers(
         }
 
         let is_selected = i == selected && focused;
-        let bg = if is_selected { SELECTED_BG } else { Color::Reset };
+        let bg = if is_selected {
+            SELECTED_BG
+        } else {
+            Color::Reset
+        };
 
         // Fill row
         for x in inner.x..inner.x + inner.width {
-            buf[(x, y)]
-                .set_char(' ')
-                .set_style(Style::default().bg(bg));
+            buf[(x, y)].set_char(' ').set_style(Style::default().bg(bg));
         }
 
         // Determine if this is a scheduled reducer (name contains "scheduled" or "__schedule")
@@ -146,14 +152,13 @@ fn render_reducers(
 
         let name_span = Span::styled(
             format!("  {prefix}{}", reducer.name),
-            Style::default().fg(fg).bg(bg).add_modifier(
-                if is_selected { Modifier::BOLD } else { Modifier::empty() }
-            ),
+            Style::default().fg(fg).bg(bg).add_modifier(if is_selected {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            }),
         );
-        let sig_span = Span::styled(
-            format!("({sig})"),
-            Style::default().fg(FG_PARAM).bg(bg),
-        );
+        let sig_span = Span::styled(format!("({sig})"), Style::default().fg(FG_PARAM).bg(bg));
 
         let line = Line::from(vec![name_span, sig_span]);
         buf.set_line(inner.x, y, &line, inner.width);
@@ -173,12 +178,10 @@ fn render_reducers(
 // ── Tables panel ──────────────────────────────────────────────────────────────
 
 fn render_tables_panel(area: Rect, buf: &mut Buffer, schema: &crate::api::types::Schema) {
-    let block = Block::default()
-        .borders(Borders::NONE)
-        .title(Span::styled(
-            " Tables ",
-            Style::default().fg(SECTION_FG).add_modifier(Modifier::BOLD),
-        ));
+    let block = Block::default().borders(Borders::NONE).title(Span::styled(
+        " Tables ",
+        Style::default().fg(SECTION_FG).add_modifier(Modifier::BOLD),
+    ));
     let inner = block.inner(area);
     block.render(area, buf);
 
@@ -187,10 +190,7 @@ fn render_tables_panel(area: Rect, buf: &mut Buffer, schema: &crate::api::types:
     }
 
     if schema.tables.is_empty() {
-        let msg = Line::from(Span::styled(
-            "  (no tables)",
-            Style::default().fg(FG_MUTED),
-        ));
+        let msg = Line::from(Span::styled("  (no tables)", Style::default().fg(FG_MUTED)));
         buf.set_line(inner.x, inner.y, &msg, inner.width);
         return;
     }
@@ -199,12 +199,18 @@ fn render_tables_panel(area: Rect, buf: &mut Buffer, schema: &crate::api::types:
     let user_tables: Vec<_> = schema
         .tables
         .iter()
-        .filter(|t| t.table_type != "system" && !crate::api::types::SYSTEM_TABLES.contains(&t.table_name.as_str()))
+        .filter(|t| {
+            t.table_type != "system"
+                && !crate::api::types::SYSTEM_TABLES.contains(&t.table_name.as_str())
+        })
         .collect();
     let system_tables: Vec<_> = schema
         .tables
         .iter()
-        .filter(|t| t.table_type == "system" || crate::api::types::SYSTEM_TABLES.contains(&t.table_name.as_str()))
+        .filter(|t| {
+            t.table_type == "system"
+                || crate::api::types::SYSTEM_TABLES.contains(&t.table_name.as_str())
+        })
         .collect();
 
     let visible_h = inner.height as usize;
@@ -214,7 +220,9 @@ fn render_tables_panel(area: Rect, buf: &mut Buffer, schema: &crate::api::types:
     if !user_tables.is_empty() && row < visible_h {
         let section_line = Line::from(Span::styled(
             "  USER TABLES",
-            Style::default().fg(SECTION_FG).add_modifier(Modifier::UNDERLINED),
+            Style::default()
+                .fg(SECTION_FG)
+                .add_modifier(Modifier::UNDERLINED),
         ));
         buf.set_line(inner.x, inner.y + row as u16, &section_line, inner.width);
         row += 1;
@@ -224,7 +232,11 @@ fn render_tables_panel(area: Rect, buf: &mut Buffer, schema: &crate::api::types:
         if row >= visible_h {
             break;
         }
-        let access_icon = if tbl.table_access == "private" { "🔒" } else { "🌐" };
+        let access_icon = if tbl.table_access == "private" {
+            "🔒"
+        } else {
+            "🌐"
+        };
         let line = Line::from(vec![
             Span::styled(
                 format!("    {access_icon} {}", tbl.table_name),
@@ -263,7 +275,9 @@ fn render_tables_panel(area: Rect, buf: &mut Buffer, schema: &crate::api::types:
         if row < visible_h {
             let section_line = Line::from(Span::styled(
                 "  SYSTEM TABLES",
-                Style::default().fg(FG_SYSTEM).add_modifier(Modifier::UNDERLINED),
+                Style::default()
+                    .fg(FG_SYSTEM)
+                    .add_modifier(Modifier::UNDERLINED),
             ));
             buf.set_line(inner.x, inner.y + row as u16, &section_line, inner.width);
             row += 1;

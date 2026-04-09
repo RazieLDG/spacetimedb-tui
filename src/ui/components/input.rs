@@ -213,7 +213,7 @@ impl<'a> InputWidget<'a> {
 fn token_color(kind: super::syntax::TokenKind) -> Color {
     use super::syntax::TokenKind;
     match kind {
-        TokenKind::Keyword => Color::Rgb(198, 120, 221),   // purple
+        TokenKind::Keyword => Color::Rgb(198, 120, 221), // purple
         TokenKind::Identifier => Color::Rgb(220, 220, 220),
         TokenKind::StringLit => Color::Rgb(152, 195, 121), // green
         TokenKind::Number => Color::Rgb(229, 192, 123),    // yellow
@@ -260,14 +260,12 @@ impl<'a> Widget for InputWidget<'a> {
             }
             // When focused but empty, still draw the cursor at col 0.
             if self.focused {
-                buf[(inner.x, inner.y)]
-                    .set_char(' ')
-                    .set_style(
-                        Style::default()
-                            .fg(CURSOR_FG)
-                            .bg(CURSOR_BG)
-                            .add_modifier(Modifier::BOLD),
-                    );
+                buf[(inner.x, inner.y)].set_char(' ').set_style(
+                    Style::default()
+                        .fg(CURSOR_FG)
+                        .bg(CURSOR_BG)
+                        .add_modifier(Modifier::BOLD),
+                );
             }
             return;
         }
@@ -340,14 +338,12 @@ impl<'a> Widget for InputWidget<'a> {
             let screen_col = x_pos as isize - scroll_x as isize;
             if screen_col >= 0 && (screen_col as usize) < available_w {
                 let cell_x = inner.x + screen_col as u16;
-                buf[(cell_x, inner.y)]
-                    .set_char(' ')
-                    .set_style(
-                        Style::default()
-                            .fg(CURSOR_FG)
-                            .bg(CURSOR_BG)
-                            .add_modifier(Modifier::BOLD),
-                    );
+                buf[(cell_x, inner.y)].set_char(' ').set_style(
+                    Style::default()
+                        .fg(CURSOR_FG)
+                        .bg(CURSOR_BG)
+                        .add_modifier(Modifier::BOLD),
+                );
             }
         }
     }

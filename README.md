@@ -4,10 +4,12 @@
 
 Browse databases, run SQL, stream live transactions, edit rows in a spreadsheet, call reducers, and manage aliases — all with Vim-style key bindings and a command palette.
 
+[![CI](https://github.com/RazieLDG/spacetimedb-tui/actions/workflows/ci.yml/badge.svg)](https://github.com/RazieLDG/spacetimedb-tui/actions/workflows/ci.yml)
+[![Release](https://github.com/RazieLDG/spacetimedb-tui/actions/workflows/release.yml/badge.svg)](https://github.com/RazieLDG/spacetimedb-tui/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![SpacetimeDB](https://img.shields.io/badge/SpacetimeDB-2.0-blueviolet)](https://spacetimedb.com)
 [![Rust](https://img.shields.io/badge/Rust-1.78%2B-orange)](https://www.rust-lang.org)
-[![Tests](https://img.shields.io/badge/tests-122%20passing-brightgreen)](#)
+[![Tests](https://img.shields.io/badge/tests-127%20passing-brightgreen)](#)
 
 ---
 
@@ -74,11 +76,37 @@ Browse databases, run SQL, stream live transactions, edit rows in a spreadsheet,
 
 ### Prerequisites
 
-- **Rust 1.78+** — install via [rustup](https://rustup.rs)
 - A running **SpacetimeDB 2.0** instance (local or remote)
 - **SpacetimeDB CLI** configured (`spacetime login` or local server)
+- For source builds only: **Rust 1.78+** via [rustup](https://rustup.rs)
 
-### Build from Source
+### Option 1 — Pre-built binaries (recommended)
+
+Every tagged release ships pre-built archives for the three tier-1 desktop platforms. Grab the right archive for your machine from the [latest release](https://github.com/RazieLDG/spacetimedb-tui/releases/latest):
+
+| Platform | Archive |
+|---|---|
+| Linux x86_64 (glibc) | `spacetimedb-tui-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS Intel | `spacetimedb-tui-vX.Y.Z-x86_64-apple-darwin.tar.gz` |
+| macOS Apple Silicon | `spacetimedb-tui-vX.Y.Z-aarch64-apple-darwin.tar.gz` |
+| Windows x86_64 | `spacetimedb-tui-vX.Y.Z-x86_64-pc-windows-msvc.zip` |
+
+Unpack and drop `spacetimedb-tui` (or `spacetimedb-tui.exe` on Windows) anywhere on your `PATH`:
+
+```bash
+# Linux / macOS
+tar xzf spacetimedb-tui-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+sudo mv spacetimedb-tui-v0.1.0-x86_64-unknown-linux-gnu/spacetimedb-tui /usr/local/bin/
+```
+
+```powershell
+# Windows (PowerShell)
+Expand-Archive spacetimedb-tui-v0.1.0-x86_64-pc-windows-msvc.zip
+Move-Item .\spacetimedb-tui-v0.1.0-x86_64-pc-windows-msvc\spacetimedb-tui.exe `
+          "$env:USERPROFILE\bin\spacetimedb-tui.exe"
+```
+
+### Option 2 — Build from source
 
 ```bash
 # 1. Clone the repository

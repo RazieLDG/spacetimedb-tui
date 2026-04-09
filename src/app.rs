@@ -2633,7 +2633,11 @@ impl App {
                     // updates immediately. The bootstrap helper
                     // already does ping → list_databases under a
                     // timeout.
-                    if let Ok(Ok(dbs)) = tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.list_databases()).await { send_event(&tx, AppEvent::DatabasesLoaded(dbs)) }
+                    if let Ok(Ok(dbs)) =
+                        tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.list_databases()).await
+                    {
+                        send_event(&tx, AppEvent::DatabasesLoaded(dbs))
+                    }
                 }
                 Ok(Err(e)) => send_event(
                     &tx,

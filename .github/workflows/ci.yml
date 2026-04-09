@@ -51,7 +51,9 @@ jobs:
 
       - name: cargo clippy
         # Deny every warning so PRs have to fix lints before merge.
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        # --locked ensures Cargo.lock is honoured — no surprise
+        # dependency bumps during CI.
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
   # ────────────────────────────────────────────────────────────────
   # Test + release build matrix on the three tier-1 desktop OSes.
@@ -78,10 +80,10 @@ jobs:
           key: test-${{ matrix.os }}
 
       - name: cargo test
-        run: cargo test --all-features --verbose
+        run: cargo test --all-features --locked --verbose
 
       - name: cargo build --release
         # Smoke check that the release build actually links — this
         # is what ends up in the GitHub release later, so catching a
         # platform-specific link error on CI saves a broken release.
-        run: cargo build --release --verbose
+        run: cargo build --release --locked --verbose

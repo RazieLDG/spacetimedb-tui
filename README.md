@@ -80,7 +80,30 @@ Browse databases, run SQL, stream live transactions, edit rows in a spreadsheet,
 - **SpacetimeDB CLI** configured (`spacetime login` or local server)
 - For source builds only: **Rust 1.78+** via [rustup](https://rustup.rs)
 
-### Option 1 — Pre-built binaries (recommended)
+### Option 1 — One-line installer (recommended)
+
+The repo ships ready-to-pipe installer scripts that detect your OS/architecture, download the matching archive from the latest GitHub release, and drop the binary onto a directory on your `PATH`.
+
+```bash
+# Linux / macOS — installs to ~/.local/bin by default
+curl -fsSL https://raw.githubusercontent.com/RazieLDG/spacetimedb-tui/main/scripts/install.sh | bash
+
+# Pin a version or override the install dir
+curl -fsSL https://raw.githubusercontent.com/RazieLDG/spacetimedb-tui/main/scripts/install.sh \
+    | bash -s -- --version v0.1.0 --dir /usr/local/bin
+```
+
+```powershell
+# Windows (PowerShell 5.1+ / 7+)
+irm https://raw.githubusercontent.com/RazieLDG/spacetimedb-tui/main/scripts/install.ps1 | iex
+
+# Pin a version and auto-append the install dir to user PATH
+iex "& { $(irm https://raw.githubusercontent.com/RazieLDG/spacetimedb-tui/main/scripts/install.ps1) } -Version v0.1.0 -AddToPath"
+```
+
+Both scripts are idempotent — re-running upgrades the binary in place.
+
+### Option 2 — Pre-built binaries (manual)
 
 Every tagged release ships pre-built archives for the three tier-1 desktop platforms. Grab the right archive for your machine from the [latest release](https://github.com/RazieLDG/spacetimedb-tui/releases/latest):
 
@@ -106,7 +129,7 @@ Move-Item .\spacetimedb-tui-v0.1.0-x86_64-pc-windows-msvc\spacetimedb-tui.exe `
           "$env:USERPROFILE\bin\spacetimedb-tui.exe"
 ```
 
-### Option 2 — Build from source
+### Option 3 — Build from source
 
 ```bash
 # 1. Clone the repository

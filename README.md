@@ -147,7 +147,17 @@ If this file exists, you don't need to pass `--host`, `--port`, or `--token` man
 
 ### User Config
 
-Persistent preferences live at `~/.config/spacetimedb-tui/config.toml`:
+Persistent preferences live at the platform-specific config directory:
+
+| Platform | Path |
+|---|---|
+| **Linux** | `~/.config/spacetimedb-tui/config.toml` |
+| **macOS** | `~/Library/Application Support/spacetimedb-tui/config.toml` |
+| **Windows** | `%APPDATA%\spacetimedb-tui\config.toml` |
+
+The SpacetimeDB CLI config (`spacetime/cli.toml`) is looked up in the same root, so credentials created by `spacetime login` are picked up automatically on every platform.
+
+Example contents:
 
 ```toml
 # Default theme — built-in name (dark / light / high-contrast)
@@ -165,10 +175,10 @@ default_database = "my_game_db"
 restore_session = true
 ```
 
-A user theme file is a flat table of RGB triples:
+A user theme file is a flat table of RGB triples, placed under `<config_dir>/themes/<name>.toml`:
 
 ```toml
-# ~/.config/spacetimedb-tui/themes/dracula.toml
+# e.g. ~/.config/spacetimedb-tui/themes/dracula.toml (Linux)
 bg_primary    = [40, 42, 54]
 bg_secondary  = [68, 71, 90]
 bg_selected   = [68, 71, 90]

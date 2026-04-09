@@ -31,6 +31,7 @@ use crate::{api::SpacetimeClient, app::App, config::Config};
 fn main() -> Result<()> {
     let config = Config::parse().context("Failed to parse configuration")?;
     init_tracing(&config.log_level);
+    install_panic_logger();
 
     info!(
         server_url = %config.server_url,
@@ -110,4 +111,33 @@ fn init_tracing(level: &str) {
         .with_target(false)
         .with_writer(std::io::stderr)
         .init();
+}
+
+/// Route every panic (including ones that fire inside `tokio::spawn`
+/// background tasks) through `tracing::error!` so they show up in the
+/// log output instead of getting silently dropped by the default
+/// hook while the TUI is in raw mode and nothing is visible anyway.
+///
+/// We wrap the default hook rather than replacing it so the original
+/// backtrace-printing behaviour still fires when running outside the
+/// TUI (e.g. during `cargo test`).
+fn install_panic_logger() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "<unknown location>".to_string());
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("<non-string panic payload>");
+        tracing::error!(
+            target: "spacetimedb_tui::panic",
+            "panic at {location}: {payload}"
+        );
+        default_hook(info);
+    }));
 }

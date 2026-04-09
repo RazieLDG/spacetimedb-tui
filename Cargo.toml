@@ -47,6 +47,11 @@ chrono = { version = "0.4", features = ["serde"] }
 # URL handling
 url = "2"
 
+# Cross-platform config directories (XDG on Linux, ~/Library on macOS,
+# %APPDATA% on Windows). Replaces the hardcoded `$HOME` lookups that
+# silently disabled user config / session restore on Windows.
+dirs = "5"
+
 [profile.release]
 opt-level = 3
 lto = true

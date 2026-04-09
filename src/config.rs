@@ -21,12 +21,16 @@ struct SpacetimeCliConfig {
     uses_tls: bool,
 }
 
-/// Try to read and parse `~/.config/spacetime/cli.toml`.
+/// Try to read and parse the SpacetimeDB CLI config file.
+///
+/// Looks in the platform-specific config directory:
+/// - Linux:   `~/.config/spacetime/cli.toml`
+/// - macOS:   `~/Library/Application Support/spacetime/cli.toml`
+/// - Windows: `%APPDATA%\spacetime\cli.toml`
 ///
 /// Returns `None` when the file does not exist or cannot be parsed.
 fn read_spacetime_cli_config() -> Option<SpacetimeCliConfig> {
-    let home = std::env::var("HOME").ok()?;
-    let path = std::path::Path::new(&home).join(".config/spacetime/cli.toml");
+    let path = dirs::config_dir()?.join("spacetime/cli.toml");
     let content = std::fs::read_to_string(&path).ok()?;
     parse_spacetime_cli_toml(&content)
 }

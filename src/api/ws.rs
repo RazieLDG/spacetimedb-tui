@@ -155,7 +155,9 @@ impl WsHandle {
 
     /// Request a graceful shutdown of the background task.
     pub async fn close(&self) {
-        let _ = self.cmd_tx.send(WsCommand::Close).await;
+        if self.cmd_tx.send(WsCommand::Close).await.is_err() {
+            tracing::debug!("WS close: command channel already dropped");
+        }
     }
 }
 
@@ -401,7 +403,10 @@ async fn connect_subscription_once(
                     }
                     Some(Err(e)) => {
                         warn!("WebSocket frame error: {e}");
-                        let _ = event_tx.send(WsEvent::Error(e.to_string())).await;
+                        if event_tx.send(WsEvent::Error(e.to_string())).await.is_err() {
+                            debug!("WS error event dropped — receiver gone");
+                            return ConnectOutcome::Closed;
+                        }
                         // A fatal error will surface as `None` on the next
                         // iteration; transient frame errors are tolerated.
                     }
@@ -434,12 +439,18 @@ async fn connect_subscription_once(
                     }
                     Some(WsCommand::Close) | None => {
                         info!("WebSocket task received close command");
-                        let _ = sink.send(Message::Close(None)).await;
-                        let _ = event_tx
+                        if let Err(e) = sink.send(Message::Close(None)).await {
+                            debug!("WS close frame send failed: {e}");
+                        }
+                        if event_tx
                             .send(WsEvent::Disconnected {
                                 reason: "Client requested close".to_string(),
                             })
-                            .await;
+                            .await
+                            .is_err()
+                        {
+                            debug!("WS disconnect event dropped — receiver gone");
+                        }
                         return ConnectOutcome::Closed;
                     }
                 }

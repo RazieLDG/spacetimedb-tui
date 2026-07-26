@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-26
 
-**Status:** Design direction approved, specification pending user review
+**Status:** Approved for implementation
 
 **Project:** `spacetimedb-tui`
 

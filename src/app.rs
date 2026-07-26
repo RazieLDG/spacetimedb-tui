@@ -35,6 +35,10 @@ use crate::{
         WritePlanBuildError,
     },
     state::{
+        edit_mode::{
+            BeginEditResult, EditCellProjection, EditCellValues, EditRowTarget,
+            SpreadsheetEditError,
+        },
         safety::{
             ColumnChange, CompletePrimaryKey, GuidedMutation, MutationOutcome, PrimaryKeyError,
             QualifiedTable, WritePlan, WritePlanId,
@@ -138,6 +142,7 @@ pub struct SchemaRequestContext {
 pub struct TableBrowseRequestContext {
     database: String,
     table: String,
+    server_context_generation: u64,
     table_generation: u64,
     schema_generation: u64,
     database_generation: u64,
@@ -161,6 +166,15 @@ struct GuidedWriteTarget {
     primary_key: CompletePrimaryKey,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DeferredTableRefresh {
+    table: QualifiedTable,
+    server_context_generation: u64,
+    database_generation: u64,
+    schema_generation: u64,
+    table_generation: u64,
+}
+
 impl GuidedWriteTarget {
     fn from_plan(plan: &WritePlan) -> Self {
         Self {
@@ -173,6 +187,46 @@ impl GuidedWriteTarget {
 #[derive(Debug, Default)]
 struct GuidedWriteLocks {
     targets_by_plan_id: HashMap<WritePlanId, GuidedWriteTarget>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingSpreadsheetEditRequest {
+    target: EditRowTarget,
+    column_index: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SpreadsheetSaveLifecycle {
+    AwaitingConfirmation(WritePlanId),
+    InFlight(WritePlanId),
+    InFlightInvalidated(WritePlanId),
+}
+
+impl SpreadsheetSaveLifecycle {
+    fn plan_id(self) -> WritePlanId {
+        match self {
+            Self::AwaitingConfirmation(plan_id)
+            | Self::InFlight(plan_id)
+            | Self::InFlightInvalidated(plan_id) => plan_id,
+        }
+    }
+
+    fn is_in_flight(self) -> bool {
+        matches!(self, Self::InFlight(_) | Self::InFlightInvalidated(_))
+    }
+
+    fn is_invalidated(self) -> bool {
+        matches!(self, Self::InFlightInvalidated(_))
+    }
+
+    fn invalidate_if_in_flight(self) -> Self {
+        match self {
+            Self::InFlight(plan_id) | Self::InFlightInvalidated(plan_id) => {
+                Self::InFlightInvalidated(plan_id)
+            }
+            Self::AwaitingConfirmation(plan_id) => Self::AwaitingConfirmation(plan_id),
+        }
+    }
 }
 
 impl GuidedWriteLocks {
@@ -196,8 +250,14 @@ impl GuidedWriteLocks {
             .any(|locked| locked == &target)
     }
 
-    fn release(&mut self, plan_id: WritePlanId) -> bool {
-        self.targets_by_plan_id.remove(&plan_id).is_some()
+    fn has_lock_for_table(&self, table: &QualifiedTable) -> bool {
+        self.targets_by_plan_id
+            .values()
+            .any(|locked| locked.table == *table)
+    }
+
+    fn release(&mut self, plan_id: WritePlanId) -> Option<GuidedWriteTarget> {
+        self.targets_by_plan_id.remove(&plan_id)
     }
 }
 
@@ -245,6 +305,9 @@ pub struct App {
     next_write_plan_id: WritePlanId,
     write_plans: HashMap<WritePlanId, WritePlan>,
     pending_update_draft: Option<PendingGuidedUpdateDraft>,
+    pending_spreadsheet_edit_request: Option<PendingSpreadsheetEditRequest>,
+    spreadsheet_save_lifecycle: Option<SpreadsheetSaveLifecycle>,
+    deferred_guided_refresh: Option<DeferredTableRefresh>,
     guided_write_locks: GuidedWriteLocks,
     schema_generation: u64,
     table_generation: u64,
@@ -291,6 +354,9 @@ impl App {
             next_write_plan_id: WritePlanId(1),
             write_plans: HashMap::new(),
             pending_update_draft: None,
+            pending_spreadsheet_edit_request: None,
+            spreadsheet_save_lifecycle: None,
+            deferred_guided_refresh: None,
             guided_write_locks: GuidedWriteLocks::default(),
             schema_generation: 0,
             table_generation: 0,
@@ -321,8 +387,195 @@ impl App {
     }
 
     fn discard_pending_guided_writes(&mut self) {
+        self.clear_spreadsheet_owned_modal();
+        self.clear_discarded_guided_owned_modal();
         self.write_plans.clear();
         self.pending_update_draft = None;
+        self.pending_spreadsheet_edit_request = None;
+        if let Some(lifecycle) = self.spreadsheet_save_lifecycle {
+            self.spreadsheet_save_lifecycle = if lifecycle.is_in_flight() {
+                Some(lifecycle.invalidate_if_in_flight())
+            } else {
+                None
+            };
+        }
+    }
+
+    fn clear_discarded_guided_owned_modal(&mut self) {
+        let should_clear = self
+            .state
+            .modal
+            .as_ref()
+            .is_some_and(|modal| match modal.action() {
+                crate::state::modal::ModalAction::Safety(
+                    crate::state::modal::SafetyModalAction::DirtyRowChoice {
+                        requested_row,
+                        requested_column,
+                    },
+                ) => self.pending_update_draft.as_ref().is_some_and(|draft| {
+                    draft.requested_row == *requested_row
+                        && draft.requested_column == *requested_column
+                }),
+                crate::state::modal::ModalAction::Safety(
+                    crate::state::modal::SafetyModalAction::ConfirmWritePlan { plan_id },
+                ) => self.write_plans.contains_key(plan_id),
+                _ => false,
+            });
+        if should_clear {
+            self.state.modal = None;
+        }
+    }
+
+    fn clear_spreadsheet_edit_state(&mut self) {
+        self.clear_spreadsheet_owned_modal();
+        self.state.edit_mode = None;
+        self.pending_spreadsheet_edit_request = None;
+        self.spreadsheet_save_lifecycle = None;
+    }
+
+    fn clear_spreadsheet_owned_modal(&mut self) {
+        let should_clear = self
+            .state
+            .modal
+            .as_ref()
+            .is_some_and(|modal| match modal.action() {
+                crate::state::modal::ModalAction::SpreadsheetDirtyRowChoice { .. }
+                | crate::state::modal::ModalAction::DiscardPendingEdits => true,
+                crate::state::modal::ModalAction::Safety(
+                    crate::state::modal::SafetyModalAction::ConfirmWritePlan { plan_id },
+                ) => self.spreadsheet_lifecycle_plan_id() == Some(*plan_id),
+                _ => false,
+            });
+        if should_clear {
+            self.state.modal = None;
+        }
+    }
+
+    fn spreadsheet_lifecycle_plan_id(&self) -> Option<WritePlanId> {
+        self.spreadsheet_save_lifecycle
+            .map(SpreadsheetSaveLifecycle::plan_id)
+    }
+
+    fn spreadsheet_edits_are_frozen(&self) -> bool {
+        self.spreadsheet_save_lifecycle
+            .is_some_and(SpreadsheetSaveLifecycle::is_in_flight)
+    }
+
+    fn selected_table_matches(&self, table: &QualifiedTable) -> bool {
+        self.state.selected_database() == Some(table.database.as_str())
+            && self
+                .state
+                .selected_table()
+                .is_some_and(|selected| selected.table_name == table.table)
+    }
+
+    fn guided_current_table_interaction_is_active(&self) -> bool {
+        if let (Some(database), Some(table)) = (
+            self.state.selected_database(),
+            self.state
+                .selected_table()
+                .map(|table| table.table_name.as_str()),
+        ) {
+            let selected_table = QualifiedTable {
+                database: database.to_string(),
+                schema: None,
+                table: table.to_string(),
+            };
+            if self.guided_write_locks.has_lock_for_table(&selected_table) {
+                return true;
+            }
+        }
+        if self
+            .pending_update_draft
+            .as_ref()
+            .is_some_and(|draft| self.selected_table_matches(&draft.qualified_table))
+        {
+            return true;
+        }
+        if self.pending_spreadsheet_edit_request.is_some()
+            || self.spreadsheet_save_lifecycle.is_some()
+            || self.state.edit_mode.is_some()
+        {
+            return true;
+        }
+        if let Some(crate::state::modal::ModalAction::Safety(
+            crate::state::modal::SafetyModalAction::ConfirmWritePlan { plan_id },
+        )) = self
+            .state
+            .modal
+            .as_ref()
+            .map(crate::state::modal::Modal::action)
+        {
+            return self
+                .write_plans
+                .get(plan_id)
+                .is_some_and(|plan| self.selected_table_matches(&plan.table));
+        }
+        false
+    }
+
+    fn read_owner_is_active(&self) -> bool {
+        self.state.query_loading || self.state.schema_loading
+    }
+
+    fn deferred_table_refresh_for(&self, table: QualifiedTable) -> DeferredTableRefresh {
+        DeferredTableRefresh {
+            table,
+            server_context_generation: self.server_context_generation,
+            database_generation: self.database_generation,
+            schema_generation: self.schema_generation,
+            table_generation: self.table_generation,
+        }
+    }
+
+    fn deferred_refresh_matches_current(&self, refresh: &DeferredTableRefresh) -> bool {
+        self.selected_table_matches(&refresh.table)
+            && self.server_context_generation == refresh.server_context_generation
+            && self.database_generation == refresh.database_generation
+            && self.schema_generation == refresh.schema_generation
+            && self.table_generation == refresh.table_generation
+    }
+
+    async fn refresh_or_defer_guided_table(&mut self, table: QualifiedTable) {
+        if self.guided_current_table_interaction_is_active() || self.read_owner_is_active() {
+            self.deferred_guided_refresh = Some(self.deferred_table_refresh_for(table));
+            return;
+        }
+        if self.selected_table_matches(&table) {
+            self.deferred_guided_refresh = None;
+            self.load_table_data().await;
+        }
+    }
+
+    async fn flush_deferred_guided_refresh_if_unowned(&mut self) {
+        if self
+            .deferred_guided_refresh
+            .as_ref()
+            .is_some_and(|refresh| !self.deferred_refresh_matches_current(refresh))
+        {
+            self.deferred_guided_refresh = None;
+            return;
+        }
+        if self.guided_current_table_interaction_is_active() || self.read_owner_is_active() {
+            return;
+        }
+        let Some(refresh) = self.deferred_guided_refresh.take() else {
+            return;
+        };
+        if self.deferred_refresh_matches_current(&refresh) {
+            self.load_table_data().await;
+        }
+    }
+
+    fn block_if_spreadsheet_edits_frozen(&mut self, action: &str) -> bool {
+        if self.spreadsheet_edits_are_frozen() {
+            self.state.set_notification(format!(
+                "Spreadsheet save is in flight; {action} after it finishes"
+            ));
+            true
+        } else {
+            false
+        }
     }
 
     fn clear_table_browse_for_selection_change(&mut self) {
@@ -330,6 +583,9 @@ impl App {
         self.state.query_loading = false;
         self.tables_grid = TableGridState::new();
         self.discard_pending_guided_writes();
+        if !self.spreadsheet_edits_are_frozen() {
+            self.clear_spreadsheet_edit_state();
+        }
     }
 
     fn current_schema_request_context(&self, database: String) -> SchemaRequestContext {
@@ -348,6 +604,7 @@ impl App {
         TableBrowseRequestContext {
             database,
             table,
+            server_context_generation: self.server_context_generation,
             table_generation: self.table_generation,
             schema_generation: self.schema_generation,
             database_generation: self.database_generation,
@@ -369,6 +626,7 @@ impl App {
             && self.table_generation == context.table_generation
             && self.schema_generation == context.schema_generation
             && self.database_generation == context.database_generation
+            && self.server_context_generation == context.server_context_generation
     }
 
     fn bump_schema_generation(&mut self) {
@@ -379,11 +637,17 @@ impl App {
     fn bump_table_generation(&mut self) {
         self.table_generation = self.table_generation.saturating_add(1);
         self.discard_pending_guided_writes();
+        if !self.spreadsheet_edits_are_frozen() {
+            self.clear_spreadsheet_edit_state();
+        }
     }
 
     fn bump_server_context_generation(&mut self) {
         self.server_context_generation = self.server_context_generation.saturating_add(1);
         self.discard_pending_guided_writes();
+        if !self.spreadsheet_edits_are_frozen() {
+            self.clear_spreadsheet_edit_state();
+        }
     }
 
     fn bump_database_generation(&mut self) {
@@ -703,7 +967,7 @@ impl App {
                         return;
                     }
                     KeyCode::Char('e') => {
-                        self.exit_edit_mode();
+                        self.exit_edit_mode().await;
                         return;
                     }
                     _ => {}
@@ -1949,9 +2213,39 @@ impl App {
             .set_notification("EDIT MODE — Ctrl+E to exit".to_string());
     }
 
+    fn active_edit_row_target(&self) -> Result<EditRowTarget, String> {
+        let data_row = self
+            .active_data_row_index()
+            .ok_or_else(|| "No row selected".to_string())?;
+        self.edit_row_target_at(data_row)
+    }
+
+    fn edit_row_target_at(&self, data_row: usize) -> Result<EditRowTarget, String> {
+        let table = self
+            .state
+            .selected_table()
+            .ok_or_else(|| "No table selected".to_string())?;
+        let row = self
+            .state
+            .table_browse_result
+            .as_ref()
+            .and_then(|result| result.rows.get(data_row))
+            .ok_or_else(|| "No row selected".to_string())?;
+        let primary_key = complete_primary_key_from_table_row(table, row)
+            .map_err(|error| Self::explain_primary_key_error(table, error))?;
+        Ok(EditRowTarget {
+            primary_key,
+            row_generation: self.table_generation,
+            data_row_index: data_row,
+        })
+    }
+
     /// Leave edit mode. If there are uncommitted edits, pops up a
     /// confirm dialog so the user doesn't lose them by accident.
-    fn exit_edit_mode(&mut self) {
+    async fn exit_edit_mode(&mut self) {
+        if self.block_if_spreadsheet_edits_frozen("exit edit mode") {
+            return;
+        }
         let pending = self
             .state
             .edit_mode
@@ -1960,11 +2254,12 @@ impl App {
             .unwrap_or(0);
         if pending == 0 {
             self.state.edit_mode = None;
+            self.flush_deferred_guided_refresh_if_unowned().await;
             return;
         }
-        // Pending changes — ask before discarding. We reuse the
-        // existing Confirm modal; its action is ignored because we
-        // handle cancel vs confirm inline via a sentinel.
+        // Pending changes — ask before discarding. The confirm modal
+        // carries ModalAction::DiscardPendingEdits so modal dispatch can
+        // either discard the spreadsheet edits or leave edit mode active.
         self.state.modal = Some(crate::state::modal::Modal::confirm(
             "Discard pending edits?",
             format!(
@@ -1993,7 +2288,7 @@ impl App {
 
         match key.code {
             KeyCode::Esc => {
-                self.exit_edit_mode();
+                self.exit_edit_mode().await;
             }
             KeyCode::Enter | KeyCode::Char('i') => {
                 self.begin_cell_edit();
@@ -2062,9 +2357,11 @@ impl App {
     /// pre-filled with the cell's current display value (or any
     /// existing pending edit value).
     fn begin_cell_edit(&mut self) {
-        // Figure out the data row / column, plus whether the user is
-        // trying to edit the PK (which we refuse so the WHERE clause
-        // stays valid).
+        if self.block_if_spreadsheet_edits_frozen("edit cells") {
+            return;
+        }
+        // Figure out the data row / column and reject declared PK
+        // columns before any editor state is created.
         let data_row = match self.active_data_row_index() {
             Some(i) => i,
             None => return,
@@ -2077,11 +2374,47 @@ impl App {
         if table.columns.is_empty() {
             return;
         }
-        let (pk_idx, _) = pick_primary_key(&table);
-        if col_idx == pk_idx {
+        let Some(column) = table.columns.get(col_idx) else {
+            return;
+        };
+        if table
+            .primary_key_cols
+            .iter()
+            .any(|primary_key_col| u32::from(*primary_key_col) == column.col_id)
+        {
             self.state
                 .set_notification("PK column is read-only in edit mode".to_string());
             return;
+        }
+        let target = match self.active_edit_row_target() {
+            Ok(target) => target,
+            Err(error) => {
+                self.state.set_error(format!("Cannot edit row: {error}"));
+                return;
+            }
+        };
+        if let Some(em) = self.state.edit_mode.as_ref() {
+            match em
+                .spreadsheet_edits()
+                .begin_edit(target.clone(), column.col_id)
+            {
+                BeginEditResult::Began => {}
+                BeginEditResult::NeedsDirtyRowChoice { .. } => {
+                    self.pending_spreadsheet_edit_request = Some(PendingSpreadsheetEditRequest {
+                        target: target.clone(),
+                        column_index: col_idx,
+                    });
+                    self.state.modal = Some(crate::state::modal::Modal::confirm(
+                        "Save pending spreadsheet row?",
+                        "[y] Save\n[d] Discard\n[n/Esc] Stay".to_string(),
+                        crate::state::modal::ModalAction::SpreadsheetDirtyRowChoice {
+                            requested_row: target.data_row_index,
+                            requested_column: column.col_id,
+                        },
+                    ));
+                    return;
+                }
+            }
         }
 
         // Prefer the in-flight pending value if one exists, otherwise
@@ -2129,137 +2462,271 @@ impl App {
             .map(crate::ui::tabs::tables::value_to_display)
             .unwrap_or_default();
 
+        let Some(editor_value) = self
+            .state
+            .edit_mode
+            .as_ref()
+            .and_then(|em| em.editor.as_ref())
+            .map(|editor| editor.value.clone())
+        else {
+            return;
+        };
+        let Some(table) = self.state.selected_table().cloned() else {
+            return;
+        };
+        let Some(column) = table.columns.get(col_idx).cloned() else {
+            return;
+        };
+        let Some(raw_old) = self
+            .state
+            .table_browse_result
+            .as_ref()
+            .and_then(|qr| qr.rows.get(data_row))
+            .and_then(|row| row.get(col_idx))
+            .cloned()
+        else {
+            return;
+        };
+        let target = match self.edit_row_target_at(data_row) {
+            Ok(target) => target,
+            Err(error) => {
+                self.state.set_error(format!("Cannot edit row: {error}"));
+                return;
+            }
+        };
+        let old_value = match typed_sql_value_from_json(&column, &raw_old) {
+            Ok(value) => value,
+            Err(error) => {
+                self.state.set_error(format!(
+                    "Cannot read original value for {} as {}: {error:?}",
+                    column.col_name,
+                    type_tag(&column.col_type)
+                ));
+                return;
+            }
+        };
+        let new_value = match guided_form_sql_value_from_user_input(&column, &editor_value) {
+            Ok(value) => value,
+            Err(error) => {
+                self.state.set_error(format!(
+                    "Cannot parse {} as {}: {error:?}",
+                    column.col_name,
+                    type_tag(&column.col_type)
+                ));
+                return;
+            }
+        };
         let Some(em) = self.state.edit_mode.as_mut() else {
             return;
         };
-        let Some(editor) = em.editor.take() else {
-            return;
-        };
-        em.upsert(data_row, col_idx, original, editor.value);
+        if let Err(error) = em.set_cell(
+            target,
+            EditCellProjection {
+                data_row,
+                column_index: col_idx,
+                original_display: original,
+                new_display: editor_value,
+            },
+            EditCellValues {
+                column_id: column.col_id,
+                old_value: Some(old_value),
+                new_value,
+            },
+        ) {
+            self.state
+                .set_error(Self::format_spreadsheet_edit_error(error));
+        } else if let Some(em) = self.state.edit_mode.as_mut() {
+            em.editor = None;
+        }
     }
 
     /// Drop the pending edit (if any) on the active cell.
     fn revert_active_cell(&mut self) {
+        if self.block_if_spreadsheet_edits_frozen("revert cells") {
+            return;
+        }
         let data_row = match self.active_data_row_index() {
             Some(i) => i,
             None => return,
         };
         let col_idx = self.tables_grid.selected_col;
+        let Some(column_id) = self
+            .state
+            .selected_table()
+            .and_then(|table| table.columns.get(col_idx))
+            .map(|column| column.col_id)
+        else {
+            return;
+        };
+        let target = match self.active_edit_row_target() {
+            Ok(target) => target,
+            Err(reason) => {
+                self.record_spreadsheet_definitely_not_sent(reason);
+                return;
+            }
+        };
         let Some(em) = self.state.edit_mode.as_mut() else {
             return;
         };
-        if em.revert(data_row, col_idx) {
-            self.state.set_notification("Reverted".to_string());
+        match em.remove_cell_change_for_target(&target, data_row, col_idx, column_id) {
+            Ok(true) => self.state.set_notification("Reverted".to_string()),
+            Ok(false) => {}
+            Err(error) => self
+                .state
+                .set_error(Self::format_spreadsheet_edit_error(error)),
         }
     }
 
-    /// Flush every pending edit to the server as a sequence of
-    /// `UPDATE <table> SET col=val WHERE pk=pk` statements, one per
-    /// edit. On success clears the pending list and leaves edit
-    /// mode; on partial failure keeps the failing entries.
+    /// Build one guided update plan for the dirty spreadsheet row.
     async fn save_pending_edits(&mut self) {
-        // Gather everything we need while we still hold the state
-        // borrow; then drop the borrow before spawning tasks.
-        let (db, table, pk_idx, pk_column, column_types, rows, pending) = {
-            let Some(db) = self.state.selected_database() else {
-                self.state.set_error("No database selected".to_string());
-                return;
-            };
-            let db = db.to_string();
-            let Some(table) = self.state.selected_table().cloned() else {
-                return;
-            };
-            let (pk_idx, pk_column) = pick_primary_key(&table);
-            let column_types: Vec<String> = table
-                .columns
-                .iter()
-                .map(|c| type_tag(&c.col_type))
-                .collect();
-            let rows: Vec<Vec<serde_json::Value>> = self
-                .state
-                .table_browse_result
-                .as_ref()
-                .map(|qr| qr.rows.clone())
-                .unwrap_or_default();
-            let pending: Vec<_> = self
-                .state
-                .edit_mode
-                .as_ref()
-                .map(|em| em.pending.clone())
-                .unwrap_or_default();
-            (
-                db,
-                table.table_name,
-                pk_idx,
-                pk_column,
-                column_types,
-                rows,
-                pending,
-            )
-        };
-
-        if pending.is_empty() {
+        if self.block_if_spreadsheet_edits_frozen("save again") {
+            return;
+        }
+        if let Some(Err(error)) = self
+            .state
+            .edit_mode
+            .as_ref()
+            .map(|em| em.spreadsheet_edits().save_all())
+        {
+            match error {
+                SpreadsheetEditError::MultiRowSaveAllDisabled => {}
+                other => {
+                    self.state
+                        .set_error(Self::format_spreadsheet_edit_error(other));
+                    return;
+                }
+            }
+        }
+        if self
+            .state
+            .edit_mode
+            .as_ref()
+            .and_then(|em| em.pending_single_row_save())
+            .is_none()
+        {
             self.state.set_notification("No pending edits".to_string());
             return;
         }
-
-        let mut spawned = 0usize;
-        let mut skipped_errors: Vec<String> = Vec::new();
-        for edit in &pending {
-            let Some(row) = rows.get(edit.data_row_idx) else {
-                continue;
-            };
-            let Some(col_type) = column_types.get(edit.col_idx) else {
-                continue;
-            };
-            let col_name = self
-                .state
-                .selected_table()
-                .and_then(|t| t.columns.get(edit.col_idx).map(|c| c.col_name.clone()))
-                .unwrap_or_default();
-            let new_literal = sql_literal(&edit.new_value, col_type);
-            // Build the WHERE literal from the raw JSON value so
-            // Identity / ConnectionId / U256 PKs round-trip
-            // correctly. A complex-shaped PK (array, nested object
-            // we don't recognise) is skipped with a per-edit error
-            // so the rest of the batch still goes through.
-            let pk_literal = match row.get(pk_idx).map(json_to_sql_literal) {
-                Some(Ok(lit)) => lit,
-                Some(Err(e)) => {
-                    skipped_errors.push(format!("{col_name}: {e}"));
-                    continue;
-                }
-                None => {
-                    skipped_errors.push(format!("{col_name}: no PK value"));
-                    continue;
-                }
-            };
-            let sql = format!(
-                "UPDATE {table} SET {col_name} = {new_literal} WHERE {pk_column} = {pk_literal}"
-            );
-            let op_label = format!("edit {table}.{col_name}");
-            self.spawn_write_sql(db.clone(), sql, op_label);
-            spawned += 1;
-        }
-
-        if !skipped_errors.is_empty() {
-            self.state.set_error(format!(
-                "Skipped {} edit(s): {}",
-                skipped_errors.len(),
-                skipped_errors.join("; ")
-            ));
-        }
-
-        if spawned > 0 {
-            self.state
-                .set_notification(format!("Submitted {spawned} UPDATE statement(s)"));
-            // Leave edit mode — the background spawn will re-fetch
-            // the table data on success, and any failures surface
-            // as `WriteOpError` notifications.
-            self.state.edit_mode = None;
-        }
+        self.open_spreadsheet_guided_save().await;
     }
 
+    async fn open_spreadsheet_guided_save(&mut self) {
+        let Some(dirty_target) = self
+            .state
+            .edit_mode
+            .as_ref()
+            .and_then(|em| em.spreadsheet_edits().dirty_target().cloned())
+        else {
+            self.state.set_notification("No pending edits".to_string());
+            return;
+        };
+        let current_target = match self.edit_row_target_at(dirty_target.data_row_index) {
+            Ok(target) => target,
+            Err(reason) => {
+                self.record_spreadsheet_definitely_not_sent(reason);
+                return;
+            }
+        };
+        let Some(edit_mode) = self.state.edit_mode.as_ref() else {
+            self.state.set_notification("No pending edits".to_string());
+            return;
+        };
+        let save = match edit_mode.pending_single_row_save_for_current_target(&current_target) {
+            Ok(Some(save)) => save,
+            Ok(None) => {
+                self.state.set_notification("No pending edits".to_string());
+                return;
+            }
+            Err(SpreadsheetEditError::DefinitelyNotSent { reason }) => {
+                self.record_spreadsheet_definitely_not_sent(reason);
+                return;
+            }
+            Err(error) => {
+                self.state
+                    .set_error(Self::format_spreadsheet_edit_error(error));
+                return;
+            }
+        };
+        let Some(table_info) = self.state.selected_table().cloned() else {
+            self.record_spreadsheet_definitely_not_sent("No table selected".to_string());
+            return;
+        };
+        let Some(qualified_table) = self.qualified_selected_table(&table_info) else {
+            return;
+        };
+        let Some(row) = self
+            .state
+            .table_browse_result
+            .as_ref()
+            .and_then(|result| result.rows.get(save.target.data_row_index))
+            .cloned()
+        else {
+            self.record_spreadsheet_definitely_not_sent("No row selected".to_string());
+            return;
+        };
+        let plan_id = self.next_write_plan_id();
+        let changes: Vec<ColumnChange> = save
+            .changes
+            .into_iter()
+            .map(|change| ColumnChange {
+                column_id: change.column_id,
+                old_value: change.old_value,
+                new_value: change.new_value,
+            })
+            .collect();
+        let plan = match build_guided_update_plan(
+            plan_id,
+            qualified_table,
+            &table_info,
+            &row,
+            self.current_generations(),
+            changes,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.record_spreadsheet_definitely_not_sent(Self::explain_write_plan_build_error(
+                    error,
+                ));
+                return;
+            }
+        };
+        let plan_id = plan.id;
+        let prompt = format!(
+            "{}\n\nPress [y] to confirm, [n] to cancel.",
+            format_guided_update_confirmation(&plan)
+        );
+        self.write_plans.insert(plan_id, plan);
+        self.spreadsheet_save_lifecycle =
+            Some(SpreadsheetSaveLifecycle::AwaitingConfirmation(plan_id));
+        if let Some(display_row) = self.display_row_for_data_idx(save.target.data_row_index) {
+            self.tables_grid.selected_row = display_row;
+        }
+        self.state.modal = Some(crate::state::modal::Modal::confirm(
+            "Confirm row update",
+            prompt,
+            crate::state::modal::ModalAction::Safety(
+                crate::state::modal::SafetyModalAction::ConfirmWritePlan { plan_id },
+            ),
+        ));
+    }
+
+    fn record_spreadsheet_definitely_not_sent(&mut self, reason: String) {
+        self.spreadsheet_save_lifecycle = None;
+        self.state.set_error(format_mutation_outcome_not_sent(
+            MutationOutcome::DefinitelyNotSent { reason },
+        ));
+    }
+
+    fn format_spreadsheet_edit_error(error: SpreadsheetEditError) -> String {
+        match error {
+            SpreadsheetEditError::MultiRowSaveAllDisabled => {
+                "Saving all spreadsheet rows is disabled".to_string()
+            }
+            SpreadsheetEditError::DefinitelyNotSent { reason } => {
+                format_mutation_outcome_not_sent(MutationOutcome::DefinitelyNotSent { reason })
+            }
+        }
+    }
     // ── Command palette (Faz 6.3) ────────────────────────────────────────
 
     /// Route a key event into the active command palette overlay.
@@ -2342,6 +2809,11 @@ impl App {
         match modal.action() {
             ModalAction::Safety(SafetyModalAction::ConfirmWritePlan { plan_id }) => {
                 self.write_plans.remove(plan_id);
+                if self.spreadsheet_lifecycle_plan_id() == Some(*plan_id)
+                    && !self.spreadsheet_edits_are_frozen()
+                {
+                    self.spreadsheet_save_lifecycle = None;
+                }
             }
             ModalAction::Safety(SafetyModalAction::DirtyRowChoice { .. }) => {
                 self.pending_update_draft = None;
@@ -2365,14 +2837,61 @@ impl App {
         };
 
         match &mut modal {
-            crate::state::modal::Modal::Confirm { .. } => match key.code {
+            crate::state::modal::Modal::Confirm { action, .. } => match key.code {
+                KeyCode::Char('d') | KeyCode::Char('D')
+                    if matches!(
+                        action,
+                        crate::state::modal::ModalAction::SpreadsheetDirtyRowChoice { .. }
+                    ) =>
+                {
+                    if let crate::state::modal::ModalAction::SpreadsheetDirtyRowChoice {
+                        requested_row,
+                        requested_column,
+                    } = action
+                    {
+                        self.handle_spreadsheet_dirty_row_choice(
+                            crate::state::modal::DirtyRowChoice::Discard,
+                            *requested_row,
+                            *requested_column,
+                        )
+                        .await;
+                    }
+                    return;
+                }
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    self.dispatch_modal_action(modal).await;
+                    if let crate::state::modal::ModalAction::SpreadsheetDirtyRowChoice {
+                        requested_row,
+                        requested_column,
+                    } = action
+                    {
+                        self.handle_spreadsheet_dirty_row_choice(
+                            crate::state::modal::DirtyRowChoice::Save,
+                            *requested_row,
+                            *requested_column,
+                        )
+                        .await;
+                    } else {
+                        self.dispatch_modal_action(modal).await;
+                    }
                     return;
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    if let crate::state::modal::ModalAction::SpreadsheetDirtyRowChoice {
+                        requested_row,
+                        requested_column,
+                    } = action
+                    {
+                        self.handle_spreadsheet_dirty_row_choice(
+                            crate::state::modal::DirtyRowChoice::Stay,
+                            *requested_row,
+                            *requested_column,
+                        )
+                        .await;
+                        return;
+                    }
                     // Cancelled — drop the modal entirely.
                     self.discard_guided_state_for_modal(&modal);
+                    self.flush_deferred_guided_refresh_if_unowned().await;
                     return;
                 }
                 _ => {}
@@ -2380,6 +2899,7 @@ impl App {
             crate::state::modal::Modal::Form { fields, focus, .. } => match key.code {
                 KeyCode::Esc => {
                     self.discard_guided_state_for_modal(&modal);
+                    self.flush_deferred_guided_refresh_if_unowned().await;
                     return;
                 }
                 KeyCode::Enter => {
@@ -2441,6 +2961,75 @@ impl App {
 
         // Key didn't trigger accept/cancel — put the modal back.
         self.state.modal = Some(modal);
+    }
+
+    async fn handle_spreadsheet_dirty_row_choice(
+        &mut self,
+        choice: crate::state::modal::DirtyRowChoice,
+        requested_row: usize,
+        requested_column: u32,
+    ) {
+        let matches_pending_request =
+            self.pending_spreadsheet_edit_request
+                .as_ref()
+                .is_some_and(|request| {
+                    request.target.data_row_index == requested_row
+                        && self
+                            .state
+                            .selected_table()
+                            .and_then(|table| table.columns.get(request.column_index))
+                            .map(|column| column.col_id == requested_column)
+                            .unwrap_or(false)
+                });
+        if !matches_pending_request {
+            self.pending_spreadsheet_edit_request = None;
+            if let Some(dirty_row) = self
+                .state
+                .edit_mode
+                .as_ref()
+                .and_then(|em| em.spreadsheet_edits().dirty_target())
+                .and_then(|target| self.display_row_for_data_idx(target.data_row_index))
+            {
+                self.tables_grid.selected_row = dirty_row;
+            }
+            self.state.set_error(
+                "Spreadsheet dirty-row choice no longer matches the pending edit".to_string(),
+            );
+            return;
+        }
+        match choice {
+            crate::state::modal::DirtyRowChoice::Save => {
+                self.pending_spreadsheet_edit_request = None;
+                self.open_spreadsheet_guided_save().await;
+            }
+            crate::state::modal::DirtyRowChoice::Discard => {
+                let request = self.pending_spreadsheet_edit_request.take();
+                if let Some(em) = self.state.edit_mode.as_mut() {
+                    em.discard_spreadsheet_edits();
+                }
+                if let Some(request) = request {
+                    if let Some(display_row) =
+                        self.display_row_for_data_idx(request.target.data_row_index)
+                    {
+                        self.tables_grid.selected_row = display_row;
+                    }
+                    self.tables_grid.selected_col = request.column_index;
+                    self.begin_cell_edit();
+                }
+            }
+            crate::state::modal::DirtyRowChoice::Stay => {
+                self.pending_spreadsheet_edit_request = None;
+                if let Some(dirty_row) = self
+                    .state
+                    .edit_mode
+                    .as_ref()
+                    .and_then(|em| em.spreadsheet_edits().dirty_target())
+                    .and_then(|target| self.display_row_for_data_idx(target.data_row_index))
+                {
+                    self.tables_grid.selected_row = dirty_row;
+                }
+            }
+        }
     }
 
     /// Open an edit form pre-filled with the currently selected row's
@@ -2804,7 +3393,12 @@ impl App {
         let op_label = modal.action().op_label();
 
         match modal {
-            Modal::Form { fields, action, .. } => match action {
+            Modal::Form {
+                title,
+                fields,
+                focus,
+                action,
+            } => match action {
                 ModalAction::CallReducer {
                     reducer,
                     param_types,
@@ -2882,11 +3476,6 @@ impl App {
                     };
                     self.spawn_write_sql(db, sql, op_label);
                 }
-                ModalAction::DeleteRow { .. } => {
-                    // DeleteRow is always a Confirm, never a Form.
-                    self.state
-                        .set_error("Internal: DeleteRow inside a Form".to_string());
-                }
                 ModalAction::DiscardPendingEdits => {
                     // DiscardPendingEdits is always a Confirm, never a Form.
                 }
@@ -2894,30 +3483,34 @@ impl App {
                     requested_row,
                     requested_column,
                 }) => {
-                    self.submit_guided_update_form(fields, requested_row, requested_column);
+                    self.submit_guided_update_form(
+                        title,
+                        fields,
+                        focus,
+                        requested_row,
+                        requested_column,
+                    );
                 }
                 ModalAction::Safety(SafetyModalAction::ConfirmWritePlan { .. }) => {
                     self.state
                         .set_error("Internal: ConfirmWritePlan inside a Form".to_string());
                 }
+                ModalAction::SpreadsheetDirtyRowChoice { .. } => {
+                    self.state
+                        .set_error("Internal: SpreadsheetDirtyRowChoice inside a Form".to_string());
+                }
             },
             Modal::Confirm { action, .. } => match action {
-                ModalAction::DeleteRow { table, where_sql } => {
-                    let sql = format!("DELETE FROM {table} WHERE {where_sql}");
-                    let Some(db) = self.selected_database_for_modal() else {
-                        return;
-                    };
-                    self.spawn_write_sql(db, sql, op_label);
-                }
                 ModalAction::DiscardPendingEdits => {
                     // User confirmed leaving edit mode — drop the
                     // pending list and exit.
                     self.state.edit_mode = None;
                     self.state
                         .set_notification("Pending edits discarded".to_string());
+                    self.flush_deferred_guided_refresh_if_unowned().await;
                 }
                 ModalAction::Safety(SafetyModalAction::ConfirmWritePlan { plan_id }) => {
-                    self.dispatch_confirmed_write_plan(plan_id, op_label);
+                    self.dispatch_confirmed_write_plan(plan_id, op_label).await;
                 }
                 ModalAction::Safety(SafetyModalAction::DirtyRowChoice { .. }) => {
                     self.state
@@ -2925,7 +3518,7 @@ impl App {
                 }
                 _ => {
                     self.state
-                        .set_error("Internal: non-DeleteRow inside Confirm".to_string());
+                        .set_error("Internal: unsupported Confirm action".to_string());
                 }
             },
         }
@@ -2933,11 +3526,13 @@ impl App {
 
     fn submit_guided_update_form(
         &mut self,
+        title: String,
         fields: Vec<crate::state::modal::FormField>,
+        focus: usize,
         requested_row: usize,
         requested_column: u32,
     ) {
-        let Some(draft) = self.pending_update_draft.take() else {
+        let Some(draft) = self.pending_update_draft.as_ref().cloned() else {
             self.state.set_error("No pending update draft".to_string());
             return;
         };
@@ -2955,6 +3550,13 @@ impl App {
             Ok(changes) => changes,
             Err(error) => {
                 self.state.set_error(error);
+                self.restore_guided_update_form(
+                    title,
+                    fields,
+                    focus,
+                    requested_row,
+                    requested_column,
+                );
                 return;
             }
         };
@@ -2972,10 +3574,18 @@ impl App {
                     "Cannot update row: {}",
                     Self::explain_write_plan_build_error(error)
                 ));
+                self.restore_guided_update_form(
+                    title,
+                    fields,
+                    focus,
+                    requested_row,
+                    requested_column,
+                );
                 return;
             }
         };
         let plan_id = plan.id;
+        self.pending_update_draft = None;
         self.write_plans.remove(&plan_id);
         let prompt = format!(
             "{}\n\nPress [y] to confirm, [n] to cancel.",
@@ -2991,25 +3601,59 @@ impl App {
         ));
     }
 
-    fn dispatch_confirmed_write_plan(&mut self, plan_id: WritePlanId, op_label: String) {
+    fn restore_guided_update_form(
+        &mut self,
+        title: String,
+        fields: Vec<crate::state::modal::FormField>,
+        focus: usize,
+        requested_row: usize,
+        requested_column: u32,
+    ) {
+        let action = crate::state::modal::ModalAction::Safety(
+            crate::state::modal::SafetyModalAction::DirtyRowChoice {
+                requested_row,
+                requested_column,
+            },
+        );
+        self.state.modal = Some(crate::state::modal::Modal::Form {
+            title,
+            fields,
+            focus,
+            action,
+        });
+    }
+
+    async fn dispatch_confirmed_write_plan(&mut self, plan_id: WritePlanId, op_label: String) {
         let Some(plan) = self.write_plans.remove(&plan_id) else {
             self.state
                 .set_error("Write plan is no longer available; nothing sent".to_string());
+            self.flush_deferred_guided_refresh_if_unowned().await;
             return;
         };
+        let clear_spreadsheet_marker = |app: &mut Self| {
+            if app.spreadsheet_lifecycle_plan_id() == Some(plan_id) {
+                app.spreadsheet_save_lifecycle = None;
+            }
+        };
         if self.state.schema_loading || self.state.query_loading {
+            clear_spreadsheet_marker(self);
             self.state
                 .set_error("Data is loading; write plan was not sent".to_string());
+            self.flush_deferred_guided_refresh_if_unowned().await;
             return;
         }
         let Some(table_info) = self.state.selected_table().cloned() else {
+            clear_spreadsheet_marker(self);
             self.state
                 .set_error("No table selected; write plan was not sent".to_string());
+            self.flush_deferred_guided_refresh_if_unowned().await;
             return;
         };
         let Some(data_idx) = self.active_data_row_index() else {
+            clear_spreadsheet_marker(self);
             self.state
                 .set_error("No row selected; write plan was not sent".to_string());
+            self.flush_deferred_guided_refresh_if_unowned().await;
             return;
         };
         let Some(current_raw_row) = self
@@ -3019,8 +3663,10 @@ impl App {
             .and_then(|result| result.rows.get(data_idx))
             .cloned()
         else {
+            clear_spreadsheet_marker(self);
             self.state
                 .set_error("No row selected; write plan was not sent".to_string());
+            self.flush_deferred_guided_refresh_if_unowned().await;
             return;
         };
         let snapshot = ConfirmationSnapshot {
@@ -3030,8 +3676,10 @@ impl App {
             row_locked: self.guided_write_locks.is_locked(&plan),
         };
         if let Err(outcome) = revalidate_before_dispatch(&plan, &snapshot) {
+            clear_spreadsheet_marker(self);
             self.state
                 .set_error(format_mutation_outcome_not_sent(outcome));
+            self.flush_deferred_guided_refresh_if_unowned().await;
             return;
         }
         let sql = match &plan.mutation {
@@ -3041,19 +3689,28 @@ impl App {
         let sql = match sql {
             Ok(sql) => sql,
             Err(error) => {
+                clear_spreadsheet_marker(self);
                 self.state.set_error(format!(
                     "Write plan encoding failed; nothing sent: {error:?}"
                 ));
+                self.flush_deferred_guided_refresh_if_unowned().await;
                 return;
             }
         };
         if !self.guided_write_locks.acquire(&plan) {
+            clear_spreadsheet_marker(self);
             self.state.set_error(format_mutation_outcome_not_sent(
                 MutationOutcome::DefinitelyNotSent {
                     reason: "row locked before confirmation".to_string(),
                 },
             ));
+            self.flush_deferred_guided_refresh_if_unowned().await;
             return;
+        }
+        if self.spreadsheet_save_lifecycle
+            == Some(SpreadsheetSaveLifecycle::AwaitingConfirmation(plan_id))
+        {
+            self.spreadsheet_save_lifecycle = Some(SpreadsheetSaveLifecycle::InFlight(plan_id));
         }
         self.spawn_guided_write_sql(plan.id, plan.table.database.clone(), sql, op_label);
     }
@@ -3710,6 +4367,10 @@ impl App {
                 if !self.schema_context_matches_current(&context) {
                     return;
                 }
+                let deferred_refresh_before_connect = self
+                    .deferred_guided_refresh
+                    .take()
+                    .filter(|refresh| self.deferred_refresh_matches_current(refresh));
                 self.state.schema_loading = false;
                 self.state.schema_load_failed = false;
                 self.state.tables = schema.tables.clone();
@@ -3737,6 +4398,13 @@ impl App {
                 );
                 // Establish WebSocket subscription for live data
                 self.connect_ws().await;
+                if let Some(refresh) = deferred_refresh_before_connect {
+                    if self.selected_table_matches(&refresh.table) {
+                        self.deferred_guided_refresh =
+                            Some(self.deferred_table_refresh_for(refresh.table));
+                    }
+                }
+                self.flush_deferred_guided_refresh_if_unowned().await;
             }
 
             AppEvent::SchemaError { context, error } => {
@@ -3749,6 +4417,7 @@ impl App {
                 self.state.schema_loading = false;
                 self.state.schema_load_failed = true;
                 self.state.set_error(error);
+                self.flush_deferred_guided_refresh_if_unowned().await;
             }
 
             AppEvent::QueryResult {
@@ -3773,6 +4442,7 @@ impl App {
                 });
                 self.state
                     .set_notification(format!("{row_count} rows returned"));
+                self.flush_deferred_guided_refresh_if_unowned().await;
             }
 
             AppEvent::QueryError { sql, error } => {
@@ -3785,6 +4455,7 @@ impl App {
                     error: Some(error.clone()),
                 });
                 self.state.set_error(error);
+                self.flush_deferred_guided_refresh_if_unowned().await;
             }
 
             AppEvent::TableBrowseResult { context, result } => {
@@ -3798,6 +4469,7 @@ impl App {
                 self.tables_grid = TableGridState::new();
                 self.state
                     .set_notification(format!("{row_count} rows loaded"));
+                self.flush_deferred_guided_refresh_if_unowned().await;
             }
 
             AppEvent::TableBrowseError { context, error } => {
@@ -3806,6 +4478,7 @@ impl App {
                 }
                 self.state.query_loading = false;
                 self.state.set_error(error);
+                self.flush_deferred_guided_refresh_if_unowned().await;
             }
 
             AppEvent::LogsLoaded(logs) => {
@@ -3822,7 +4495,6 @@ impl App {
             }
 
             AppEvent::WriteOpSuccess { op, response } => {
-                self.state.query_loading = false;
                 let summary = if response.is_null() {
                     op.clone()
                 } else {
@@ -3834,13 +4506,24 @@ impl App {
                 // Many writes invalidate the table-browse view, so a
                 // gentle refresh is useful — but only when the user
                 // is still looking at the Tables tab.
-                if self.state.current_tab == Tab::Tables && self.state.selected_table().is_some() {
-                    self.load_table_data().await;
+                if self.state.current_tab == Tab::Tables {
+                    let selected_target = self.state.selected_database().map(str::to_string).zip(
+                        self.state
+                            .selected_table()
+                            .map(|table| table.table_name.clone()),
+                    );
+                    if let Some((database, table)) = selected_target {
+                        self.refresh_or_defer_guided_table(QualifiedTable {
+                            database,
+                            schema: None,
+                            table,
+                        })
+                        .await;
+                    }
                 }
             }
 
             AppEvent::WriteOpError { op, error } => {
-                self.state.query_loading = false;
                 self.state.set_error(format!("{op} failed: {error}"));
             }
 
@@ -3849,8 +4532,14 @@ impl App {
                 op,
                 response,
             } => {
-                self.guided_write_locks.release(plan_id);
-                self.state.query_loading = false;
+                let Some(target) = self.guided_write_locks.release(plan_id) else {
+                    return;
+                };
+                let active_spreadsheet_plan = self.spreadsheet_lifecycle_plan_id();
+                let matching_spreadsheet = active_spreadsheet_plan == Some(plan_id);
+                if matching_spreadsheet {
+                    self.clear_spreadsheet_edit_state();
+                }
                 let summary = if response.is_null() {
                     op.clone()
                 } else {
@@ -3862,15 +4551,34 @@ impl App {
                 // Many writes invalidate the table-browse view, so a
                 // gentle refresh is useful — but only when the user
                 // is still looking at the Tables tab.
-                if self.state.current_tab == Tab::Tables && self.state.selected_table().is_some() {
-                    self.load_table_data().await;
+                if self.state.current_tab == Tab::Tables
+                    && self
+                        .state
+                        .selected_table()
+                        .is_some_and(|table| table.table_name == target.table.table)
+                    && self.state.selected_database() == Some(target.table.database.as_str())
+                {
+                    self.refresh_or_defer_guided_table(target.table).await;
                 }
+                self.flush_deferred_guided_refresh_if_unowned().await;
             }
 
             AppEvent::GuidedWriteOpError { plan_id, op, error } => {
-                self.guided_write_locks.release(plan_id);
-                self.state.query_loading = false;
+                let Some(_target) = self.guided_write_locks.release(plan_id) else {
+                    return;
+                };
+                let matching_lifecycle = self
+                    .spreadsheet_save_lifecycle
+                    .filter(|lifecycle| lifecycle.plan_id() == plan_id);
+                if let Some(lifecycle) = matching_lifecycle {
+                    if lifecycle.is_invalidated() {
+                        self.clear_spreadsheet_edit_state();
+                    } else {
+                        self.spreadsheet_save_lifecycle = None;
+                    }
+                }
                 self.state.set_error(format!("{op} failed: {error}"));
+                self.flush_deferred_guided_refresh_if_unowned().await;
             }
 
             AppEvent::LogLine(entry) => {
@@ -3886,62 +4594,6 @@ impl App {
             }
         }
     }
-}
-
-// ── PK detection helper ──────────────────────────────────────────────────────
-
-/// Pick the most likely primary-key column for a table.
-///
-/// SpacetimeDB's v9 schema JSON doesn't expose a reliable
-/// "primary key" flag, so this is a heuristic with two fallbacks:
-///   1. The first column flagged `is_autoinc` — autoinc columns are
-///      almost always the table's identity in real schemas.
-///   2. The first column whose name is `id`, `pk`, or ends in `_id`
-///      and matches the table's bare name (e.g. `user_id` for `users`).
-///   3. Column 0 — last-resort default.
-///
-/// Returns `(index, column_name)`. Used by row update / delete so the
-/// WHERE clause targets the right column instead of always assuming
-/// it's column zero.
-fn pick_primary_key(table: &crate::api::types::TableInfo) -> (usize, String) {
-    // 0. Server-declared primary key wins (populated by the v9
-    //    schema parser from the table's `primary_key: [u16, ...]`
-    //    field). Composite PKs aren't supported by the write-op
-    //    SQL builders yet — we take the first column in that case
-    //    so at least single-column lookups work.
-    if let Some(&col_id) = table.primary_key_cols.first() {
-        if let Some((i, c)) = table
-            .columns
-            .iter()
-            .enumerate()
-            .find(|(_, c)| c.col_id as u16 == col_id)
-        {
-            return (i, c.col_name.clone());
-        }
-    }
-    // 1. autoinc wins (now that `is_autoinc` is actually set by the
-    //    parser from the `sequences` array).
-    if let Some((i, c)) = table.columns.iter().enumerate().find(|(_, c)| c.is_autoinc) {
-        return (i, c.col_name.clone());
-    }
-    // 2. naming convention.
-    let lower = table.table_name.to_ascii_lowercase();
-    let stem = lower.trim_end_matches('s');
-    for (i, c) in table.columns.iter().enumerate() {
-        let n = c.col_name.to_ascii_lowercase();
-        if n == "id" || n == "pk" || n == format!("{stem}_id") {
-            return (i, c.col_name.clone());
-        }
-    }
-    // 3. fallback.
-    (
-        0,
-        table
-            .columns
-            .first()
-            .map(|c| c.col_name.clone())
-            .unwrap_or_default(),
-    )
 }
 
 // ── Session restore helpers (Faz 6) ──────────────────────────────────────────
@@ -4150,105 +4802,6 @@ fn sql_literal(raw: &str, type_tag: &str) -> String {
     format!("'{escaped}'")
 }
 
-/// Convert a raw JSON `Value` directly into a SpacetimeDB SQL literal.
-///
-/// Goes further than [`sql_literal`]: instead of flattening the value
-/// to a display string first (which corrupts `Identity` / `ConnectionId` /
-/// `U256` into garbage like `{__identity__:0xabc}`), this inspects the
-/// value's shape and emits the correct SQL form:
-///
-/// | JSON shape                           | Emits              |
-/// |--------------------------------------|--------------------|
-/// | `null`                               | `NULL`             |
-/// | `true` / `false`                     | `TRUE` / `FALSE`   |
-/// | integer / float                      | bare number        |
-/// | `"0xdead"` hex-looking string        | `0xdead`           |
-/// | regular string                       | `'…'` (escaped)    |
-/// | `{"__identity__": "0xabc"}`          | `0xabc`            |
-/// | `{"__connection_id__": "0xabc"}`     | `0xabc`            |
-/// | `{"U256": "12345"}` / `{"I128": …}`  | bare number        |
-/// | array / unknown object               | Err(…) with reason |
-///
-/// Used by the row-level write helpers (delete / update / edit-mode
-/// save) so their WHERE clauses actually match the row on the server
-/// instead of getting rejected for a bogus string literal.
-fn json_to_sql_literal(v: &serde_json::Value) -> Result<String, String> {
-    use serde_json::Value;
-    match v {
-        Value::Null => Ok("NULL".to_string()),
-        Value::Bool(true) => Ok("TRUE".to_string()),
-        Value::Bool(false) => Ok("FALSE".to_string()),
-        Value::Number(n) => Ok(n.to_string()),
-        Value::String(s) => {
-            // Accept hex-looking strings verbatim so `Identity` /
-            // `ConnectionId` values survive round-tripping without
-            // being wrapped in single quotes.
-            if let Some(hex) = s.strip_prefix("0x") {
-                if !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()) {
-                    return Ok(s.clone());
-                }
-            }
-            // Bare-hex heuristic (no `0x` prefix): some server versions
-            // serialise `Identity` / `ConnectionId` as a bare hex string
-            // like `"c2005e40a5b1..."`. Re-add the prefix so the literal
-            // is valid SpacetimeDB hex syntax.
-            //
-            // Require ≥8 chars and even length so short ambiguous
-            // strings (`"ab"`, `"cafe"`, `"deadbeef"` as a nickname)
-            // still fall through to the quoted-string branch unless
-            // they're long enough to be obviously an identity hash.
-            if s.len() >= 16 && s.len() % 2 == 0 && s.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Ok(format!("0x{s}"));
-            }
-            let escaped = s.replace('\'', "''");
-            Ok(format!("'{escaped}'"))
-        }
-        Value::Object(o) => {
-            // SpacetimeDB's JSON encoding for the scalar SATS types
-            // that need special-casing. The key tells us the wire tag.
-            if let Some(key) = o.keys().next() {
-                let inner = &o[key];
-                match key.as_str() {
-                    // Identity / ConnectionId come through in a
-                    // couple of shapes depending on the server
-                    // version: `{"__identity__": "0xabc"}`, the
-                    // tagged form `{"Identity": "0xabc"}`, or a
-                    // bare object with a single hex string value.
-                    "__identity__" | "Identity" | "__connection_id__" | "ConnectionId" => {
-                        if let Some(s) = inner.as_str() {
-                            // Ensure the leading `0x` for the literal.
-                            if s.starts_with("0x") {
-                                return Ok(s.to_string());
-                            }
-                            return Ok(format!("0x{s}"));
-                        }
-                    }
-                    // Large integer SATS types sometimes serialise
-                    // as `{"U256": "12345"}` to preserve precision.
-                    "U128" | "U256" | "I128" | "I256" => {
-                        if let Some(s) = inner.as_str() {
-                            return Ok(s.to_string());
-                        }
-                        if let Some(n) = inner.as_u64() {
-                            return Ok(n.to_string());
-                        }
-                        if let Some(n) = inner.as_i64() {
-                            return Ok(n.to_string());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Err(format!(
-                "complex value {v} has no SQL literal form — edit via the SQL console instead"
-            ))
-        }
-        Value::Array(_) => Err(format!(
-            "array value {v} has no SQL literal form — SpacetimeDB SQL doesn't support array literals"
-        )),
-    }
-}
-
 // ── Metrics Parser ────────────────────────────────────────────────────────────
 
 fn parse_prometheus_metrics(text: &str) -> crate::state::MetricsSnapshot {
@@ -4287,35 +4840,14 @@ fn parse_prometheus_metrics(text: &str) -> crate::state::MetricsSnapshot {
 
 // ── Tests for modal helpers ──────────────────────────────────────────────────
 //
-// Kept inline (rather than in a separate file) so the tests sit
-// next to the `json_to_sql_literal` / `sql_literal` / `pick_primary_key`
-// free functions they exercise. `draw_frame` follows this block on
-// purpose — it's the last item in the file and logically closes out
-// the app module, so we suppress clippy's "items after test module"
-// lint here rather than fragmenting the code with a second file.
+// Kept inline because `draw_frame` follows this block and logically closes out
+// the app module.
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod modal_helper_tests {
     use super::*;
 
     use crate::api::types::{ColumnInfo, TableInfo};
-
-    fn make_col(name: &str, autoinc: bool) -> ColumnInfo {
-        make_col_at(0, name, autoinc)
-    }
-
-    /// Build a test column with an explicit `col_id`. Needed for
-    /// the declared-PK path — `pick_primary_key` matches the PK
-    /// entry against `ColumnInfo.col_id`, so every column in a
-    /// PK-test fixture needs a distinct id.
-    fn make_col_at(col_id: u32, name: &str, autoinc: bool) -> ColumnInfo {
-        ColumnInfo {
-            col_id,
-            col_name: name.to_string(),
-            col_type: serde_json::json!("U64"),
-            is_autoinc: autoinc,
-        }
-    }
 
     fn make_table(name: &str, cols: Vec<ColumnInfo>) -> TableInfo {
         TableInfo {
@@ -4330,93 +4862,10 @@ mod modal_helper_tests {
         }
     }
 
-    /// Same as `make_table` but pre-populated with a declared
-    /// server-side primary key (the `primary_key: [col_id, ...]`
-    /// array that v9 schemas carry). Used by the "prefers declared
-    /// PK" regression test.
     fn make_table_with_pk(name: &str, cols: Vec<ColumnInfo>, pk_col_ids: Vec<u16>) -> TableInfo {
-        let mut t = make_table(name, cols);
-        t.primary_key_cols = pk_col_ids;
-        t
-    }
-
-    #[test]
-    fn pick_primary_key_prefers_declared_server_pk() {
-        // When the v9 schema carries a `primary_key: [col_id]`
-        // entry, that wins over every heuristic — including
-        // autoinc matches on a different column.
-        let t = make_table_with_pk(
-            "sessions",
-            vec![
-                make_col_at(0, "created_at", false),
-                make_col_at(1, "auto_id", true), // autoinc, but NOT the declared PK
-                make_col_at(2, "session_token", false),
-            ],
-            vec![2], // server says col_id 2 is the primary key
-        );
-        let (idx, name) = pick_primary_key(&t);
-        assert_eq!(idx, 2);
-        assert_eq!(name, "session_token");
-    }
-
-    #[test]
-    fn pick_primary_key_prefers_autoinc() {
-        let t = make_table(
-            "users",
-            vec![
-                make_col("name", false),
-                make_col("user_id", true), // autoinc — should win
-                make_col("email", false),
-            ],
-        );
-        let (idx, name) = pick_primary_key(&t);
-        assert_eq!(idx, 1);
-        assert_eq!(name, "user_id");
-    }
-
-    #[test]
-    fn pick_primary_key_falls_back_to_id_naming() {
-        let t = make_table(
-            "users",
-            vec![
-                make_col("name", false),
-                make_col("id", false), // naming convention
-                make_col("email", false),
-            ],
-        );
-        let (idx, name) = pick_primary_key(&t);
-        assert_eq!(idx, 1);
-        assert_eq!(name, "id");
-    }
-
-    #[test]
-    fn pick_primary_key_falls_back_to_user_id_for_users_table() {
-        let t = make_table(
-            "users",
-            vec![
-                make_col("name", false),
-                make_col("email", false),
-                make_col("user_id", false),
-            ],
-        );
-        let (idx, name) = pick_primary_key(&t);
-        assert_eq!(idx, 2);
-        assert_eq!(name, "user_id");
-    }
-
-    #[test]
-    fn pick_primary_key_last_resort_is_first_column() {
-        let t = make_table(
-            "logs",
-            vec![
-                make_col("timestamp", false),
-                make_col("level", false),
-                make_col("message", false),
-            ],
-        );
-        let (idx, name) = pick_primary_key(&t);
-        assert_eq!(idx, 0);
-        assert_eq!(name, "timestamp");
+        let mut table = make_table(name, cols);
+        table.primary_key_cols = pk_col_ids;
+        table
     }
 
     #[test]
@@ -4772,6 +5221,1841 @@ mod modal_helper_tests {
         }
     }
 
+    fn query_result_two_rows() -> crate::api::types::QueryResult {
+        crate::api::types::QueryResult {
+            schema: vec![
+                crate::api::types::SchemaElement {
+                    name: "id".to_string(),
+                    algebraic_type: serde_json::json!({ "AlgebraicType": { "U64": {} } }),
+                },
+                crate::api::types::SchemaElement {
+                    name: "name".to_string(),
+                    algebraic_type: serde_json::json!({ "AlgebraicType": { "String": {} } }),
+                },
+                crate::api::types::SchemaElement {
+                    name: "score".to_string(),
+                    algebraic_type: serde_json::json!({ "AlgebraicType": { "U64": {} } }),
+                },
+            ],
+            rows: vec![
+                vec![
+                    serde_json::json!(1),
+                    serde_json::json!("Ada"),
+                    serde_json::json!(5),
+                ],
+                vec![
+                    serde_json::json!(2),
+                    serde_json::json!("Bob"),
+                    serde_json::json!(6),
+                ],
+            ],
+            total_duration_micros: 10,
+        }
+    }
+
+    fn spreadsheet_app() -> App {
+        let mut app = test_app();
+        app.state.databases = vec!["db".to_string()];
+        app.state.selected_database_idx = Some(0);
+        app.state.tables = vec![make_table_with_pk(
+            "users",
+            vec![
+                typed_col_at(511, "id", "U64"),
+                typed_col_at(700, "name", "String"),
+                typed_col_at(900, "score", "U64"),
+            ],
+            vec![511],
+        )];
+        app.state.selected_table_idx = Some(0);
+        app.state.current_tab = Tab::Tables;
+        app.state.table_browse_result = Some(query_result_two_rows());
+        app.state.edit_mode = Some(crate::state::edit_mode::EditMode::new());
+        app
+    }
+
+    #[test]
+    fn spreadsheet_declared_pk_is_read_only_and_no_pk_refuses_before_editor() {
+        let mut app = spreadsheet_app();
+        app.tables_grid.selected_col = 0;
+        app.begin_cell_edit();
+        assert!(app.state.edit_mode.as_ref().unwrap().editor.is_none());
+        assert_eq!(
+            app.state
+                .notification
+                .as_ref()
+                .map(|(message, _)| message.as_str()),
+            Some("PK column is read-only in edit mode")
+        );
+
+        app.state.tables[0].primary_key_cols.clear();
+        app.tables_grid.selected_col = 1;
+        app.begin_cell_edit();
+        assert!(app.state.edit_mode.as_ref().unwrap().editor.is_none());
+        assert!(app
+            .state
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("missing declared primary key"));
+    }
+
+    #[tokio::test]
+    async fn spreadsheet_different_row_modal_choices_and_save_plan_lifecycle() {
+        let mut app = spreadsheet_app();
+        app.tables_grid.selected_row = 0;
+        app.tables_grid.selected_col = 1;
+        app.begin_cell_edit();
+        app.state
+            .edit_mode
+            .as_mut()
+            .unwrap()
+            .editor
+            .as_mut()
+            .unwrap()
+            .set("Adele".to_string());
+        app.commit_cell_edit();
+
+        app.tables_grid.selected_row = 1;
+        app.tables_grid.selected_col = 2;
+        app.begin_cell_edit();
+        let modal = app.state.modal.as_ref().expect("dirty row choice modal");
+        match modal.action() {
+            crate::state::modal::ModalAction::SpreadsheetDirtyRowChoice {
+                requested_row,
+                requested_column,
+            } => {
+                assert_eq!((*requested_row, *requested_column), (1, 900));
+            }
+            other => panic!("unexpected modal action: {other:?}"),
+        }
+
+        app.handle_spreadsheet_dirty_row_choice(crate::state::modal::DirtyRowChoice::Stay, 1, 900)
+            .await;
+        assert_eq!(app.tables_grid.selected_row, 0);
+        assert_eq!(app.state.edit_mode.as_ref().unwrap().pending_count(), 1);
+
+        app.tables_grid.selected_row = 1;
+        app.begin_cell_edit();
+        app.handle_spreadsheet_dirty_row_choice(
+            crate::state::modal::DirtyRowChoice::Discard,
+            1,
+            900,
+        )
+        .await;
+        assert_eq!(app.tables_grid.selected_row, 1);
+        assert!(app.state.edit_mode.as_ref().unwrap().editor.is_some());
+        assert_eq!(app.state.edit_mode.as_ref().unwrap().pending_count(), 0);
+
+        app.state.edit_mode.as_mut().unwrap().editor = None;
+        app.tables_grid.selected_row = 0;
+        app.tables_grid.selected_col = 1;
+        app.begin_cell_edit();
+        app.state
+            .edit_mode
+            .as_mut()
+            .unwrap()
+            .editor
+            .as_mut()
+            .unwrap()
+            .set("Ada2".to_string());
+        app.commit_cell_edit();
+        app.tables_grid.selected_col = 2;
+        app.begin_cell_edit();
+        app.state
+            .edit_mode
+            .as_mut()
+            .unwrap()
+            .editor
+            .as_mut()
+            .unwrap()
+            .set("7".to_string());
+        app.commit_cell_edit();
+        app.save_pending_edits().await;
+        let plan_id = app
+            .spreadsheet_lifecycle_plan_id()
+            .expect("spreadsheet-origin plan");
+        let plan = app.write_plans.get(&plan_id).expect("write plan stored");
+        match &plan.mutation {
+            GuidedMutation::Update { changes } => {
+                assert_eq!(
+                    changes.iter().map(|c| c.column_id).collect::<Vec<_>>(),
+                    vec![700, 900]
+                );
+            }
+            _ => panic!("expected guided update plan"),
+        }
+        assert!(
+            app.state.edit_mode.is_some(),
+            "save keeps edits until success"
+        );
+        let modal = app.state.modal.clone().unwrap();
+        app.discard_guided_state_for_modal(&modal);
+        assert!(
+            app.state.edit_mode.is_some(),
+            "cancel preserves spreadsheet edits"
+        );
+        assert!(app.spreadsheet_lifecycle_plan_id().is_none());
+
+        let plan = app
+            .write_plans
+            .get(&plan_id)
+            .cloned()
+            .unwrap_or_else(|| make_write_plan(plan_id, "db", None, "users", 1, true));
+        let _ = app.guided_write_locks.acquire(&plan);
+        app.spreadsheet_save_lifecycle = Some(SpreadsheetSaveLifecycle::InFlight(plan_id));
+        app.handle_app_event(AppEvent::GuidedWriteOpError {
+            plan_id,
+            op: "edit".to_string(),
+            error: "nope".to_string(),
+        })
+        .await;
+        assert!(app.state.edit_mode.is_some());
+        assert!(app.spreadsheet_lifecycle_plan_id().is_none());
+        let plan = app
+            .write_plans
+            .get(&plan_id)
+            .cloned()
+            .unwrap_or_else(|| make_write_plan(plan_id, "db", None, "users", 1, true));
+        let _ = app.guided_write_locks.acquire(&plan);
+        app.spreadsheet_save_lifecycle = Some(SpreadsheetSaveLifecycle::InFlight(plan_id));
+        app.handle_app_event(AppEvent::GuidedWriteOpSuccess {
+            plan_id,
+            op: "edit".to_string(),
+            response: serde_json::Value::Null,
+        })
+        .await;
+        assert!(app.state.edit_mode.is_none());
+    }
+
+    #[tokio::test]
+    async fn spreadsheet_stale_generation_creates_no_plan_and_selection_invalidation_clears_state()
+    {
+        let mut app = spreadsheet_app();
+        app.tables_grid.selected_col = 1;
+        app.begin_cell_edit();
+        app.state
+            .edit_mode
+            .as_mut()
+            .unwrap()
+            .editor
+            .as_mut()
+            .unwrap()
+            .set("Adele".to_string());
+        app.commit_cell_edit();
+        app.table_generation += 1;
+        app.save_pending_edits().await;
+        assert!(app.write_plans.is_empty());
+        assert!(app.spreadsheet_lifecycle_plan_id().is_none());
+        assert_eq!(
+            app.state.error_message.as_deref(),
+            Some("Write plan was not sent: row generation changed before save")
+        );
+
+        app.pending_spreadsheet_edit_request = Some(PendingSpreadsheetEditRequest {
+            target: app.edit_row_target_at(0).unwrap(),
+            column_index: 1,
+        });
+        app.clear_table_browse_for_selection_change();
+        assert!(app.state.table_browse_result.is_none());
+        assert!(app.state.edit_mode.is_none());
+        assert!(app.pending_spreadsheet_edit_request.is_none());
+        assert!(app.spreadsheet_lifecycle_plan_id().is_none());
+    }
+
+    #[tokio::test]
+    async fn spreadsheet_table_generation_invalidation_clears_non_inflight_spreadsheet_modal_state_only(
+    ) {
+        let mut app = spreadsheet_app();
+        app.tables_grid.selected_col = 1;
+        app.begin_cell_edit();
+        app.state
+            .edit_mode
+            .as_mut()
+            .unwrap()
+            .editor
+            .as_mut()
+            .unwrap()
+            .set("Adele".to_string());
+        app.commit_cell_edit();
+        app.save_pending_edits().await;
+        let plan_id = app
+            .spreadsheet_lifecycle_plan_id()
+            .expect("awaiting spreadsheet confirmation");
+        assert_eq!(
+            app.spreadsheet_save_lifecycle,
+            Some(SpreadsheetSaveLifecycle::AwaitingConfirmation(plan_id))
+        );
+        assert!(matches!(
+            app.state.modal.as_ref().map(crate::state::modal::Modal::action),
+            Some(crate::state::modal::ModalAction::Safety(
+                crate::state::modal::SafetyModalAction::ConfirmWritePlan { plan_id: modal_plan }
+            )) if *modal_plan == plan_id
+        ));
+
+        app.bump_table_generation();
+
+        assert!(app.state.edit_mode.is_none());
+        assert!(app.pending_spreadsheet_edit_request.is_none());
+        assert!(app.spreadsheet_save_lifecycle.is_none());
+        assert!(!app.write_plans.contains_key(&plan_id));
+        assert!(
+            app.state.modal.is_none(),
+            "stale spreadsheet confirm modal cleared"
+        );
+
+        let mut app = spreadsheet_app();
+        app.tables_grid.selected_col = 1;
+        app.begin_cell_edit();
+        app.state
+            .edit_mode
+            .as_mut()
+            .unwrap()
+            .editor
+            .as_mut()
+            .unwrap()
+            .set("Adele".to_string());
+        app.commit_cell_edit();
+        app.pending_spreadsheet_edit_request = Some(PendingSpreadsheetEditRequest {
+            target: app.edit_row_target_at(1).unwrap(),
+            column_index: 2,
+        });
+        app.state.modal = Some(crate::state::modal::Modal::confirm(
+            "Dirty row",
+            "Choose what to do",
+            crate::state::modal::ModalAction::SpreadsheetDirtyRowChoice {
+                requested_row: 1,
+                requested_column: 900,
+            },
+        ));
+
+        app.bump_table_generation();
+
+        assert!(app.state.edit_mode.is_none());
+        assert!(app.pending_spreadsheet_edit_request.is_none());
+        assert!(app.spreadsheet_save_lifecycle.is_none());
+        assert!(
+            app.state.modal.is_none(),
+            "stale spreadsheet dirty-row modal cleared"
+        );
+
+        let mut app = spreadsheet_app();
+        app.tables_grid.selected_col = 1;
+        app.begin_cell_edit();
+        app.state
+            .edit_mode
+            .as_mut()
+            .unwrap()
+            .editor
+            .as_mut()
+            .unwrap()
+            .set("Adele".to_string());
+        app.commit_cell_edit();
+        app.state.modal = Some(crate::state::modal::Modal::confirm(
+            "Unrelated",
+            "Keep me",
+            crate::state::modal::ModalAction::AddDatabaseAlias {
+                database: "db".to_string(),
+            },
+        ));
+
+        app.bump_table_generation();
+
+        assert!(matches!(
+            app.state.modal.as_ref().map(crate::state::modal::Modal::action),
+            Some(crate::state::modal::ModalAction::AddDatabaseAlias { database })
+                if database == "db"
+        ));
+    }
+
+    #[tokio::test]
+    async fn spreadsheet_inflight_table_generation_invalidation_preserves_until_matching_result() {
+        let mut app = spreadsheet_app();
+        app.tables_grid.selected_col = 1;
+        app.begin_cell_edit();
+        app.state
+            .edit_mode
+            .as_mut()
+            .unwrap()
+            .editor
+            .as_mut()
+            .unwrap()
+            .set("Adele".to_string());
+        app.commit_cell_edit();
+        app.save_pending_edits().await;
+        let plan_id = app.spreadsheet_lifecycle_plan_id().unwrap();
+        app.dispatch_confirmed_write_plan(plan_id, "edit".to_string())
+            .await;
+
+        app.bump_table_generation();
+
+        assert_eq!(
+            app.spreadsheet_save_lifecycle,
+            Some(SpreadsheetSaveLifecycle::InFlightInvalidated(plan_id))
+        );
+        assert_eq!(app.state.edit_mode.as_ref().unwrap().pending_count(), 1);
+        assert!(app
+            .guided_write_locks
+            .targets_by_plan_id
+            .contains_key(&plan_id));
+
+        app.handle_app_event(AppEvent::GuidedWriteOpError {
+            plan_id,
+            op: "edit".to_string(),
+            error: "nope".to_string(),
+        })
+        .await;
+
+        assert!(app.spreadsheet_save_lifecycle.is_none());
+        assert!(app.state.edit_mode.is_none());
+        assert!(!app
+            .guided_write_locks
+            .targets_by_plan_id
+            .contains_key(&plan_id));
+
+        let mut app = spreadsheet_app();
+        app.tables_grid.selected_col = 1;
+        app.begin_cell_edit();
+        app.state
+            .edit_mode
+            .as_mut()
+            .unwrap()
+            .editor
+            .as_mut()
+            .unwrap()
+            .set("Adele".to_string());
+        app.commit_cell_edit();
+        app.save_pending_edits().await;
+        let plan_id = app.spreadsheet_lifecycle_plan_id().unwrap();
+        app.dispatch_confirmed_write_plan(plan_id, "edit".to_string())
+            .await;
+
+        app.bump_table_generation();
+        app.handle_app_event(AppEvent::GuidedWriteOpSuccess {
+            plan_id,
+            op: "edit".to_string(),
+            response: serde_json::Value::Null,
+        })
+        .await;
+
+        assert!(app.spreadsheet_save_lifecycle.is_none());
+        assert!(app.state.edit_mode.is_none());
+        assert!(!app
+            .guided_write_locks
+            .targets_by_plan_id
+            .contains_key(&plan_id));
+    }
+
+    #[tokio::test]
+    async fn spreadsheet_stale_guided_success_does_not_refresh_or_mutate_active_spreadsheet_state()
+    {
+        let mut app = spreadsheet_app();
+        app.tables_grid.selected_row = 0;
+        app.tables_grid.selected_col = 1;
+        app.begin_cell_edit();
+        app.state
+            .edit_mode
+            .as_mut()
+            .unwrap()
+            .editor
+            .as_mut()
+            .unwrap()
+            .set("Adele".to_string());
+        app.commit_cell_edit();
+        app.save_pending_edits().await;
+        let plan_a = app.spreadsheet_lifecycle_plan_id().unwrap();
+        let mut plan_b = app
+            .write_plans
+            .get(&plan_a)
+            .expect("plan A awaiting confirmation")
+            .clone();
+        app.dispatch_confirmed_write_plan(plan_a, "edit A".to_string())
+            .await;
+        app.state.edit_mode = None;
+
+        let plan_b_id = WritePlanId(plan_a.0 + 100);
+        plan_b.id = plan_b_id;
+        plan_b.original_primary_key =
+            crate::state::safety::CompletePrimaryKey::from_schema_ordered_parts(vec![
+                crate::state::safety::PrimaryKeyPart {
+                    column_id: 511,
+                    value: crate::state::safety::SqlValue::U64(2),
+                },
+            ])
+            .expect("test primary key");
+        app.write_plans.insert(plan_b_id, plan_b.clone());
+        app.tables_grid.selected_row = 1;
+        app.tables_grid.selected_col = 1;
+        let target_b = app.edit_row_target_at(1).expect("row B target");
+        let mut edit_mode = crate::state::edit_mode::EditMode::new();
+        edit_mode
+            .set_cell(
+                target_b,
+                crate::state::edit_mode::EditCellProjection {
+                    data_row: 1,
+                    column_index: 1,
+                    original_display: "Bob".to_string(),
+                    new_display: "Bobby".to_string(),
+                },
+                crate::state::edit_mode::EditCellValues {
+                    column_id: 700,
+                    old_value: Some(crate::state::safety::SqlValue::Text("Bob".to_string())),
+                    new_value: crate::state::safety::SqlValue::Text("Bobby".to_string()),
+                },
+            )
+            .expect("seed B edit");
+        app.state.edit_mode = Some(edit_mode);
+        assert!(app.guided_write_locks.acquire(&plan_b));
+        app.spreadsheet_save_lifecycle = Some(SpreadsheetSaveLifecycle::InFlight(plan_b_id));
+        app.state.modal = Some(crate::state::modal::Modal::confirm(
+            "Confirm B",
+            "B is active",
+            crate::state::modal::ModalAction::Safety(
+                crate::state::modal::SafetyModalAction::ConfirmWritePlan { plan_id: plan_b_id },
+            ),
+        ));
+        app.state.query_loading = true;
+        app.state.notification = None;
+
+        app.handle_app_event(AppEvent::GuidedWriteOpSuccess {
+            plan_id: plan_a,
+            op: "edit A".to_string(),
+            response: serde_json::Value::Null,
+        })
+        .await;
+
+        assert_eq!(
+            app.spreadsheet_save_lifecycle,
+            Some(SpreadsheetSaveLifecycle::InFlight(plan_b_id))
+        );
+        assert_eq!(app.state.edit_mode.as_ref().unwrap().pending_count(), 1);
+        assert!(matches!(
+            app.state.modal.as_ref().map(crate::state::modal::Modal::action),
+            Some(crate::state::modal::ModalAction::Safety(
+                crate::state::modal::SafetyModalAction::ConfirmWritePlan { plan_id }
+            )) if *plan_id == plan_b_id
+        ));
+        assert!(
+            app.state.query_loading,
+            "guided success must preserve unrelated loading state"
+        );
+        assert!(
+            app.state
+                .notification
+                .as_ref()
+                .is_some_and(|(message, _)| message.contains("✓ edit A")),
+            "owned unrelated success must surface its success notification"
+        );
+        assert!(
+            app.event_rx.try_recv().is_err(),
+            "stale success must not refresh the table"
+        );
+    }
+
+    #[tokio::test]
+    async fn guided_success_defers_refresh_while_unrelated_guided_update_form_owns_current_table() {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        app.tables_grid.selected_row = 0;
+        app.tables_grid.selected_col = 1;
+        app.open_update_form();
+        let draft_b_id = app
+            .pending_update_draft
+            .as_ref()
+            .expect("guided update form draft")
+            .plan_id;
+        let draft_b_generation = app
+            .pending_update_draft
+            .as_ref()
+            .expect("guided update form draft")
+            .generations
+            .row;
+        let modal = app.state.modal.as_mut().expect("guided update form modal");
+        let crate::state::modal::Modal::Form { fields, .. } = modal else {
+            panic!("expected guided update form");
+        };
+        fields[1].input.set("Alicia".to_string());
+
+        let mut plan_a = make_write_plan(
+            WritePlanId(draft_b_id.0 + 100),
+            "db",
+            None,
+            "users",
+            2,
+            true,
+        );
+        plan_a.original_primary_key =
+            crate::state::safety::CompletePrimaryKey::from_schema_ordered_parts(vec![
+                crate::state::safety::PrimaryKeyPart {
+                    column_id: 511,
+                    value: crate::state::safety::SqlValue::U64(2),
+                },
+            ])
+            .expect("plan A primary key");
+        assert!(app.guided_write_locks.acquire(&plan_a));
+        app.state.query_loading = true;
+        app.state.notification = None;
+        let generation_before = app.table_generation;
+
+        app.handle_app_event(AppEvent::GuidedWriteOpSuccess {
+            plan_id: plan_a.id,
+            op: "edit A".to_string(),
+            response: serde_json::Value::Null,
+        })
+        .await;
+
+        assert_eq!(app.table_generation, generation_before);
+        assert_eq!(
+            app.pending_update_draft.as_ref().map(|draft| draft.plan_id),
+            Some(draft_b_id)
+        );
+        assert_eq!(
+            app.pending_update_draft
+                .as_ref()
+                .map(|draft| draft.generations.row),
+            Some(draft_b_generation)
+        );
+        let modal = app.state.modal.as_ref().expect("guided update form kept");
+        let crate::state::modal::Modal::Form { fields, .. } = modal else {
+            panic!("expected guided update form to remain open");
+        };
+        assert_eq!(fields[1].input.value, "Alicia");
+        assert!(app.write_plans.is_empty());
+        assert!(app.state.query_loading);
+        assert!(
+            app.state
+                .notification
+                .as_ref()
+                .is_some_and(|(message, _)| message.contains("✓ edit A")),
+            "owned unrelated success must surface its success notification"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_guided_refresh_runs_after_guided_update_form_cancel() {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        app.tables_grid.selected_row = 0;
+        app.tables_grid.selected_col = 1;
+        app.open_update_form();
+        let draft_b_id = app.pending_update_draft.as_ref().unwrap().plan_id;
+
+        let mut plan_a = make_write_plan(
+            WritePlanId(draft_b_id.0 + 100),
+            "db",
+            None,
+            "users",
+            2,
+            true,
+        );
+        plan_a.original_primary_key =
+            crate::state::safety::CompletePrimaryKey::from_schema_ordered_parts(vec![
+                crate::state::safety::PrimaryKeyPart {
+                    column_id: 511,
+                    value: crate::state::safety::SqlValue::U64(2),
+                },
+            ])
+            .expect("plan A primary key");
+        assert!(app.guided_write_locks.acquire(&plan_a));
+        let generation_before = app.table_generation;
+
+        app.handle_app_event(AppEvent::GuidedWriteOpSuccess {
+            plan_id: plan_a.id,
+            op: "edit A".to_string(),
+            response: serde_json::Value::Null,
+        })
+        .await;
+        assert_eq!(app.table_generation, generation_before);
+        assert_eq!(
+            app.deferred_guided_refresh
+                .as_ref()
+                .map(|refresh| &refresh.table),
+            Some(&plan_a.table)
+        );
+
+        app.handle_modal_key(KeyEvent::from(KeyCode::Esc)).await;
+
+        assert!(app.pending_update_draft.is_none());
+        assert!(app.state.modal.is_none());
+        assert!(app.deferred_guided_refresh.is_none());
+        assert_eq!(app.table_generation, generation_before + 1);
+    }
+
+    fn assert_guided_update_form_preserved(
+        app: &App,
+        expected_plan_id: WritePlanId,
+        expected_generation: u64,
+        expected_focus: usize,
+        expected_values: &[&str],
+    ) {
+        assert_eq!(
+            app.pending_update_draft.as_ref().map(|draft| draft.plan_id),
+            Some(expected_plan_id)
+        );
+        assert_eq!(
+            app.pending_update_draft
+                .as_ref()
+                .map(|draft| draft.generations.row),
+            Some(expected_generation)
+        );
+        let modal = app.state.modal.as_ref().expect("guided form still open");
+        let crate::state::modal::Modal::Form {
+            title,
+            fields,
+            focus,
+            action,
+        } = modal
+        else {
+            panic!("expected guided update form, got {modal:?}");
+        };
+        assert_eq!(title, "Update row in users");
+        assert_eq!(*focus, expected_focus);
+        assert_eq!(
+            action,
+            &crate::state::modal::ModalAction::Safety(
+                crate::state::modal::SafetyModalAction::DirtyRowChoice {
+                    requested_row: 0,
+                    requested_column: 700,
+                }
+            )
+        );
+        assert_eq!(
+            fields
+                .iter()
+                .map(|field| field.input.value.as_str())
+                .collect::<Vec<_>>(),
+            expected_values
+        );
+    }
+
+    #[tokio::test]
+    async fn guided_update_invalid_typed_input_keeps_exact_form_draft_and_deferred_refresh_until_correction(
+    ) {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        app.tables_grid.selected_row = 0;
+        app.tables_grid.selected_col = 1;
+        app.open_update_form();
+        let draft_plan = app.pending_update_draft.as_ref().unwrap().plan_id;
+        let draft_generation = app.pending_update_draft.as_ref().unwrap().generations.row;
+        let modal = app.state.modal.as_mut().expect("guided update form");
+        let crate::state::modal::Modal::Form { fields, focus, .. } = modal else {
+            panic!("expected guided form");
+        };
+        fields[1].input.set("Alicia".to_string());
+        fields[2].input.set("not-a-u64".to_string());
+        *focus = 2;
+        queue_users_refresh(&mut app);
+        let generation_before = app.table_generation;
+
+        app.handle_modal_key(KeyEvent::from(KeyCode::Enter)).await;
+
+        assert!(app.write_plans.is_empty());
+        assert_eq!(app.table_generation, generation_before);
+        assert!(!app.state.query_loading);
+        assert!(app.deferred_guided_refresh.is_some());
+        assert_guided_update_form_preserved(
+            &app,
+            draft_plan,
+            draft_generation,
+            2,
+            &["1", "Alicia", "not-a-u64"],
+        );
+        assert!(app
+            .state
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Cannot parse score"));
+
+        let modal = app.state.modal.as_mut().expect("correctable guided form");
+        let crate::state::modal::Modal::Form { fields, .. } = modal else {
+            panic!("expected guided form");
+        };
+        fields[2].input.set("7".to_string());
+        app.handle_modal_key(KeyEvent::from(KeyCode::Enter)).await;
+
+        assert!(app.pending_update_draft.is_none());
+        assert!(app.deferred_guided_refresh.is_some());
+        assert_eq!(app.table_generation, generation_before);
+        assert!(matches!(
+            app.state.modal.as_ref().map(crate::state::modal::Modal::action),
+            Some(crate::state::modal::ModalAction::Safety(
+                crate::state::modal::SafetyModalAction::ConfirmWritePlan { plan_id }
+            )) if *plan_id == draft_plan
+        ));
+        assert!(app.write_plans.contains_key(&draft_plan));
+    }
+
+    #[tokio::test]
+    async fn guided_update_empty_update_keeps_exact_form_draft_and_esc_drains_deferred_refresh_once(
+    ) {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        app.tables_grid.selected_row = 0;
+        app.tables_grid.selected_col = 1;
+        app.open_update_form();
+        let draft_plan = app.pending_update_draft.as_ref().unwrap().plan_id;
+        let draft_generation = app.pending_update_draft.as_ref().unwrap().generations.row;
+        let modal = app.state.modal.as_mut().expect("guided update form");
+        let crate::state::modal::Modal::Form { focus, .. } = modal else {
+            panic!("expected guided form");
+        };
+        *focus = 1;
+        queue_users_refresh(&mut app);
+        let generation_before = app.table_generation;
+
+        app.handle_modal_key(KeyEvent::from(KeyCode::Enter)).await;
+
+        assert!(app.write_plans.is_empty());
+        assert_eq!(app.table_generation, generation_before);
+        assert!(!app.state.query_loading);
+        assert!(app.deferred_guided_refresh.is_some());
+        assert_guided_update_form_preserved(
+            &app,
+            draft_plan,
+            draft_generation,
+            1,
+            &["1", "Ada", "5"],
+        );
+        assert!(app
+            .state
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("No changed fields"));
+
+        app.handle_modal_key(KeyEvent::from(KeyCode::Esc)).await;
+
+        assert!(app.pending_update_draft.is_none());
+        assert!(app.state.modal.is_none());
+        assert!(app.deferred_guided_refresh.is_none());
+        assert_eq!(app.table_generation, generation_before + 1);
+        assert_no_extra_table_refresh(&mut app);
+    }
+
+    #[tokio::test]
+    async fn guided_owned_form_and_confirm_modals_clear_when_generation_discards_their_private_state(
+    ) {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        app.tables_grid.selected_row = 0;
+        app.tables_grid.selected_col = 1;
+        app.open_update_form();
+        let form_plan = app.pending_update_draft.as_ref().unwrap().plan_id;
+
+        app.bump_table_generation();
+
+        assert!(app.pending_update_draft.is_none());
+        assert!(!app.write_plans.contains_key(&form_plan));
+        assert!(
+            app.state.modal.is_none(),
+            "stale guided update form cleared"
+        );
+
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        app.tables_grid.selected_row = 0;
+        app.tables_grid.selected_col = 1;
+        app.open_update_form();
+        let modal = app.state.modal.as_mut().expect("guided update form");
+        let crate::state::modal::Modal::Form { fields, .. } = modal else {
+            panic!("expected guided form");
+        };
+        fields[1].input.set("Alicia".to_string());
+        app.handle_modal_key(KeyEvent::from(KeyCode::Enter)).await;
+        let confirm_plan = match app
+            .state
+            .modal
+            .as_ref()
+            .map(crate::state::modal::Modal::action)
+        {
+            Some(crate::state::modal::ModalAction::Safety(
+                crate::state::modal::SafetyModalAction::ConfirmWritePlan { plan_id },
+            )) => *plan_id,
+            other => panic!("expected guided confirm, got {other:?}"),
+        };
+
+        app.bump_schema_generation();
+
+        assert!(app.pending_update_draft.is_none());
+        assert!(!app.write_plans.contains_key(&confirm_plan));
+        assert!(app.state.modal.is_none(), "stale guided confirm cleared");
+
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        app.tables_grid.selected_row = 0;
+        app.tables_grid.selected_col = 1;
+        app.open_update_form();
+        app.state.modal = Some(crate::state::modal::Modal::form(
+            "Unrelated alias",
+            vec![crate::state::modal::FormField::new("New alias")],
+            crate::state::modal::ModalAction::AddDatabaseAlias {
+                database: "db".to_string(),
+            },
+        ));
+
+        app.bump_server_context_generation();
+
+        assert!(app.pending_update_draft.is_none());
+        assert!(matches!(
+            app.state.modal.as_ref().map(crate::state::modal::Modal::action),
+            Some(crate::state::modal::ModalAction::AddDatabaseAlias { database }) if database == "db"
+        ));
+    }
+
+    fn selected_users_table() -> QualifiedTable {
+        QualifiedTable {
+            database: "db".to_string(),
+            schema: None,
+            table: "users".to_string(),
+        }
+    }
+
+    fn queue_users_refresh(app: &mut App) {
+        app.deferred_guided_refresh = Some(app.deferred_table_refresh_for(selected_users_table()));
+    }
+
+    fn assert_no_extra_table_refresh(app: &mut App) {
+        assert!(
+            app.event_rx.try_recv().is_err(),
+            "deferred refresh should drain exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_guided_refresh_drains_once_after_sql_query_result_owner_clears() {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        app.state.query_loading = true;
+        queue_users_refresh(&mut app);
+        let generation_before = app.table_generation;
+
+        app.handle_app_event(AppEvent::QueryResult {
+            result: query_result("sql"),
+            duration: Duration::from_millis(3),
+            sql: "SELECT 1".to_string(),
+        })
+        .await;
+
+        assert!(app.deferred_guided_refresh.is_none());
+        assert!(
+            app.state.query_loading,
+            "drained refresh starts a new table read after SQL completes"
+        );
+        assert_eq!(app.table_generation, generation_before + 1);
+        assert_no_extra_table_refresh(&mut app);
+
+        app.handle_app_event(AppEvent::QueryResult {
+            result: query_result("duplicate"),
+            duration: Duration::from_millis(1),
+            sql: "SELECT 2".to_string(),
+        })
+        .await;
+
+        assert_eq!(app.table_generation, generation_before + 1);
+    }
+
+    #[tokio::test]
+    async fn deferred_guided_refresh_drains_once_after_sql_query_error_owner_clears() {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        app.state.query_loading = true;
+        queue_users_refresh(&mut app);
+        let generation_before = app.table_generation;
+
+        app.handle_app_event(AppEvent::QueryError {
+            sql: "SELECT bad".to_string(),
+            error: "boom".to_string(),
+        })
+        .await;
+
+        assert!(app.deferred_guided_refresh.is_none());
+        assert!(
+            app.state.query_loading,
+            "drained refresh starts a new table read after SQL error completes"
+        );
+        assert_eq!(app.table_generation, generation_before + 1);
+        assert_no_extra_table_refresh(&mut app);
+
+        app.handle_app_event(AppEvent::QueryError {
+            sql: "SELECT bad again".to_string(),
+            error: "boom again".to_string(),
+        })
+        .await;
+
+        assert_eq!(app.table_generation, generation_before + 1);
+    }
+
+    #[tokio::test]
+    async fn deferred_guided_refresh_drains_after_matching_schema_loaded_owner_clears_and_accepts_terminal(
+    ) {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        app.state.schema_loading = true;
+        queue_users_refresh(&mut app);
+        let generation_before = app.table_generation;
+        let context = app.current_schema_request_context("db".to_string());
+
+        app.handle_app_event(AppEvent::SchemaLoaded {
+            context,
+            schema: schema_with_table("users"),
+        })
+        .await;
+
+        assert!(app.deferred_guided_refresh.is_none());
+        assert!(
+            app.state.query_loading,
+            "drained refresh starts after matching schema load completes"
+        );
+        assert!(!app.state.schema_loading);
+        assert_eq!(app.table_generation, generation_before + 1);
+        let browse_context =
+            app.current_table_browse_request_context("db".to_string(), "users".to_string());
+
+        app.handle_app_event(AppEvent::TableBrowseResult {
+            context: browse_context,
+            result: query_result("fresh"),
+        })
+        .await;
+
+        assert_eq!(
+            app.state
+                .table_browse_result
+                .as_ref()
+                .and_then(|result| result.rows.first())
+                .and_then(|row| row.get(1)),
+            Some(&serde_json::json!("fresh"))
+        );
+        assert!(!app.state.query_loading);
+        assert!(app.deferred_guided_refresh.is_none());
+        assert_eq!(app.table_generation, generation_before + 1);
+
+        app.handle_app_event(AppEvent::SchemaLoaded {
+            context: app.current_schema_request_context("db".to_string()),
+            schema: schema_with_table("users"),
+        })
+        .await;
+
+        assert_eq!(app.table_generation, generation_before + 1);
+    }
+
+    #[tokio::test]
+    async fn deferred_guided_refresh_schema_loaded_rebases_matching_intent_and_accepts_error_terminal(
+    ) {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        app.state.schema_loading = true;
+        queue_users_refresh(&mut app);
+        let generation_before = app.table_generation;
+        let context = app.current_schema_request_context("db".to_string());
+
+        app.handle_app_event(AppEvent::SchemaLoaded {
+            context,
+            schema: schema_with_table("users"),
+        })
+        .await;
+
+        let browse_context =
+            app.current_table_browse_request_context("db".to_string(), "users".to_string());
+        app.handle_app_event(AppEvent::TableBrowseError {
+            context: browse_context,
+            error: "terminal boom".to_string(),
+        })
+        .await;
+
+        assert_eq!(app.state.error_message.as_deref(), Some("terminal boom"));
+        assert!(!app.state.query_loading);
+        assert!(app.deferred_guided_refresh.is_none());
+        assert_eq!(app.table_generation, generation_before + 1);
+    }
+
+    #[tokio::test]
+    async fn deferred_guided_refresh_schema_loaded_drops_stale_intent_instead_of_rebasing() {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        app.state.schema_loading = true;
+        queue_users_refresh(&mut app);
+        app.deferred_guided_refresh
+            .as_mut()
+            .expect("queued refresh")
+            .server_context_generation = app.server_context_generation.saturating_add(1);
+        let generation_before = app.table_generation;
+        let context = app.current_schema_request_context("db".to_string());
+
+        app.handle_app_event(AppEvent::SchemaLoaded {
+            context,
+            schema: schema_with_table("users"),
+        })
+        .await;
+
+        assert!(app.deferred_guided_refresh.is_none());
+        assert!(!app.state.query_loading);
+        assert_eq!(app.table_generation, generation_before);
+
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        app.state.schema_loading = true;
+        queue_users_refresh(&mut app);
+        app.state.selected_table_idx = Some(1);
+        let mut posts = schema_with_table("posts").tables.remove(0);
+        posts.table_name = "posts".to_string();
+        app.state.tables.push(posts);
+        let generation_before = app.table_generation;
+        let context = app.current_schema_request_context("db".to_string());
+
+        app.handle_app_event(AppEvent::SchemaLoaded {
+            context,
+            schema: schema_with_table("users"),
+        })
+        .await;
+
+        assert!(app.deferred_guided_refresh.is_none());
+        assert!(!app.state.query_loading);
+        assert_eq!(app.table_generation, generation_before);
+    }
+
+    #[tokio::test]
+    async fn deferred_guided_refresh_drains_after_matching_schema_error_owner_clears() {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        app.state.schema_loading = true;
+        queue_users_refresh(&mut app);
+        let generation_before = app.table_generation;
+        let context = app.current_schema_request_context("db".to_string());
+
+        app.handle_app_event(AppEvent::SchemaError {
+            context,
+            error: "schema boom".to_string(),
+        })
+        .await;
+
+        assert!(app.deferred_guided_refresh.is_none());
+        assert!(
+            app.state.query_loading,
+            "drained refresh starts after matching schema error completes"
+        );
+        assert!(!app.state.schema_loading);
+        assert!(app.state.schema_load_failed);
+        assert_eq!(app.table_generation, generation_before + 1);
+        assert_no_extra_table_refresh(&mut app);
+    }
+
+    #[tokio::test]
+    async fn deferred_guided_refresh_generic_write_result_does_not_clear_unrelated_sql_owner() {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        app.state.query_loading = true;
+        queue_users_refresh(&mut app);
+        let generation_before = app.table_generation;
+
+        app.handle_app_event(AppEvent::WriteOpSuccess {
+            op: "generic write".to_string(),
+            response: serde_json::Value::Null,
+        })
+        .await;
+
+        assert!(app.state.query_loading);
+        assert!(app.deferred_guided_refresh.is_some());
+        assert_eq!(app.table_generation, generation_before);
+        assert_no_extra_table_refresh(&mut app);
+
+        app.handle_app_event(AppEvent::WriteOpError {
+            op: "generic write".to_string(),
+            error: "boom".to_string(),
+        })
+        .await;
+
+        assert!(app.state.query_loading);
+        assert!(app.deferred_guided_refresh.is_some());
+        assert_eq!(app.table_generation, generation_before);
+        assert_no_extra_table_refresh(&mut app);
+    }
+
+    #[tokio::test]
+    async fn deferred_guided_refresh_generic_write_success_defers_for_active_read_and_drains_once()
+    {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        let read_context =
+            app.current_table_browse_request_context("db".to_string(), "users".to_string());
+        app.state.query_loading = true;
+        let generation_before = app.table_generation;
+
+        app.handle_app_event(AppEvent::WriteOpSuccess {
+            op: "generic write".to_string(),
+            response: serde_json::Value::Null,
+        })
+        .await;
+
+        assert!(app.state.query_loading, "existing read owner is preserved");
+        assert!(app.deferred_guided_refresh.is_some());
+        assert_eq!(app.table_generation, generation_before);
+
+        app.handle_app_event(AppEvent::TableBrowseResult {
+            context: read_context,
+            result: query_result("old read"),
+        })
+        .await;
+
+        assert!(
+            app.state.query_loading,
+            "deferred refresh starts after read owner clears"
+        );
+        assert!(app.deferred_guided_refresh.is_none());
+        assert_eq!(app.table_generation, generation_before + 1);
+        let refresh_context =
+            app.current_table_browse_request_context("db".to_string(), "users".to_string());
+
+        app.handle_app_event(AppEvent::TableBrowseResult {
+            context: refresh_context,
+            result: query_result("fresh"),
+        })
+        .await;
+
+        assert!(!app.state.query_loading);
+        assert_eq!(app.table_generation, generation_before + 1);
+        assert!(app.deferred_guided_refresh.is_none());
+    }
+
+    #[tokio::test]
+    async fn deferred_guided_refresh_generic_write_success_defers_for_guided_spreadsheet_and_form_owners(
+    ) {
+        let mut app = spreadsheet_app();
+        let generation_before = app.table_generation;
+        app.handle_app_event(AppEvent::WriteOpSuccess {
+            op: "generic write".to_string(),
+            response: serde_json::Value::Null,
+        })
+        .await;
+        assert!(app.deferred_guided_refresh.is_some());
+        assert_eq!(app.table_generation, generation_before);
+        assert!(
+            app.state.edit_mode.is_some(),
+            "spreadsheet input is preserved"
+        );
+
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        app.tables_grid.selected_row = 0;
+        app.tables_grid.selected_col = 1;
+        app.open_update_form();
+        let generation_before = app.table_generation;
+        app.handle_app_event(AppEvent::WriteOpSuccess {
+            op: "generic write".to_string(),
+            response: serde_json::Value::Null,
+        })
+        .await;
+        assert!(app.deferred_guided_refresh.is_some());
+        assert_eq!(app.table_generation, generation_before);
+        assert!(
+            app.pending_update_draft.is_some(),
+            "guided form input is preserved"
+        );
+
+        app.handle_app_event(AppEvent::WriteOpError {
+            op: "generic write".to_string(),
+            error: "boom".to_string(),
+        })
+        .await;
+        assert!(app.deferred_guided_refresh.is_some());
+        assert_eq!(app.table_generation, generation_before);
+    }
+
+    #[tokio::test]
+    async fn deferred_guided_refresh_generic_write_error_without_queue_creates_no_refresh() {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        app.state.query_loading = true;
+        let generation_before = app.table_generation;
+
+        app.handle_app_event(AppEvent::WriteOpError {
+            op: "generic write".to_string(),
+            error: "boom".to_string(),
+        })
+        .await;
+
+        assert!(app.deferred_guided_refresh.is_none());
+        assert!(app.state.query_loading);
+        assert_eq!(app.table_generation, generation_before);
+    }
+
+    #[tokio::test]
+    async fn deferred_guided_refresh_drains_after_clean_spreadsheet_edit_exit() {
+        let mut app = spreadsheet_app();
+        queue_users_refresh(&mut app);
+        let generation_before = app.table_generation;
+
+        app.exit_edit_mode().await;
+
+        assert!(app.state.edit_mode.is_none());
+        assert!(app.deferred_guided_refresh.is_none());
+        assert_eq!(app.table_generation, generation_before + 1);
+    }
+
+    #[tokio::test]
+    async fn deferred_guided_refresh_drains_after_spreadsheet_discard_terminal_path() {
+        let mut app = spreadsheet_app();
+        app.tables_grid.selected_col = 1;
+        app.begin_cell_edit();
+        app.state
+            .edit_mode
+            .as_mut()
+            .unwrap()
+            .editor
+            .as_mut()
+            .unwrap()
+            .set("Adele".to_string());
+        app.commit_cell_edit();
+        queue_users_refresh(&mut app);
+        let generation_before = app.table_generation;
+
+        app.exit_edit_mode().await;
+        assert!(matches!(
+            app.state
+                .modal
+                .as_ref()
+                .map(crate::state::modal::Modal::action),
+            Some(crate::state::modal::ModalAction::DiscardPendingEdits)
+        ));
+        app.handle_modal_key(KeyEvent::from(KeyCode::Enter)).await;
+
+        assert!(app.state.edit_mode.is_none());
+        assert!(app.deferred_guided_refresh.is_none());
+        assert_eq!(app.table_generation, generation_before + 1);
+    }
+
+    #[tokio::test]
+    async fn deferred_guided_refresh_drains_after_guided_confirmation_local_not_sent() {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        app.tables_grid.selected_row = 0;
+        app.tables_grid.selected_col = 1;
+        app.open_update_form();
+        let modal = app.state.modal.as_mut().expect("guided update form modal");
+        let crate::state::modal::Modal::Form { fields, .. } = modal else {
+            panic!("expected guided update form");
+        };
+        fields[1].input.set("Alicia".to_string());
+        app.handle_modal_key(KeyEvent::from(KeyCode::Enter)).await;
+        let plan_id = match app
+            .state
+            .modal
+            .as_ref()
+            .map(crate::state::modal::Modal::action)
+        {
+            Some(crate::state::modal::ModalAction::Safety(
+                crate::state::modal::SafetyModalAction::ConfirmWritePlan { plan_id },
+            )) => *plan_id,
+            other => panic!("expected confirmation modal, got {other:?}"),
+        };
+        app.state
+            .table_browse_result
+            .as_mut()
+            .expect("table result")
+            .rows[0][1] = serde_json::json!("Adrienne");
+        queue_users_refresh(&mut app);
+        let generation_before = app.table_generation;
+
+        app.dispatch_confirmed_write_plan(plan_id, "guided update".to_string())
+            .await;
+
+        assert!(app.deferred_guided_refresh.is_none());
+        assert_eq!(app.table_generation, generation_before + 1);
+    }
+
+    #[tokio::test]
+    async fn deferred_guided_refresh_waits_for_generic_current_table_guided_lock_then_drains_once()
+    {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        app.tables_grid.selected_row = 0;
+        app.tables_grid.selected_col = 1;
+        app.open_update_form();
+        let modal = app.state.modal.as_mut().expect("guided update form modal");
+        let crate::state::modal::Modal::Form { fields, .. } = modal else {
+            panic!("expected guided update form");
+        };
+        fields[1].input.set("Alicia".to_string());
+        app.handle_modal_key(KeyEvent::from(KeyCode::Enter)).await;
+        let plan_id = match app
+            .state
+            .modal
+            .as_ref()
+            .map(crate::state::modal::Modal::action)
+        {
+            Some(crate::state::modal::ModalAction::Safety(
+                crate::state::modal::SafetyModalAction::ConfirmWritePlan { plan_id },
+            )) => *plan_id,
+            other => panic!("expected confirmation modal, got {other:?}"),
+        };
+        app.state.modal = None;
+        app.pending_update_draft = None;
+        app.dispatch_confirmed_write_plan(plan_id, "guided update".to_string())
+            .await;
+        assert_eq!(app.guided_write_locks.targets_by_plan_id.len(), 1);
+        assert!(app.pending_update_draft.is_none());
+        assert!(app.pending_spreadsheet_edit_request.is_none());
+        assert!(app.spreadsheet_save_lifecycle.is_none());
+        assert!(app.state.modal.is_none());
+        queue_users_refresh(&mut app);
+        let generation_before = app.table_generation;
+
+        app.flush_deferred_guided_refresh_if_unowned().await;
+
+        assert_eq!(app.guided_write_locks.targets_by_plan_id.len(), 1);
+        assert!(app.deferred_guided_refresh.is_some());
+        assert_eq!(app.table_generation, generation_before);
+        assert!(
+            !app.state.query_loading,
+            "existing loading owner must not be clobbered while guided lock owns the row"
+        );
+
+        app.handle_app_event(AppEvent::GuidedWriteOpSuccess {
+            plan_id,
+            op: "guided update".to_string(),
+            response: serde_json::Value::Null,
+        })
+        .await;
+
+        assert!(app.guided_write_locks.targets_by_plan_id.is_empty());
+        assert!(app.deferred_guided_refresh.is_none());
+        assert!(app.state.query_loading);
+        assert_eq!(app.table_generation, generation_before + 1);
+        let generation_after_drain = app.table_generation;
+
+        app.handle_app_event(AppEvent::GuidedWriteOpSuccess {
+            plan_id,
+            op: "duplicate guided update".to_string(),
+            response: serde_json::Value::Null,
+        })
+        .await;
+
+        assert_eq!(app.table_generation, generation_after_drain);
+    }
+
+    #[tokio::test]
+    async fn deferred_guided_refresh_waits_for_existing_table_read_owner_then_drains() {
+        let mut app = spreadsheet_app();
+        let existing_context =
+            app.current_table_browse_request_context("db".to_string(), "users".to_string());
+        app.state.edit_mode = None;
+        app.state.query_loading = true;
+        queue_users_refresh(&mut app);
+        let generation_before = app.table_generation;
+
+        app.flush_deferred_guided_refresh_if_unowned().await;
+
+        assert!(
+            app.state.query_loading,
+            "existing read owner must not be clobbered"
+        );
+        assert!(app.deferred_guided_refresh.is_some());
+        assert_eq!(app.table_generation, generation_before);
+
+        app.handle_app_event(AppEvent::TableBrowseResult {
+            context: existing_context,
+            result: query_result("fresh"),
+        })
+        .await;
+
+        assert!(
+            app.state.query_loading,
+            "drained refresh starts after matching read completes"
+        );
+        assert!(app.deferred_guided_refresh.is_none());
+        assert_eq!(app.table_generation, generation_before + 1);
+    }
+
+    #[tokio::test]
+    async fn deferred_guided_refresh_is_dropped_by_generation_invalidations() {
+        let mut app = spreadsheet_app();
+        queue_users_refresh(&mut app);
+        app.bump_table_generation();
+        app.flush_deferred_guided_refresh_if_unowned().await;
+        assert!(app.deferred_guided_refresh.is_none());
+
+        let mut app = spreadsheet_app();
+        queue_users_refresh(&mut app);
+        app.bump_schema_generation();
+        app.flush_deferred_guided_refresh_if_unowned().await;
+        assert!(app.deferred_guided_refresh.is_none());
+
+        let mut app = spreadsheet_app();
+        queue_users_refresh(&mut app);
+        app.bump_database_generation();
+        app.flush_deferred_guided_refresh_if_unowned().await;
+        assert!(app.deferred_guided_refresh.is_none());
+
+        let mut app = spreadsheet_app();
+        queue_users_refresh(&mut app);
+        app.bump_server_context_generation();
+        app.flush_deferred_guided_refresh_if_unowned().await;
+        assert!(app.deferred_guided_refresh.is_none());
+    }
+
+    #[tokio::test]
+    async fn deferred_guided_refresh_is_dropped_after_away_and_back_navigation_to_same_named_table()
+    {
+        let mut app = test_app();
+        app.state.databases = vec!["db".to_string(), "other".to_string()];
+        app.state.selected_database_idx = Some(0);
+        app.state.tables = schema_with_table("users").tables;
+        app.state.selected_table_idx = Some(0);
+        app.state.current_tab = Tab::Tables;
+        queue_users_refresh(&mut app);
+
+        app.state.sidebar_focus = SidebarFocus::Databases;
+        app.nav_down().await;
+        app.state.tables = schema_with_table("users").tables;
+        app.state.selected_table_idx = Some(0);
+        app.nav_up().await;
+        app.state.tables = schema_with_table("users").tables;
+        app.state.selected_table_idx = Some(0);
+        let generation_before_flush = app.table_generation;
+        app.flush_deferred_guided_refresh_if_unowned().await;
+
+        assert!(app.deferred_guided_refresh.is_none());
+        assert_eq!(app.table_generation, generation_before_flush);
+    }
+
+    #[tokio::test]
+    async fn spreadsheet_server_context_invalidation_clears_non_inflight_and_invalidated_error_clears_inflight(
+    ) {
+        let mut app = spreadsheet_app();
+        app.tables_grid.selected_col = 1;
+        app.begin_cell_edit();
+        app.state
+            .edit_mode
+            .as_mut()
+            .unwrap()
+            .editor
+            .as_mut()
+            .unwrap()
+            .set("Adele".to_string());
+        app.commit_cell_edit();
+        app.save_pending_edits().await;
+        let awaiting_plan = app.spreadsheet_lifecycle_plan_id().unwrap();
+        app.bump_server_context_generation();
+        assert!(app.state.edit_mode.is_none());
+        assert!(app.pending_spreadsheet_edit_request.is_none());
+        assert!(app.spreadsheet_save_lifecycle.is_none());
+        assert!(!app.write_plans.contains_key(&awaiting_plan));
+
+        let mut app = spreadsheet_app();
+        app.tables_grid.selected_col = 1;
+        app.begin_cell_edit();
+        app.state
+            .edit_mode
+            .as_mut()
+            .unwrap()
+            .editor
+            .as_mut()
+            .unwrap()
+            .set("Adele".to_string());
+        app.commit_cell_edit();
+        app.save_pending_edits().await;
+        let plan_id = app.spreadsheet_lifecycle_plan_id().unwrap();
+        app.dispatch_confirmed_write_plan(plan_id, "edit".to_string())
+            .await;
+        app.bump_server_context_generation();
+        assert_eq!(app.state.edit_mode.as_ref().unwrap().pending_count(), 1);
+        assert!(
+            app.spreadsheet_save_lifecycle.is_some(),
+            "invalidated in-flight state remains correlated until result"
+        );
+        app.handle_app_event(AppEvent::GuidedWriteOpError {
+            plan_id,
+            op: "edit".to_string(),
+            error: "stale".to_string(),
+        })
+        .await;
+        assert!(app.spreadsheet_save_lifecycle.is_none());
+        assert!(
+            app.state.edit_mode.is_none(),
+            "invalidated matching error clears stale edits"
+        );
+    }
+
+    #[tokio::test]
+    async fn spreadsheet_discard_pending_edits_modal_is_cleared_on_table_invalidation() {
+        let mut app = spreadsheet_app();
+        app.tables_grid.selected_col = 1;
+        app.begin_cell_edit();
+        app.state
+            .edit_mode
+            .as_mut()
+            .unwrap()
+            .editor
+            .as_mut()
+            .unwrap()
+            .set("Adele".to_string());
+        app.commit_cell_edit();
+        app.exit_edit_mode().await;
+        assert!(matches!(
+            app.state
+                .modal
+                .as_ref()
+                .map(crate::state::modal::Modal::action),
+            Some(crate::state::modal::ModalAction::DiscardPendingEdits)
+        ));
+        app.bump_table_generation();
+        assert!(app.state.edit_mode.is_none());
+        assert!(
+            app.state.modal.is_none(),
+            "discard-pending-edits modal is spreadsheet-owned"
+        );
+    }
+
+    #[tokio::test]
+    async fn spreadsheet_stale_dirty_row_choice_does_not_discard_or_start_requested_editor() {
+        let mut app = spreadsheet_app();
+        app.tables_grid.selected_col = 1;
+        app.begin_cell_edit();
+        app.state
+            .edit_mode
+            .as_mut()
+            .unwrap()
+            .editor
+            .as_mut()
+            .unwrap()
+            .set("Adele".to_string());
+        app.commit_cell_edit();
+        let pending_before = app.state.edit_mode.as_ref().unwrap().pending_count();
+        app.pending_spreadsheet_edit_request = Some(PendingSpreadsheetEditRequest {
+            target: app.edit_row_target_at(1).unwrap(),
+            column_index: 2,
+        });
+
+        app.handle_spreadsheet_dirty_row_choice(
+            crate::state::modal::DirtyRowChoice::Discard,
+            1,
+            700,
+        )
+        .await;
+
+        assert_eq!(
+            app.state.edit_mode.as_ref().unwrap().pending_count(),
+            pending_before
+        );
+        assert!(app.state.edit_mode.as_ref().unwrap().editor.is_none());
+        assert!(app.pending_spreadsheet_edit_request.is_none());
+        assert_eq!(app.tables_grid.selected_row, 0);
+        assert_eq!(
+            app.state.error_message.as_deref(),
+            Some("Spreadsheet dirty-row choice no longer matches the pending edit")
+        );
+    }
+
+    #[tokio::test]
+    async fn spreadsheet_save_choice_consumes_pending_request_and_cancel_preserves_edits() {
+        let mut app = spreadsheet_app();
+        app.tables_grid.selected_col = 1;
+        app.begin_cell_edit();
+        app.state
+            .edit_mode
+            .as_mut()
+            .unwrap()
+            .editor
+            .as_mut()
+            .unwrap()
+            .set("Adele".to_string());
+        app.commit_cell_edit();
+        app.pending_spreadsheet_edit_request = Some(PendingSpreadsheetEditRequest {
+            target: app.edit_row_target_at(1).unwrap(),
+            column_index: 2,
+        });
+
+        app.handle_spreadsheet_dirty_row_choice(crate::state::modal::DirtyRowChoice::Save, 1, 900)
+            .await;
+
+        assert!(app.pending_spreadsheet_edit_request.is_none());
+        assert!(app.spreadsheet_lifecycle_plan_id().is_some());
+        assert_eq!(app.state.edit_mode.as_ref().unwrap().pending_count(), 1);
+        let modal = app.state.modal.clone().unwrap();
+        app.discard_guided_state_for_modal(&modal);
+        assert!(app.pending_spreadsheet_edit_request.is_none());
+        assert!(app.spreadsheet_lifecycle_plan_id().is_none());
+        assert_eq!(app.state.edit_mode.as_ref().unwrap().pending_count(), 1);
+    }
+
+    #[test]
+    fn spreadsheet_parse_error_preserves_open_editor_and_canonical_edits() {
+        let mut app = spreadsheet_app();
+        app.tables_grid.selected_col = 2;
+        app.begin_cell_edit();
+        app.state
+            .edit_mode
+            .as_mut()
+            .unwrap()
+            .editor
+            .as_mut()
+            .unwrap()
+            .set("not-a-u64".to_string());
+
+        app.commit_cell_edit();
+
+        let edit_mode = app.state.edit_mode.as_ref().unwrap();
+        assert_eq!(edit_mode.pending_count(), 0);
+        assert_eq!(
+            edit_mode
+                .editor
+                .as_ref()
+                .map(|editor| editor.value.as_str()),
+            Some("not-a-u64")
+        );
+        assert!(app
+            .state
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Cannot parse score"));
+    }
+
+    #[tokio::test]
+    async fn spreadsheet_set_cell_generation_error_preserves_typed_editor_and_canonical_edits() {
+        let mut app = spreadsheet_app();
+        app.tables_grid.selected_col = 1;
+        app.begin_cell_edit();
+        app.state
+            .edit_mode
+            .as_mut()
+            .unwrap()
+            .editor
+            .as_mut()
+            .unwrap()
+            .set("Adele".to_string());
+        app.commit_cell_edit();
+        assert_eq!(app.state.edit_mode.as_ref().unwrap().pending_count(), 1);
+        let canonical_before = app
+            .state
+            .edit_mode
+            .as_ref()
+            .unwrap()
+            .spreadsheet_edits()
+            .pending_single_row_save()
+            .expect("canonical dirty row before generation change");
+
+        app.tables_grid.selected_col = 2;
+        app.begin_cell_edit();
+        app.state
+            .edit_mode
+            .as_mut()
+            .unwrap()
+            .editor
+            .as_mut()
+            .unwrap()
+            .set("9".to_string());
+        app.table_generation += 1;
+
+        app.commit_cell_edit();
+
+        let edit_mode = app.state.edit_mode.as_ref().unwrap();
+        assert_eq!(
+            edit_mode
+                .editor
+                .as_ref()
+                .map(|editor| editor.value.as_str()),
+            Some("9")
+        );
+        assert_eq!(edit_mode.pending_count(), 1);
+        assert_eq!(
+            edit_mode.spreadsheet_edits().pending_single_row_save(),
+            Some(canonical_before)
+        );
+        assert!(app.write_plans.is_empty());
+        assert!(app.spreadsheet_lifecycle_plan_id().is_none());
+        assert!(app.event_rx.try_recv().is_err());
+        assert_eq!(
+            app.state.error_message.as_deref(),
+            Some("Write plan was not sent: row generation changed before edit")
+        );
+    }
+
+    #[tokio::test]
+    async fn spreadsheet_confirm_local_failure_clears_marker_removes_plan_and_preserves_edits() {
+        let mut app = spreadsheet_app();
+        app.tables_grid.selected_col = 1;
+        app.begin_cell_edit();
+        app.state
+            .edit_mode
+            .as_mut()
+            .unwrap()
+            .editor
+            .as_mut()
+            .unwrap()
+            .set("Adele".to_string());
+        app.commit_cell_edit();
+        app.save_pending_edits().await;
+        let plan_id = app.spreadsheet_lifecycle_plan_id().unwrap();
+        assert!(app.write_plans.contains_key(&plan_id));
+
+        app.state.query_loading = true;
+        app.dispatch_confirmed_write_plan(plan_id, "edit".to_string())
+            .await;
+
+        assert!(!app.write_plans.contains_key(&plan_id));
+        assert!(app.spreadsheet_lifecycle_plan_id().is_none());
+        assert_eq!(app.state.edit_mode.as_ref().unwrap().pending_count(), 1);
+        assert_eq!(
+            app.state.error_message.as_deref(),
+            Some("Data is loading; write plan was not sent")
+        );
+        assert!(
+            app.event_rx.try_recv().is_err(),
+            "no dispatch event should be emitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn spreadsheet_in_flight_freezes_edit_revert_exit_and_duplicate_save_until_result() {
+        let mut app = spreadsheet_app();
+        app.tables_grid.selected_col = 1;
+        app.begin_cell_edit();
+        app.state
+            .edit_mode
+            .as_mut()
+            .unwrap()
+            .editor
+            .as_mut()
+            .unwrap()
+            .set("Adele".to_string());
+        app.commit_cell_edit();
+        app.save_pending_edits().await;
+        let plan_id = app.spreadsheet_lifecycle_plan_id().unwrap();
+        app.dispatch_confirmed_write_plan(plan_id, "edit".to_string())
+            .await;
+        assert_eq!(
+            app.spreadsheet_save_lifecycle,
+            Some(SpreadsheetSaveLifecycle::InFlight(plan_id))
+        );
+        assert_eq!(app.state.edit_mode.as_ref().unwrap().pending_count(), 1);
+
+        app.begin_cell_edit();
+        assert!(app.state.edit_mode.as_ref().unwrap().editor.is_none());
+        app.revert_active_cell();
+        app.exit_edit_mode().await;
+        app.save_pending_edits().await;
+
+        assert_eq!(
+            app.spreadsheet_save_lifecycle,
+            Some(SpreadsheetSaveLifecycle::InFlight(plan_id))
+        );
+        assert_eq!(app.state.edit_mode.as_ref().unwrap().pending_count(), 1);
+        assert!(app
+            .guided_write_locks
+            .targets_by_plan_id
+            .contains_key(&plan_id));
+
+        app.handle_app_event(AppEvent::GuidedWriteOpError {
+            plan_id,
+            op: "edit".to_string(),
+            error: "nope".to_string(),
+        })
+        .await;
+        assert!(app.spreadsheet_save_lifecycle.is_none());
+        assert_eq!(app.state.edit_mode.as_ref().unwrap().pending_count(), 1);
+    }
+
     #[tokio::test]
     async fn app_ignores_matching_database_but_stale_schema_generation_schema_events() {
         let mut app = test_app();
@@ -4854,6 +7138,7 @@ mod modal_helper_tests {
                 database: "db".to_string(),
                 table: "users".to_string(),
                 table_generation: 7,
+                server_context_generation: 0,
                 schema_generation: 1,
                 database_generation: 1,
             },
@@ -4872,6 +7157,7 @@ mod modal_helper_tests {
                 database: "db".to_string(),
                 table: "users".to_string(),
                 table_generation: 7,
+                server_context_generation: 0,
                 schema_generation: 1,
                 database_generation: 1,
             },
@@ -4893,6 +7179,7 @@ mod modal_helper_tests {
                 database: "db".to_string(),
                 table: "users".to_string(),
                 table_generation: 7,
+                server_context_generation: 0,
                 schema_generation: 2,
                 database_generation: 1,
             },
@@ -4911,6 +7198,7 @@ mod modal_helper_tests {
                 database: "db".to_string(),
                 table: "users".to_string(),
                 table_generation: 7,
+                server_context_generation: 0,
                 schema_generation: 2,
                 database_generation: 1,
             },
@@ -4993,7 +7281,11 @@ mod modal_helper_tests {
         let same_target = make_write_plan(WritePlanId(2), "db", Some("public"), "users", 7, false);
 
         assert!(locks.acquire(&first));
-        assert!(locks.release(WritePlanId(1)));
+        let released = locks
+            .release(WritePlanId(1))
+            .expect("owned target released");
+        assert_eq!(released, GuidedWriteTarget::from_plan(&first));
+        assert!(locks.release(WritePlanId(1)).is_none());
         assert!(!locks.is_locked(&same_target));
         assert!(locks.acquire(&same_target));
     }
@@ -5103,126 +7395,6 @@ mod modal_helper_tests {
     #[test]
     fn sql_literal_empty_is_null() {
         assert_eq!(sql_literal("  ", "String"), "NULL");
-    }
-
-    // ── json_to_sql_literal ────────────────────────────────────────────
-
-    #[test]
-    fn json_literal_scalars() {
-        assert_eq!(
-            json_to_sql_literal(&serde_json::json!(null)).unwrap(),
-            "NULL"
-        );
-        assert_eq!(
-            json_to_sql_literal(&serde_json::json!(true)).unwrap(),
-            "TRUE"
-        );
-        assert_eq!(
-            json_to_sql_literal(&serde_json::json!(false)).unwrap(),
-            "FALSE"
-        );
-        assert_eq!(json_to_sql_literal(&serde_json::json!(42)).unwrap(), "42");
-        assert_eq!(json_to_sql_literal(&serde_json::json!(-17)).unwrap(), "-17");
-        assert_eq!(json_to_sql_literal(&serde_json::json!(1.5)).unwrap(), "1.5");
-    }
-
-    #[test]
-    fn json_literal_plain_string_is_single_quoted() {
-        let lit = json_to_sql_literal(&serde_json::json!("alice")).unwrap();
-        assert_eq!(lit, "'alice'");
-    }
-
-    #[test]
-    fn json_literal_string_escapes_embedded_quotes() {
-        let lit = json_to_sql_literal(&serde_json::json!("O'Brien")).unwrap();
-        assert_eq!(lit, "'O''Brien'");
-    }
-
-    #[test]
-    fn json_literal_hex_string_passes_through() {
-        // Identity / ConnectionId serialised as a bare hex string
-        // must round-trip as a raw `0x…` literal — *not* as a
-        // single-quoted string.
-        let lit = json_to_sql_literal(&serde_json::json!("0xdeadbeef")).unwrap();
-        assert_eq!(lit, "0xdeadbeef");
-    }
-
-    #[test]
-    fn json_literal_identity_object_tagged_form() {
-        // `{"Identity": "0xabc"}` → `0xabc`
-        let v = serde_json::json!({"Identity": "0xdeadbeef"});
-        assert_eq!(json_to_sql_literal(&v).unwrap(), "0xdeadbeef");
-    }
-
-    #[test]
-    fn json_literal_identity_object_dunder_form() {
-        // `{"__identity__": "0xabc"}` → `0xabc`
-        let v = serde_json::json!({"__identity__": "0xc2005e40a5b1"});
-        assert_eq!(json_to_sql_literal(&v).unwrap(), "0xc2005e40a5b1");
-    }
-
-    #[test]
-    fn json_literal_identity_object_without_0x_prefix() {
-        // If the server drops the `0x` prefix, re-add it so the
-        // literal is still valid SpacetimeDB hex syntax.
-        let v = serde_json::json!({"__identity__": "deadbeef"});
-        assert_eq!(json_to_sql_literal(&v).unwrap(), "0xdeadbeef");
-    }
-
-    #[test]
-    fn json_literal_connection_id_object() {
-        let v = serde_json::json!({"ConnectionId": "0xfeed"});
-        assert_eq!(json_to_sql_literal(&v).unwrap(), "0xfeed");
-    }
-
-    #[test]
-    fn json_literal_u256_string_form() {
-        // Large integers come back as strings to preserve precision.
-        let v = serde_json::json!({"U256": "123456789012345678901234567890"});
-        assert_eq!(
-            json_to_sql_literal(&v).unwrap(),
-            "123456789012345678901234567890"
-        );
-    }
-
-    #[test]
-    fn json_literal_array_is_error() {
-        let v = serde_json::json!([1, 2, 3]);
-        let err = json_to_sql_literal(&v).unwrap_err();
-        assert!(err.contains("array"));
-    }
-
-    #[test]
-    fn json_literal_unknown_object_is_error() {
-        let v = serde_json::json!({"WeirdCustomType": {"foo": 1}});
-        let err = json_to_sql_literal(&v).unwrap_err();
-        assert!(err.contains("complex value"));
-    }
-
-    #[test]
-    fn json_literal_bare_hex_long_string_gets_prefix() {
-        // Some server versions emit Identity as a bare hex string
-        // without the `0x` prefix. A 64-char all-hex string must
-        // round-trip as a hex literal, not a quoted one.
-        let v = serde_json::json!("c2005e40a5b1576e629a78ae0deef2fbbd6449ba1f150a8dcf76d312c47e2f");
-        let lit = json_to_sql_literal(&v).unwrap();
-        assert!(lit.starts_with("0x"));
-    }
-
-    #[test]
-    fn json_literal_short_hex_like_string_stays_quoted() {
-        // Short strings that *happen* to be hex-only (`"cafe"`,
-        // `"deadbeef"` as a nickname) must still be treated as
-        // regular strings — the heuristic is only safe for lengths
-        // that are clearly identity hashes.
-        for short in ["ab", "cafe", "deadbeef"] {
-            let v = serde_json::json!(short);
-            let lit = json_to_sql_literal(&v).unwrap();
-            assert!(
-                lit.starts_with('\''),
-                "{short:?} → {lit:?} should be quoted, not hex"
-            );
-        }
     }
 
     #[test]

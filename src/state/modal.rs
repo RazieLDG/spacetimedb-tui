@@ -53,6 +53,13 @@ pub enum SafetyModalAction {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirtyRowChoice {
+    Save,
+    Discard,
+    Stay,
+}
+
 /// What to do when a modal is accepted (Enter / `y`).
 ///
 /// We don't keep callbacks because that would require boxing
@@ -76,9 +83,6 @@ pub enum ModalAction {
         table: String,
         column_types: Vec<String>,
     },
-    /// Delete a single row identified by `where_sql` (already
-    /// quoted / formatted by the caller). Confirm dialog only.
-    DeleteRow { table: String, where_sql: String },
     /// Permanently delete an entire database.
     ///
     /// Always wrapped in a one-field [`Modal::Form`] where the user
@@ -106,6 +110,12 @@ pub enum ModalAction {
     /// Type-safe write-plan modal action. The app owns the actual
     /// write plan and modal state carries only stable IDs / coordinates.
     Safety(SafetyModalAction),
+    /// Spreadsheet dirty-row conflict choice. Modal state carries only
+    /// stable coordinates; App privately owns the full requested target.
+    SpreadsheetDirtyRowChoice {
+        requested_row: usize,
+        requested_column: u32,
+    },
 }
 
 impl ModalAction {
@@ -115,7 +125,6 @@ impl ModalAction {
         match self {
             ModalAction::CallReducer { reducer, .. } => format!("call {reducer}"),
             ModalAction::InsertRow { table, .. } => format!("insert into {table}"),
-            ModalAction::DeleteRow { table, .. } => format!("delete from {table}"),
             ModalAction::DeleteDatabase { database } => format!("delete db {database}"),
             ModalAction::TruncateTable { table } => format!("truncate {table}"),
             ModalAction::AddDatabaseAlias { database } => format!("alias {database}"),
@@ -125,6 +134,9 @@ impl ModalAction {
             }
             ModalAction::Safety(SafetyModalAction::DirtyRowChoice { .. }) => {
                 "prepare guided update".to_string()
+            }
+            ModalAction::SpreadsheetDirtyRowChoice { .. } => {
+                "spreadsheet dirty row choice".to_string()
             }
         }
     }
@@ -217,14 +229,6 @@ mod tests {
             "insert into users"
         );
         assert_eq!(
-            ModalAction::DeleteRow {
-                table: "users".to_string(),
-                where_sql: "id = 1".to_string(),
-            }
-            .op_label(),
-            "delete from users"
-        );
-        assert_eq!(
             ModalAction::DeleteDatabase {
                 database: "alice-state".to_string(),
             }
@@ -250,15 +254,12 @@ mod tests {
     #[test]
     fn confirm_modal_exposes_action_and_title() {
         let m = Modal::confirm(
-            "Delete row?",
-            "users WHERE id = 1",
-            ModalAction::DeleteRow {
-                table: "users".to_string(),
-                where_sql: "id = 1".to_string(),
-            },
+            "Discard edits?",
+            "pending edits",
+            ModalAction::DiscardPendingEdits,
         );
-        assert_eq!(m.title(), "Delete row?");
-        assert!(matches!(m.action(), ModalAction::DeleteRow { .. }));
+        assert_eq!(m.title(), "Discard edits?");
+        assert!(matches!(m.action(), ModalAction::DiscardPendingEdits));
     }
 
     #[test]

@@ -47,7 +47,7 @@ Browse databases, run SQL, stream live transactions, edit rows in a spreadsheet,
 | ➕ **Row Insert** | `i` on the Tables tab opens a column-typed form; submit issues `INSERT INTO <table> (…) VALUES (…)`. |
 | ✏️ **Row Update (form)** | `Shift+U` pre-fills every column of the selected row into an edit form with the PK marked read-only. Submit builds a correct `UPDATE … SET col=val WHERE pk=original_pk`, even if the PK is an `Identity` / `ConnectionId` / `U256`. |
 | 🗑️ **Row Delete** | `d` opens a y/n confirm showing the exact `DELETE FROM … WHERE pk = …` statement that will run. |
-| 📝 **Spreadsheet Edit Mode** | `Ctrl+E` enters a cell-by-cell editor on the Tables tab. Move with `h`/`j`/`k`/`l`, `Enter` to open an inline input, `Enter` to stage, `s` to flush all pending edits as batched `UPDATE`s, `u` to revert, `Esc` to exit (with a discard prompt if pending > 0). |
+| 📝 **Spreadsheet Edit Mode** | `Ctrl+E` enters a cell-by-cell editor on the Tables tab. Move with `h`/`j`/`k`/`l`, `Enter` to open an inline input, `Enter` to stage edits for one typed dirty row, `s` to save that row through one guided WritePlan/update confirmation, `u` to revert, `Esc` to exit (with a discard prompt if pending > 0). Edits on a different row ask Save / Discard / Stay; multi-row Save All is unavailable. |
 | 💾 **Clipboard + Export** | `y` copies the cell, `Y` copies the row as TSV (via OSC 52, no external dep). `e` exports to CSV, `E` exports to JSON under `./exports/`. |
 
 ### Admin
@@ -308,9 +308,10 @@ Press `?` at any time to open a scrollable help overlay listing every binding. U
 |---|---|
 | `h` / `j` / `k` / `l` | Move cell cursor |
 | `Enter` / `i` | Open inline editor on selected cell |
-| `Enter` (in editor) | Commit value to pending list |
+| `Enter` (in editor) | Commit value to the current typed dirty row |
 | `Esc` (in editor) | Cancel inline edit |
-| `s` | Save all pending edits (spawns batched `UPDATE`s) |
+| different row | Save / Discard / Stay gate when moving to another row with unsaved edits |
+| `s` | Save one typed dirty row through one guided WritePlan/update confirmation; multi-row Save All is unavailable |
 | `u` | Revert pending edit on active cell |
 | `Ctrl+E` / `Esc` | Exit edit mode (asks to discard if pending > 0) |
 

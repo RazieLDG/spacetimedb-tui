@@ -106,7 +106,7 @@ const SECTIONS: &[Section] = &[
             Binding { key: "Enter / i",       desc: "Open inline editor on selected cell" },
             Binding { key: "Enter",           desc: "Commit inline editor value to pending list" },
             Binding { key: "Esc (in editor)", desc: "Cancel inline edit without committing" },
-            Binding { key: "s",               desc: "Save all pending edits (spawn UPDATE statements)" },
+            Binding { key: "s",               desc: "Save one typed dirty row through one guided update confirmation" },
             Binding { key: "u",               desc: "Revert pending edit on active cell" },
             Binding { key: "Ctrl+E / Esc",    desc: "Exit edit mode (asks if pending edits > 0)" },
         ],
@@ -271,6 +271,43 @@ impl Widget for HelpOverlay {
             let hint_y = inner.y + inner.height.saturating_sub(1);
             let hint_line = Line::from(Span::styled(hint, Style::default().fg(FG_MUTED)));
             buf.set_line(hint_x, hint_y, &hint_line, inner.width);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spreadsheet_s_description() -> &'static str {
+        SECTIONS
+            .iter()
+            .find(|section| section.title == "Spreadsheet edit mode (Tables tab)")
+            .and_then(|section| section.bindings.iter().find(|binding| binding.key == "s"))
+            .map(|binding| binding.desc)
+            .expect("spreadsheet s binding exists")
+    }
+
+    #[test]
+    fn spreadsheet_save_binding_describes_one_typed_dirty_row_guided_update() {
+        let desc = spreadsheet_s_description();
+        assert!(desc.contains("one typed dirty row"), "desc was: {desc}");
+        assert!(
+            desc.contains("one guided update confirmation"),
+            "desc was: {desc}"
+        );
+        for forbidden in [
+            "Save all",
+            "Save All",
+            "all pending edits",
+            "batched UPDATE",
+            "spawn UPDATE",
+            "spawns UPDATE",
+        ] {
+            assert!(
+                !desc.contains(forbidden),
+                "desc must not contain {forbidden:?}: {desc}"
+            );
         }
     }
 }

@@ -9,7 +9,7 @@
 /// 3. Dispatches the event to the appropriate handler.
 /// 4. Loops until `app_state.should_quit` is set.
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     time::{Duration, Instant},
 };
 
@@ -30,9 +30,11 @@ use crate::{
         build_delete_sql, build_guided_delete_plan, build_guided_update_plan, build_update_sql,
         complete_primary_key_from_table_row, format_guided_delete_confirmation,
         format_guided_update_confirmation, guided_form_sql_value_from_user_input,
-        guided_form_value_changed, guided_form_value_from_raw, revalidate_before_dispatch,
-        typed_sql_value_from_json, ConfirmationSnapshot, Generations, GuidedFormValue,
-        WritePlanBuildError,
+        guided_form_value_changed, guided_form_value_from_raw, normalize_lookup_result,
+        plan_postcondition_queries, revalidate_before_dispatch, typed_sql_value_from_json,
+        verify_authoritative_mutation_result, ConfirmationSnapshot, Generations, GuidedFormValue,
+        LookupRows, MutationDispatchStage, PostconditionEvidence, PostconditionQueries,
+        TransportFailure, WritePlanBuildError, WriteVerificationReport, WriteVerificationRequest,
     },
     state::{
         edit_mode::{
@@ -109,17 +111,10 @@ pub enum AppEvent {
     },
     /// A reducer call (or write-SQL exec) failed.
     WriteOpError { op: String, error: String },
-    /// A guided row update/delete finished successfully and should release its row lock.
-    GuidedWriteOpSuccess {
+    GuidedWriteVerification {
         plan_id: WritePlanId,
         op: String,
-        response: serde_json::Value,
-    },
-    /// A guided row update/delete failed and should release its row lock.
-    GuidedWriteOpError {
-        plan_id: WritePlanId,
-        op: String,
-        error: String,
+        report: WriteVerificationReport,
     },
     /// A live log line from WebSocket.
     LogLine(crate::api::types::LogEntry),
@@ -139,9 +134,18 @@ pub struct SchemaRequestContext {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+enum TableBrowseOrigin {
+    ManualRefresh,
+    Navigation,
+    Automatic,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TableBrowseRequestContext {
     database: String,
+    schema: Option<String>,
     table: String,
+    origin: TableBrowseOrigin,
     server_context_generation: u64,
     table_generation: u64,
     schema_generation: u64,
@@ -160,10 +164,19 @@ struct PendingGuidedUpdateDraft {
     requested_column: u32,
 }
 
+#[derive(Clone, Debug)]
+struct PendingGuidedUpdateConfirmationForm {
+    draft: PendingGuidedUpdateDraft,
+    title: String,
+    fields: Vec<crate::state::modal::FormField>,
+    focus: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct GuidedWriteTarget {
     table: QualifiedTable,
     primary_key: CompletePrimaryKey,
+    table_generation: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -175,12 +188,55 @@ struct DeferredTableRefresh {
     table_generation: u64,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct GuidedWriteBlockKey {
+    database: String,
+    schema: Option<String>,
+    table: String,
+}
+
+/// Why guided writes are currently refused for a table.
+///
+/// The two reasons are deliberately different products of the safety
+/// contract. `RequiresManualRefresh` is the strong block demanded by
+/// `Unknown`, `Conflict`, and `CriticalSafetyError`: the user must
+/// personally reload before we accept another write. `StaleAfterVerifiedWrite`
+/// is the weak barrier a *successful* write raises when it invalidated a
+/// same-row owner: the cached rows are simply out of date, so any accepted
+/// reload (including the automatic one the success itself queues) clears it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GuidedWriteUnavailable {
+    RequiresManualRefresh,
+    StaleAfterVerifiedWrite,
+}
+
+impl GuidedWriteBlockKey {
+    fn from_table(table: &QualifiedTable) -> Self {
+        Self {
+            database: table.database.clone(),
+            schema: table.schema.clone(),
+            table: table.table.clone(),
+        }
+    }
+
+    fn matches_browse_context(&self, context: &TableBrowseRequestContext) -> bool {
+        self.database == context.database
+            && self.schema == context.schema
+            && self.table == context.table
+    }
+}
+
 impl GuidedWriteTarget {
     fn from_plan(plan: &WritePlan) -> Self {
         Self {
             table: plan.table.clone(),
             primary_key: plan.original_primary_key.clone(),
+            table_generation: plan.row_generation,
         }
+    }
+
+    fn same_row_identity(&self, other: &Self) -> bool {
+        self.table == other.table && self.primary_key == other.primary_key
     }
 }
 
@@ -235,7 +291,7 @@ impl GuidedWriteLocks {
         if self
             .targets_by_plan_id
             .values()
-            .any(|locked| locked == &target)
+            .any(|locked| locked.same_row_identity(&target))
         {
             return false;
         }
@@ -247,7 +303,7 @@ impl GuidedWriteLocks {
         let target = GuidedWriteTarget::from_plan(plan);
         self.targets_by_plan_id
             .values()
-            .any(|locked| locked == &target)
+            .any(|locked| locked.same_row_identity(&target))
     }
 
     fn has_lock_for_table(&self, table: &QualifiedTable) -> bool {
@@ -305,10 +361,13 @@ pub struct App {
     next_write_plan_id: WritePlanId,
     write_plans: HashMap<WritePlanId, WritePlan>,
     pending_update_draft: Option<PendingGuidedUpdateDraft>,
+    pending_update_confirmation_form: Option<PendingGuidedUpdateConfirmationForm>,
     pending_spreadsheet_edit_request: Option<PendingSpreadsheetEditRequest>,
     spreadsheet_save_lifecycle: Option<SpreadsheetSaveLifecycle>,
     deferred_guided_refresh: Option<DeferredTableRefresh>,
     guided_write_locks: GuidedWriteLocks,
+    guided_write_blocks: HashMap<GuidedWriteBlockKey, u64>,
+    guided_write_stale_data: HashSet<GuidedWriteBlockKey>,
     schema_generation: u64,
     table_generation: u64,
     server_context_generation: u64,
@@ -354,10 +413,13 @@ impl App {
             next_write_plan_id: WritePlanId(1),
             write_plans: HashMap::new(),
             pending_update_draft: None,
+            pending_update_confirmation_form: None,
             pending_spreadsheet_edit_request: None,
             spreadsheet_save_lifecycle: None,
             deferred_guided_refresh: None,
             guided_write_locks: GuidedWriteLocks::default(),
+            guided_write_blocks: HashMap::new(),
+            guided_write_stale_data: HashSet::new(),
             schema_generation: 0,
             table_generation: 0,
             server_context_generation: 0,
@@ -369,6 +431,103 @@ impl App {
                 None
             },
         }
+    }
+
+    /// Raise the strong "user must reload before we write again" block.
+    ///
+    /// The epoch is deliberately the generation observed *at the moment the
+    /// outcome is applied*, not the generation the plan captured. A refresh
+    /// that was already in flight when the outcome landed cannot prove
+    /// anything about the post-outcome state, so it must not unblock.
+    fn block_guided_writes_for_target(&mut self, target: &GuidedWriteTarget) {
+        let key = GuidedWriteBlockKey::from_table(&target.table);
+        let generation = self.table_generation;
+        self.guided_write_blocks
+            .entry(key)
+            .and_modify(|blocked_generation| {
+                *blocked_generation = (*blocked_generation).max(generation);
+            })
+            .or_insert(generation);
+        self.deferred_guided_refresh = self
+            .deferred_guided_refresh
+            .take()
+            .filter(|refresh| refresh.table != target.table);
+    }
+
+    /// Raise the weak "cached rows are behind a verified write" barrier.
+    ///
+    /// Unlike [`Self::block_guided_writes_for_target`] this is not part of the
+    /// manual-refresh contract: it only records that the rows currently on
+    /// screen predate a confirmed mutation. It is retired when those rows are
+    /// replaced or dropped, and while it is up the app keeps driving the
+    /// reload that replaces them, so the user is never left stranded.
+    fn mark_guided_write_data_stale(&mut self, table: &QualifiedTable) {
+        self.guided_write_stale_data
+            .insert(GuidedWriteBlockKey::from_table(table));
+    }
+
+    fn guided_write_data_is_stale(&self, table: &QualifiedTable) -> bool {
+        self.guided_write_stale_data
+            .contains(&GuidedWriteBlockKey::from_table(table))
+    }
+
+    fn guided_write_blocked_generation(&self, table: &QualifiedTable) -> Option<u64> {
+        self.guided_write_blocks
+            .get(&GuidedWriteBlockKey::from_table(table))
+            .copied()
+    }
+
+    fn guided_write_unavailable_reason(
+        &self,
+        table: &QualifiedTable,
+    ) -> Option<GuidedWriteUnavailable> {
+        if self.guided_write_blocked_generation(table).is_some() {
+            return Some(GuidedWriteUnavailable::RequiresManualRefresh);
+        }
+        self.guided_write_data_is_stale(table)
+            .then_some(GuidedWriteUnavailable::StaleAfterVerifiedWrite)
+    }
+
+    fn set_guided_write_unavailable_error(
+        &mut self,
+        table: &QualifiedTable,
+        reason: GuidedWriteUnavailable,
+    ) {
+        let message = match reason {
+            GuidedWriteUnavailable::RequiresManualRefresh => format!(
+                "Guided writes for {} are blocked until manual refresh loads newer table data",
+                table.table
+            ),
+            GuidedWriteUnavailable::StaleAfterVerifiedWrite => format!(
+                "Guided writes for {} are paused until the reload after the last verified write lands",
+                table.table
+            ),
+        };
+        self.state.set_error(message);
+    }
+
+    /// Refuse a guided write when the target is blocked or stale, explaining
+    /// which of the two it is. Returns `true` when the caller must stop.
+    fn refuse_guided_write_if_unavailable(&mut self, table: &QualifiedTable) -> bool {
+        match self.guided_write_unavailable_reason(table) {
+            Some(reason) => {
+                self.set_guided_write_unavailable_error(table, reason);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn unblock_guided_writes_after_accepted_browse(&mut self, context: &TableBrowseRequestContext) {
+        // An accepted load replaces the rows the barrier was raised for.
+        self.guided_write_stale_data
+            .retain(|key| !key.matches_browse_context(context));
+        if context.origin != TableBrowseOrigin::ManualRefresh {
+            return;
+        }
+        self.guided_write_blocks.retain(|key, blocked_generation| {
+            !(key.matches_browse_context(context) && context.table_generation > *blocked_generation)
+        });
     }
 
     fn next_write_plan_id(&mut self) -> WritePlanId {
@@ -391,6 +550,7 @@ impl App {
         self.clear_discarded_guided_owned_modal();
         self.write_plans.clear();
         self.pending_update_draft = None;
+        self.pending_update_confirmation_form = None;
         self.pending_spreadsheet_edit_request = None;
         if let Some(lifecycle) = self.spreadsheet_save_lifecycle {
             self.spreadsheet_save_lifecycle = if lifecycle.is_in_flight() {
@@ -418,7 +578,13 @@ impl App {
                 }),
                 crate::state::modal::ModalAction::Safety(
                     crate::state::modal::SafetyModalAction::ConfirmWritePlan { plan_id },
-                ) => self.write_plans.contains_key(plan_id),
+                ) => {
+                    self.write_plans.contains_key(plan_id)
+                        || self
+                            .pending_update_confirmation_form
+                            .as_ref()
+                            .is_some_and(|snapshot| snapshot.draft.plan_id == *plan_id)
+                }
                 _ => false,
             });
         if should_clear {
@@ -467,6 +633,88 @@ impl App {
                 .state
                 .selected_table()
                 .is_some_and(|selected| selected.table_name == table.table)
+    }
+
+    fn target_for_guided_update_draft(
+        draft: &PendingGuidedUpdateDraft,
+    ) -> Option<GuidedWriteTarget> {
+        let primary_key =
+            complete_primary_key_from_table_row(&draft.table_info, &draft.original_raw_row).ok()?;
+        Some(GuidedWriteTarget {
+            table: draft.qualified_table.clone(),
+            primary_key,
+            table_generation: draft.generations.row,
+        })
+    }
+
+    fn discard_same_target_pending_guided_update(&mut self, target: &GuidedWriteTarget) -> bool {
+        let discard_draft = self
+            .pending_update_draft
+            .as_ref()
+            .and_then(Self::target_for_guided_update_draft)
+            .is_some_and(|draft_target| draft_target.same_row_identity(target));
+        if discard_draft {
+            self.pending_update_draft = None;
+        }
+
+        let discard_confirmation_snapshot = self
+            .pending_update_confirmation_form
+            .as_ref()
+            .and_then(|snapshot| Self::target_for_guided_update_draft(&snapshot.draft))
+            .is_some_and(|snapshot_target| snapshot_target.same_row_identity(target));
+        if discard_confirmation_snapshot {
+            self.pending_update_confirmation_form = None;
+        }
+
+        let removed_plan_ids: Vec<WritePlanId> = self
+            .write_plans
+            .iter()
+            .filter_map(|(plan_id, plan)| {
+                let plan_target = GuidedWriteTarget::from_plan(plan);
+                plan_target.same_row_identity(target).then_some(*plan_id)
+            })
+            .collect();
+        for plan_id in &removed_plan_ids {
+            self.write_plans.remove(plan_id);
+        }
+
+        let should_clear_modal =
+            self.state
+                .modal
+                .as_ref()
+                .is_some_and(|modal| match modal.action() {
+                    crate::state::modal::ModalAction::Safety(
+                        crate::state::modal::SafetyModalAction::DirtyRowChoice { .. },
+                    ) => discard_draft,
+                    crate::state::modal::ModalAction::Safety(
+                        crate::state::modal::SafetyModalAction::ConfirmWritePlan { plan_id },
+                    ) => removed_plan_ids.contains(plan_id),
+                    _ => false,
+                });
+        if should_clear_modal {
+            self.state.modal = None;
+        }
+        // A spreadsheet save that was still awaiting confirmation loses its
+        // plan and modal here; leaving the marker behind would freeze every
+        // later spreadsheet interaction on a plan that no longer exists.
+        if self.spreadsheet_save_lifecycle.is_some_and(|lifecycle| {
+            !lifecycle.is_in_flight() && removed_plan_ids.contains(&lifecycle.plan_id())
+        }) {
+            self.spreadsheet_save_lifecycle = None;
+        }
+        discard_draft || discard_confirmation_snapshot || !removed_plan_ids.is_empty()
+    }
+
+    fn restore_guided_update_plan_after_local_rejection(&mut self, plan: WritePlan) {
+        if self
+            .pending_update_confirmation_form
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.draft.plan_id == plan.id)
+        {
+            let plan_id = plan.id;
+            self.write_plans.insert(plan_id, plan);
+            self.restore_pending_update_confirmation_form(plan_id);
+        }
     }
 
     fn guided_current_table_interaction_is_active(&self) -> bool {
@@ -537,14 +785,46 @@ impl App {
     }
 
     async fn refresh_or_defer_guided_table(&mut self, table: QualifiedTable) {
+        // Only the manual-refresh block suppresses an automatic reload; the
+        // weak staleness barrier exists precisely so this reload can clear it.
+        if self.guided_write_blocked_generation(&table).is_some() {
+            self.deferred_guided_refresh = self
+                .deferred_guided_refresh
+                .take()
+                .filter(|refresh| refresh.table != table);
+            return;
+        }
         if self.guided_current_table_interaction_is_active() || self.read_owner_is_active() {
             self.deferred_guided_refresh = Some(self.deferred_table_refresh_for(table));
             return;
         }
         if self.selected_table_matches(&table) {
             self.deferred_guided_refresh = None;
-            self.load_table_data().await;
+            self.load_table_data(TableBrowseOrigin::Automatic).await;
         }
+    }
+
+    /// The table whose rows are behind a verified write and which we are still
+    /// responsible for reloading.
+    ///
+    /// The weak staleness barrier refuses guided writes, so something must
+    /// always be driving the load that clears it. A queued deferred refresh can
+    /// be dropped by an unrelated invalidation, so the barrier on the selected
+    /// table is itself a standing reload request and outlives that queue entry.
+    fn selected_table_awaits_stale_reload(&self) -> bool {
+        let Some(database) = self.state.selected_database() else {
+            return false;
+        };
+        let Some(table) = self.state.selected_table() else {
+            return false;
+        };
+        let selected = QualifiedTable {
+            database: database.to_string(),
+            schema: None,
+            table: table.table_name.clone(),
+        };
+        self.guided_write_data_is_stale(&selected)
+            && self.guided_write_blocked_generation(&selected).is_none()
     }
 
     async fn flush_deferred_guided_refresh_if_unowned(&mut self) {
@@ -554,16 +834,28 @@ impl App {
             .is_some_and(|refresh| !self.deferred_refresh_matches_current(refresh))
         {
             self.deferred_guided_refresh = None;
-            return;
         }
         if self.guided_current_table_interaction_is_active() || self.read_owner_is_active() {
             return;
         }
-        let Some(refresh) = self.deferred_guided_refresh.take() else {
-            return;
-        };
-        if self.deferred_refresh_matches_current(&refresh) {
-            self.load_table_data().await;
+        let refresh = self.deferred_guided_refresh.take();
+        if let Some(refresh) = refresh {
+            if self
+                .guided_write_blocked_generation(&refresh.table)
+                .is_some()
+            {
+                return;
+            }
+            if self.deferred_refresh_matches_current(&refresh) {
+                self.load_table_data(TableBrowseOrigin::Automatic).await;
+                return;
+            }
+        }
+        // The queued reload was dropped or never matched, but the barrier is
+        // still refusing writes on the table in front of the user, so drive the
+        // reload that retires it.
+        if self.selected_table_awaits_stale_reload() {
+            self.load_table_data(TableBrowseOrigin::Automatic).await;
         }
     }
 
@@ -600,10 +892,13 @@ impl App {
         &self,
         database: String,
         table: String,
+        origin: TableBrowseOrigin,
     ) -> TableBrowseRequestContext {
         TableBrowseRequestContext {
             database,
+            schema: None,
             table,
+            origin,
             server_context_generation: self.server_context_generation,
             table_generation: self.table_generation,
             schema_generation: self.schema_generation,
@@ -652,6 +947,11 @@ impl App {
 
     fn bump_database_generation(&mut self) {
         self.database_generation = self.database_generation.saturating_add(1);
+        // A database switch invalidates every block and staleness barrier:
+        // they are keyed by (database, schema, table) and the old entries
+        // would otherwise accumulate without bound across switches.
+        self.guided_write_blocks.clear();
+        self.guided_write_stale_data.clear();
         self.bump_schema_generation();
         self.bump_table_generation();
     }
@@ -1791,7 +2091,7 @@ impl App {
                     }
                     SidebarFocus::Tables => {
                         // Load the selected table's data
-                        self.load_table_data().await;
+                        self.load_table_data(TableBrowseOrigin::Navigation).await;
                         self.state.focus = FocusPanel::Main;
                         self.state.current_tab = Tab::Tables;
                         self.tables_grid = TableGridState::new();
@@ -1861,7 +2161,7 @@ impl App {
         });
     }
 
-    async fn load_table_data(&mut self) {
+    async fn load_table_data(&mut self, origin: TableBrowseOrigin) {
         let db = match self.state.selected_database() {
             Some(d) => d.to_string(),
             None => return,
@@ -1878,7 +2178,7 @@ impl App {
         let sql = format!("SELECT * FROM {table} LIMIT 200");
         let client = self.client.clone();
         let tx = self.event_tx.clone();
-        let context = self.current_table_browse_request_context(db.clone(), table.clone());
+        let context = self.current_table_browse_request_context(db.clone(), table.clone(), origin);
 
         tokio::spawn(async move {
             match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.query_sql(&db, &sql)).await {
@@ -2208,6 +2508,14 @@ impl App {
             self.state.set_notification("No table selected".to_string());
             return;
         }
+        let Some(selected_table) = self.state.selected_table().cloned() else {
+            return;
+        };
+        if let Some(qualified_table) = self.qualified_selected_table(&selected_table) {
+            if self.refuse_guided_write_if_unavailable(&qualified_table) {
+                return;
+            }
+        }
         self.state.edit_mode = Some(crate::state::edit_mode::EditMode::new());
         self.state
             .set_notification("EDIT MODE — Ctrl+E to exit".to_string());
@@ -2371,6 +2679,12 @@ impl App {
             Some(t) => t,
             None => return,
         };
+        let Some(qualified_table) = self.qualified_selected_table(&table) else {
+            return;
+        };
+        if self.refuse_guided_write_if_unavailable(&qualified_table) {
+            return;
+        }
         if table.columns.is_empty() {
             return;
         }
@@ -2654,6 +2968,9 @@ impl App {
         let Some(qualified_table) = self.qualified_selected_table(&table_info) else {
             return;
         };
+        if self.refuse_guided_write_if_unavailable(&qualified_table) {
+            return;
+        }
         let Some(row) = self
             .state
             .table_browse_result
@@ -2803,12 +3120,34 @@ impl App {
 
     // ── Modal dialogs (Faz 5: write operations) ──────────────────────────
 
+    /// Drop every piece of state that belongs to one guided update
+    /// confirmation: the draft, the restore snapshot, and the correlated write
+    /// plan. Cancellation must clear all three together, otherwise a later
+    /// same-row success can act on the leftovers.
+    fn discard_guided_update_confirmation_state(&mut self, plan_id: WritePlanId) {
+        self.write_plans.remove(&plan_id);
+        if self
+            .pending_update_confirmation_form
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.draft.plan_id == plan_id)
+        {
+            self.pending_update_confirmation_form = None;
+        }
+        if self
+            .pending_update_draft
+            .as_ref()
+            .is_some_and(|draft| draft.plan_id == plan_id)
+        {
+            self.pending_update_draft = None;
+        }
+    }
+
     fn discard_guided_state_for_modal(&mut self, modal: &crate::state::modal::Modal) {
         use crate::state::modal::{Modal, ModalAction, SafetyModalAction};
 
         match modal.action() {
             ModalAction::Safety(SafetyModalAction::ConfirmWritePlan { plan_id }) => {
-                self.write_plans.remove(plan_id);
+                self.discard_guided_update_confirmation_state(*plan_id);
                 if self.spreadsheet_lifecycle_plan_id() == Some(*plan_id)
                     && !self.spreadsheet_edits_are_frozen()
                 {
@@ -2816,6 +3155,15 @@ impl App {
                 }
             }
             ModalAction::Safety(SafetyModalAction::DirtyRowChoice { .. }) => {
+                if let Some(plan_id) = self
+                    .pending_update_draft
+                    .as_ref()
+                    .map(|draft| draft.plan_id)
+                {
+                    // A restored form still owns the snapshot and the plan that
+                    // were reinserted after a local rejection.
+                    self.discard_guided_update_confirmation_state(plan_id);
+                }
                 self.pending_update_draft = None;
             }
             _ => {}
@@ -3080,6 +3428,9 @@ impl App {
         let Some(qualified_table) = self.qualified_selected_table(&table) else {
             return;
         };
+        if self.refuse_guided_write_if_unavailable(&qualified_table) {
+            return;
+        }
         let generations = self.current_generations();
         let plan_id = self.next_write_plan_id();
         let requested_column = table
@@ -3265,6 +3616,9 @@ impl App {
         let Some(qualified_table) = self.qualified_selected_table(&table) else {
             return;
         };
+        if self.refuse_guided_write_if_unavailable(&qualified_table) {
+            return;
+        }
         let plan_id = self.next_write_plan_id();
         let plan = match build_guided_delete_plan(
             plan_id,
@@ -3562,7 +3916,7 @@ impl App {
         };
         let plan = match build_guided_update_plan(
             draft.plan_id,
-            draft.qualified_table,
+            draft.qualified_table.clone(),
             &draft.table_info,
             &draft.original_raw_row,
             draft.generations,
@@ -3586,6 +3940,12 @@ impl App {
         };
         let plan_id = plan.id;
         self.pending_update_draft = None;
+        self.pending_update_confirmation_form = Some(PendingGuidedUpdateConfirmationForm {
+            draft,
+            title,
+            fields,
+            focus,
+        });
         self.write_plans.remove(&plan_id);
         let prompt = format!(
             "{}\n\nPress [y] to confirm, [n] to cancel.",
@@ -3623,6 +3983,24 @@ impl App {
         });
     }
 
+    fn restore_pending_update_confirmation_form(&mut self, plan_id: WritePlanId) {
+        if let Some(snapshot) = self
+            .pending_update_confirmation_form
+            .as_ref()
+            .filter(|snapshot| snapshot.draft.plan_id == plan_id)
+            .cloned()
+        {
+            self.pending_update_draft = Some(snapshot.draft.clone());
+            self.restore_guided_update_form(
+                snapshot.title,
+                snapshot.fields,
+                snapshot.focus,
+                snapshot.draft.requested_row,
+                snapshot.draft.requested_column,
+            );
+        }
+    }
+
     async fn dispatch_confirmed_write_plan(&mut self, plan_id: WritePlanId, op_label: String) {
         let Some(plan) = self.write_plans.remove(&plan_id) else {
             self.state
@@ -3635,7 +4013,28 @@ impl App {
                 app.spreadsheet_save_lifecycle = None;
             }
         };
+        if self.guided_write_blocked_generation(&plan.table).is_some() {
+            self.restore_guided_update_plan_after_local_rejection(plan.clone());
+            clear_spreadsheet_marker(self);
+            self.set_guided_write_unavailable_error(
+                &plan.table,
+                GuidedWriteUnavailable::RequiresManualRefresh,
+            );
+            self.flush_deferred_guided_refresh_if_unowned().await;
+            return;
+        }
+        if self.guided_write_data_is_stale(&plan.table) {
+            self.restore_guided_update_plan_after_local_rejection(plan.clone());
+            clear_spreadsheet_marker(self);
+            self.set_guided_write_unavailable_error(
+                &plan.table,
+                GuidedWriteUnavailable::StaleAfterVerifiedWrite,
+            );
+            self.flush_deferred_guided_refresh_if_unowned().await;
+            return;
+        }
         if self.state.schema_loading || self.state.query_loading {
+            self.restore_guided_update_plan_after_local_rejection(plan);
             clear_spreadsheet_marker(self);
             self.state
                 .set_error("Data is loading; write plan was not sent".to_string());
@@ -3643,6 +4042,7 @@ impl App {
             return;
         }
         let Some(table_info) = self.state.selected_table().cloned() else {
+            self.restore_guided_update_plan_after_local_rejection(plan);
             clear_spreadsheet_marker(self);
             self.state
                 .set_error("No table selected; write plan was not sent".to_string());
@@ -3650,6 +4050,7 @@ impl App {
             return;
         };
         let Some(data_idx) = self.active_data_row_index() else {
+            self.restore_guided_update_plan_after_local_rejection(plan);
             clear_spreadsheet_marker(self);
             self.state
                 .set_error("No row selected; write plan was not sent".to_string());
@@ -3663,6 +4064,7 @@ impl App {
             .and_then(|result| result.rows.get(data_idx))
             .cloned()
         else {
+            self.restore_guided_update_plan_after_local_rejection(plan);
             clear_spreadsheet_marker(self);
             self.state
                 .set_error("No row selected; write plan was not sent".to_string());
@@ -3676,12 +4078,25 @@ impl App {
             row_locked: self.guided_write_locks.is_locked(&plan),
         };
         if let Err(outcome) = revalidate_before_dispatch(&plan, &snapshot) {
+            self.restore_guided_update_plan_after_local_rejection(plan);
             clear_spreadsheet_marker(self);
             self.state
                 .set_error(format_mutation_outcome_not_sent(outcome));
             self.flush_deferred_guided_refresh_if_unowned().await;
             return;
         }
+        let postcondition_queries = match plan_postcondition_queries(&plan, &table_info) {
+            Ok(queries) => queries,
+            Err(error) => {
+                self.restore_guided_update_plan_after_local_rejection(plan);
+                clear_spreadsheet_marker(self);
+                self.state.set_error(format!(
+                    "Postcondition verification planning failed; nothing sent: {error:?}"
+                ));
+                self.flush_deferred_guided_refresh_if_unowned().await;
+                return;
+            }
+        };
         let sql = match &plan.mutation {
             GuidedMutation::Update { .. } => build_update_sql(&plan, &table_info),
             GuidedMutation::Delete => build_delete_sql(&plan, &table_info),
@@ -3689,6 +4104,7 @@ impl App {
         let sql = match sql {
             Ok(sql) => sql,
             Err(error) => {
+                self.restore_guided_update_plan_after_local_rejection(plan);
                 clear_spreadsheet_marker(self);
                 self.state.set_error(format!(
                     "Write plan encoding failed; nothing sent: {error:?}"
@@ -3698,6 +4114,7 @@ impl App {
             }
         };
         if !self.guided_write_locks.acquire(&plan) {
+            self.restore_guided_update_plan_after_local_rejection(plan);
             clear_spreadsheet_marker(self);
             self.state.set_error(format_mutation_outcome_not_sent(
                 MutationOutcome::DefinitelyNotSent {
@@ -3707,12 +4124,20 @@ impl App {
             self.flush_deferred_guided_refresh_if_unowned().await;
             return;
         }
+        if self
+            .pending_update_confirmation_form
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.draft.plan_id == plan_id)
+        {
+            self.pending_update_confirmation_form = None;
+        }
         if self.spreadsheet_save_lifecycle
             == Some(SpreadsheetSaveLifecycle::AwaitingConfirmation(plan_id))
         {
             self.spreadsheet_save_lifecycle = Some(SpreadsheetSaveLifecycle::InFlight(plan_id));
         }
-        self.spawn_guided_write_sql(plan.id, plan.table.database.clone(), sql, op_label);
+        let db = plan.table.database.clone();
+        self.spawn_guided_write_sql(plan, table_info, postcondition_queries, db, sql, op_label);
     }
 
     /// Run `client.add_database_alias` on a background task. On
@@ -3892,41 +4317,126 @@ impl App {
     /// in-flight row lock can be released on either success or failure.
     fn spawn_guided_write_sql(
         &self,
-        plan_id: WritePlanId,
+        plan: WritePlan,
+        table_info: TableInfo,
+        postcondition_queries: PostconditionQueries,
         db: String,
         sql: String,
         op_label: String,
     ) {
         let client = self.client.clone();
         let tx = self.event_tx.clone();
+        let plan_id = plan.id;
         tokio::spawn(async move {
             match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.query_sql(&db, &sql)).await {
-                Ok(Ok(_result)) => send_event(
-                    &tx,
-                    AppEvent::GuidedWriteOpSuccess {
-                        plan_id,
-                        op: op_label,
-                        response: serde_json::json!({"sql": sql}),
-                    },
-                ),
+                Ok(Ok(dml_result)) => {
+                    let report = match build_postcondition_evidence(
+                        &client,
+                        &db,
+                        &table_info,
+                        postcondition_queries,
+                    )
+                    .await
+                    {
+                        Ok(postcondition) => {
+                            verify_authoritative_mutation_result(&WriteVerificationRequest {
+                                plan: plan.clone(),
+                                affected_rows: None,
+                                postcondition: Some(postcondition),
+                            })
+                        }
+                        Err(error) => verification_report_from_postcondition_fetch_error(error),
+                    };
+                    let _discarded_dml_body = dml_result;
+                    send_event(
+                        &tx,
+                        AppEvent::GuidedWriteVerification {
+                            plan_id,
+                            op: op_label,
+                            report,
+                        },
+                    );
+                }
                 Ok(Err(e)) => send_event(
                     &tx,
-                    AppEvent::GuidedWriteOpError {
+                    AppEvent::GuidedWriteVerification {
                         plan_id,
                         op: op_label,
-                        error: format!("{e:#}"),
+                        report: WriteVerificationReport {
+                            outcome: crate::effects::write_ops::classify_mutation_error(
+                                MutationDispatchStage::AfterTransportOwnership,
+                                Self::classify_guided_write_sql_error(&e),
+                            ),
+                        },
                     },
                 ),
                 Err(_) => send_event(
                     &tx,
-                    AppEvent::GuidedWriteOpError {
+                    AppEvent::GuidedWriteVerification {
                         plan_id,
                         op: op_label,
-                        error: "request timed out".to_string(),
+                        report: WriteVerificationReport {
+                            outcome: crate::effects::write_ops::classify_mutation_error(
+                                MutationDispatchStage::AfterTransportOwnership,
+                                TransportFailure::Timeout,
+                            ),
+                        },
                     },
                 ),
             }
         });
+    }
+
+    fn classify_guided_write_sql_error(error: &anyhow::Error) -> TransportFailure {
+        for cause in error.chain() {
+            if let Some(reqwest_error) = cause.downcast_ref::<reqwest::Error>() {
+                if let Some(status) = reqwest_error.status() {
+                    if status.is_server_error() {
+                        return TransportFailure::Http5xx(status.as_u16());
+                    }
+                }
+                if reqwest_error.is_timeout() {
+                    return TransportFailure::Timeout;
+                }
+                if reqwest_error.is_connect() {
+                    return TransportFailure::Disconnected;
+                }
+            }
+        }
+
+        let detail = format!("{error:#}");
+        let lower = detail.to_ascii_lowercase();
+        if let Some(status) = Self::parse_sql_query_http_status(&detail) {
+            if (500..=599).contains(&status) {
+                return TransportFailure::Http5xx(status);
+            }
+            return TransportFailure::Validation(detail);
+        }
+        if lower.contains("cancelled") || lower.contains("canceled") {
+            return TransportFailure::Cancelled;
+        }
+        if lower.contains("timed out") || lower.contains("timeout") {
+            return TransportFailure::Timeout;
+        }
+        if lower.contains("connection refused")
+            || lower.contains("connection reset")
+            || lower.contains("connection closed")
+            || lower.contains("broken pipe")
+            || lower.contains("connection aborted")
+        {
+            return TransportFailure::Disconnected;
+        }
+        TransportFailure::Validation(detail)
+    }
+
+    fn parse_sql_query_http_status(detail: &str) -> Option<u16> {
+        let marker = "SQL query HTTP ";
+        let start = detail.find(marker)? + marker.len();
+        let digits: String = detail[start..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect();
+        digits.parse().ok()
     }
 
     /// Tab-complete the SQL input against the current schema.
@@ -4040,7 +4550,7 @@ impl App {
                 if self.state.schema_load_failed || self.state.current_schema.is_none() {
                     self.load_schema().await;
                 } else {
-                    self.load_table_data().await;
+                    self.load_table_data(TableBrowseOrigin::ManualRefresh).await;
                 }
             }
             Tab::Sql => {
@@ -4465,6 +4975,7 @@ impl App {
                 self.state.query_loading = false;
                 let row_count = result.row_count();
                 self.state.table_browse_result = Some(result);
+                self.unblock_guided_writes_after_accepted_browse(&context);
                 // Reset the Tables grid scroll/selection on fresh data.
                 self.tables_grid = TableGridState::new();
                 self.state
@@ -4527,58 +5038,83 @@ impl App {
                 self.state.set_error(format!("{op} failed: {error}"));
             }
 
-            AppEvent::GuidedWriteOpSuccess {
+            AppEvent::GuidedWriteVerification {
                 plan_id,
                 op,
-                response,
+                report,
             } => {
                 let Some(target) = self.guided_write_locks.release(plan_id) else {
                     return;
                 };
-                let active_spreadsheet_plan = self.spreadsheet_lifecycle_plan_id();
-                let matching_spreadsheet = active_spreadsheet_plan == Some(plan_id);
-                if matching_spreadsheet {
-                    self.clear_spreadsheet_edit_state();
-                }
-                let summary = if response.is_null() {
-                    op.clone()
-                } else {
-                    let s = response.to_string();
-                    let preview: String = s.chars().take(60).collect();
-                    format!("{op} → {preview}")
-                };
-                self.state.set_notification(format!("✓ {summary}"));
-                // Many writes invalidate the table-browse view, so a
-                // gentle refresh is useful — but only when the user
-                // is still looking at the Tables tab.
-                if self.state.current_tab == Tab::Tables
-                    && self
-                        .state
-                        .selected_table()
-                        .is_some_and(|table| table.table_name == target.table.table)
-                    && self.state.selected_database() == Some(target.table.database.as_str())
-                {
-                    self.refresh_or_defer_guided_table(target.table).await;
-                }
-                self.flush_deferred_guided_refresh_if_unowned().await;
-            }
-
-            AppEvent::GuidedWriteOpError { plan_id, op, error } => {
-                let Some(_target) = self.guided_write_locks.release(plan_id) else {
-                    return;
-                };
-                let matching_lifecycle = self
-                    .spreadsheet_save_lifecycle
-                    .filter(|lifecycle| lifecycle.plan_id() == plan_id);
-                if let Some(lifecycle) = matching_lifecycle {
-                    if lifecycle.is_invalidated() {
-                        self.clear_spreadsheet_edit_state();
-                    } else {
-                        self.spreadsheet_save_lifecycle = None;
+                match &report.outcome {
+                    MutationOutcome::SentAndConfirmed { .. } => {
+                        // A verified write makes our cached rows a pre-write
+                        // snapshot. Invalidate any same-row owner that still
+                        // believes otherwise, then raise the weak staleness
+                        // barrier so nothing can be written from those rows
+                        // until a reload lands. This is not the manual-refresh
+                        // block: the refresh queued below clears it.
+                        let invalidated_stale_owner =
+                            self.discard_same_target_pending_guided_update(&target);
+                        if invalidated_stale_owner {
+                            self.mark_guided_write_data_stale(&target.table);
+                        }
+                        if self.spreadsheet_lifecycle_plan_id() == Some(plan_id) {
+                            self.clear_spreadsheet_edit_state();
+                        }
+                        self.state.set_notification(format!("✓ {op} verified"));
+                        if self.state.current_tab == Tab::Tables
+                            && self
+                                .state
+                                .selected_table()
+                                .is_some_and(|table| table.table_name == target.table.table)
+                            && self.state.selected_database()
+                                == Some(target.table.database.as_str())
+                        {
+                            self.refresh_or_defer_guided_table(target.table).await;
+                        } else if invalidated_stale_owner {
+                            // Off-tab (or off-table) successes still owe the
+                            // user a reload; queue it so returning to the table
+                            // clears the barrier without a manual refresh.
+                            self.deferred_guided_refresh =
+                                Some(self.deferred_table_refresh_for(target.table));
+                        }
+                        self.flush_deferred_guided_refresh_if_unowned().await;
+                    }
+                    MutationOutcome::Conflict { reason }
+                    | MutationOutcome::Unknown { reason }
+                    | MutationOutcome::CriticalSafetyError { reason } => {
+                        let matching_lifecycle = self
+                            .spreadsheet_save_lifecycle
+                            .filter(|lifecycle| lifecycle.plan_id() == plan_id);
+                        if let Some(lifecycle) = matching_lifecycle {
+                            if lifecycle.is_invalidated() {
+                                self.clear_spreadsheet_edit_state();
+                            } else {
+                                self.spreadsheet_save_lifecycle = None;
+                            }
+                        }
+                        self.block_guided_writes_for_target(&target);
+                        self.state
+                            .set_error(format!("{op} requires manual refresh: {reason}"));
+                        self.state.push_log(crate::api::types::LogEntry {
+                            ts: Some(chrono::Utc::now()),
+                            level: crate::api::types::LogLevel::Warn,
+                            message: format!("guided write outcome for {op}: {reason}"),
+                            target: Some("guided-write-safety".to_string()),
+                            filename: None,
+                            line_number: None,
+                        });
+                        self.flush_deferred_guided_refresh_if_unowned().await;
+                    }
+                    MutationOutcome::DefinitelyNotSent { reason } => {
+                        if self.spreadsheet_lifecycle_plan_id() == Some(plan_id) {
+                            self.spreadsheet_save_lifecycle = None;
+                        }
+                        self.state.set_error(format!("{op} was not sent: {reason}"));
+                        self.flush_deferred_guided_refresh_if_unowned().await;
                     }
                 }
-                self.state.set_error(format!("{op} failed: {error}"));
-                self.flush_deferred_guided_refresh_if_unowned().await;
             }
 
             AppEvent::LogLine(entry) => {
@@ -4704,6 +5240,137 @@ fn format_mutation_outcome_not_sent(outcome: MutationOutcome) -> String {
         }
         MutationOutcome::SentAndConfirmed { .. } => "Write plan was already sent".to_string(),
     }
+}
+
+async fn build_postcondition_evidence(
+    client: &SpacetimeClient,
+    db: &str,
+    table: &TableInfo,
+    postcondition_queries: PostconditionQueries,
+) -> Result<PostconditionEvidence, PostconditionFetchError> {
+    match postcondition_queries {
+        PostconditionQueries::Delete {
+            original_key_lookup,
+        } => {
+            let rows = run_lookup(client, db, table, &original_key_lookup).await?;
+            match rows {
+                LookupRows::Zero => Ok(PostconditionEvidence::Delete {
+                    original_tuple_present: false,
+                }),
+                LookupRows::One(_) => Ok(PostconditionEvidence::Delete {
+                    original_tuple_present: true,
+                }),
+                LookupRows::Multiple(count) => Err(PostconditionFetchError::critical(format!(
+                    "complete-key delete verification returned {count} rows; expected at most 1"
+                ))),
+            }
+        }
+        PostconditionQueries::Update {
+            original_key_lookup,
+            new_key_lookup: None,
+        } => {
+            let rows = run_lookup(client, db, table, &original_key_lookup).await?;
+            let row_by_original_key = match rows {
+                LookupRows::Zero => None,
+                LookupRows::One(row) => Some(row),
+                LookupRows::Multiple(count) => {
+                    return Err(PostconditionFetchError::critical(format!(
+                        "complete-key update verification returned {count} rows; expected at most 1"
+                    )));
+                }
+            };
+            Ok(PostconditionEvidence::Update {
+                table: table.clone(),
+                row_by_original_key,
+                row_by_new_key: None,
+                old_key_still_present: None,
+            })
+        }
+        PostconditionQueries::Update {
+            original_key_lookup,
+            new_key_lookup: Some(new_key_lookup),
+        } => {
+            let old_rows = run_lookup(client, db, table, &original_key_lookup).await?;
+            let old_key_still_present = match old_rows {
+                LookupRows::Zero => false,
+                LookupRows::One(row) => {
+                    return Ok(PostconditionEvidence::Update {
+                        table: table.clone(),
+                        row_by_original_key: Some(row),
+                        row_by_new_key: None,
+                        old_key_still_present: Some(true),
+                    });
+                }
+                LookupRows::Multiple(count) => {
+                    return Err(PostconditionFetchError::critical(format!(
+                        "complete-key old tuple verification returned {count} rows; expected at most 1"
+                    )));
+                }
+            };
+            let new_rows = run_lookup(client, db, table, &new_key_lookup).await?;
+            let row_by_new_key = match new_rows {
+                LookupRows::Zero => None,
+                LookupRows::One(row) => Some(row),
+                LookupRows::Multiple(count) => {
+                    return Err(PostconditionFetchError::critical(format!(
+                        "complete-key new tuple verification returned {count} rows; expected at most 1"
+                    )));
+                }
+            };
+            Ok(PostconditionEvidence::Update {
+                table: table.clone(),
+                row_by_original_key: None,
+                row_by_new_key,
+                old_key_still_present: Some(old_key_still_present),
+            })
+        }
+    }
+}
+
+async fn run_lookup(
+    client: &SpacetimeClient,
+    db: &str,
+    table: &TableInfo,
+    sql: &str,
+) -> Result<LookupRows, PostconditionFetchError> {
+    let result = tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.query_sql(db, sql))
+        .await
+        .map_err(|_| PostconditionFetchError::unknown("postcondition verification timed out"))?
+        .map_err(|error| {
+            PostconditionFetchError::unknown(format!(
+                "postcondition verification failed: {error:#}"
+            ))
+        })?;
+    normalize_lookup_result(table, &result)
+        .map_err(|error| PostconditionFetchError::unknown(format!("{error:?}")))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PostconditionFetchError {
+    Critical(String),
+    Unknown(String),
+}
+
+impl PostconditionFetchError {
+    fn critical(reason: impl Into<String>) -> Self {
+        Self::Critical(reason.into())
+    }
+
+    fn unknown(reason: impl Into<String>) -> Self {
+        Self::Unknown(reason.into())
+    }
+}
+
+fn verification_report_from_postcondition_fetch_error(
+    error: PostconditionFetchError,
+) -> WriteVerificationReport {
+    let outcome = match error {
+        PostconditionFetchError::Critical(reason) => {
+            MutationOutcome::CriticalSafetyError { reason }
+        }
+        PostconditionFetchError::Unknown(reason) => MutationOutcome::Unknown { reason },
+    };
+    WriteVerificationReport { outcome }
 }
 
 /// Suggest a placeholder string for a form field based on its type
@@ -5204,6 +5871,30 @@ mod modal_helper_tests {
         );
     }
 
+    fn guided_success_event(plan_id: WritePlanId, op: &str) -> AppEvent {
+        AppEvent::GuidedWriteVerification {
+            plan_id,
+            op: op.to_string(),
+            report: WriteVerificationReport {
+                outcome: MutationOutcome::SentAndConfirmed {
+                    affected_rows: None,
+                },
+            },
+        }
+    }
+
+    fn guided_unknown_outcome_event(plan_id: WritePlanId, op: &str, reason: &str) -> AppEvent {
+        AppEvent::GuidedWriteVerification {
+            plan_id,
+            op: op.to_string(),
+            report: WriteVerificationReport {
+                outcome: MutationOutcome::Unknown {
+                    reason: reason.to_string(),
+                },
+            },
+        }
+    }
+
     fn query_result(name: &str) -> crate::api::types::QueryResult {
         crate::api::types::QueryResult {
             schema: vec![
@@ -5403,12 +6094,8 @@ mod modal_helper_tests {
             .unwrap_or_else(|| make_write_plan(plan_id, "db", None, "users", 1, true));
         let _ = app.guided_write_locks.acquire(&plan);
         app.spreadsheet_save_lifecycle = Some(SpreadsheetSaveLifecycle::InFlight(plan_id));
-        app.handle_app_event(AppEvent::GuidedWriteOpError {
-            plan_id,
-            op: "edit".to_string(),
-            error: "nope".to_string(),
-        })
-        .await;
+        app.handle_app_event(guided_unknown_outcome_event(plan_id, "edit", "nope"))
+            .await;
         assert!(app.state.edit_mode.is_some());
         assert!(app.spreadsheet_lifecycle_plan_id().is_none());
         let plan = app
@@ -5418,12 +6105,8 @@ mod modal_helper_tests {
             .unwrap_or_else(|| make_write_plan(plan_id, "db", None, "users", 1, true));
         let _ = app.guided_write_locks.acquire(&plan);
         app.spreadsheet_save_lifecycle = Some(SpreadsheetSaveLifecycle::InFlight(plan_id));
-        app.handle_app_event(AppEvent::GuidedWriteOpSuccess {
-            plan_id,
-            op: "edit".to_string(),
-            response: serde_json::Value::Null,
-        })
-        .await;
+        app.handle_app_event(guided_success_event(plan_id, "edit"))
+            .await;
         assert!(app.state.edit_mode.is_none());
     }
 
@@ -5598,12 +6281,8 @@ mod modal_helper_tests {
             .targets_by_plan_id
             .contains_key(&plan_id));
 
-        app.handle_app_event(AppEvent::GuidedWriteOpError {
-            plan_id,
-            op: "edit".to_string(),
-            error: "nope".to_string(),
-        })
-        .await;
+        app.handle_app_event(guided_unknown_outcome_event(plan_id, "edit", "nope"))
+            .await;
 
         assert!(app.spreadsheet_save_lifecycle.is_none());
         assert!(app.state.edit_mode.is_none());
@@ -5630,12 +6309,8 @@ mod modal_helper_tests {
             .await;
 
         app.bump_table_generation();
-        app.handle_app_event(AppEvent::GuidedWriteOpSuccess {
-            plan_id,
-            op: "edit".to_string(),
-            response: serde_json::Value::Null,
-        })
-        .await;
+        app.handle_app_event(guided_success_event(plan_id, "edit"))
+            .await;
 
         assert!(app.spreadsheet_save_lifecycle.is_none());
         assert!(app.state.edit_mode.is_none());
@@ -5716,12 +6391,8 @@ mod modal_helper_tests {
         app.state.query_loading = true;
         app.state.notification = None;
 
-        app.handle_app_event(AppEvent::GuidedWriteOpSuccess {
-            plan_id: plan_a,
-            op: "edit A".to_string(),
-            response: serde_json::Value::Null,
-        })
-        .await;
+        app.handle_app_event(guided_success_event(plan_a, "edit A"))
+            .await;
 
         assert_eq!(
             app.spreadsheet_save_lifecycle,
@@ -5796,12 +6467,8 @@ mod modal_helper_tests {
         app.state.notification = None;
         let generation_before = app.table_generation;
 
-        app.handle_app_event(AppEvent::GuidedWriteOpSuccess {
-            plan_id: plan_a.id,
-            op: "edit A".to_string(),
-            response: serde_json::Value::Null,
-        })
-        .await;
+        app.handle_app_event(guided_success_event(plan_a.id, "edit A"))
+            .await;
 
         assert_eq!(app.table_generation, generation_before);
         assert_eq!(
@@ -5827,6 +6494,385 @@ mod modal_helper_tests {
                 .as_ref()
                 .is_some_and(|(message, _)| message.contains("✓ edit A")),
             "owned unrelated success must surface its success notification"
+        );
+    }
+
+    #[tokio::test]
+    async fn guided_success_invalidates_same_row_update_form_before_unlock_and_blocks_stale_dispatch(
+    ) {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        app.tables_grid.selected_row = 0;
+        app.tables_grid.selected_col = 1;
+        app.open_update_form();
+        let draft_plan = app.pending_update_draft.as_ref().unwrap().plan_id;
+        let modal = app.state.modal.as_mut().expect("guided update form");
+        let crate::state::modal::Modal::Form { fields, focus, .. } = modal else {
+            panic!("expected guided form");
+        };
+        fields[1].input.set("Alicia".to_string());
+        *focus = 1;
+
+        let mut plan_a = make_write_plan(
+            WritePlanId(draft_plan.0 + 100),
+            "db",
+            None,
+            "users",
+            1,
+            true,
+        );
+        plan_a.original_primary_key = CompletePrimaryKey::from_schema_ordered_parts(vec![
+            crate::state::safety::PrimaryKeyPart {
+                column_id: 511,
+                value: crate::state::safety::SqlValue::U64(1),
+            },
+        ])
+        .expect("test primary key");
+        assert!(app.guided_write_locks.acquire(&plan_a));
+        app.handle_app_event(guided_success_event(plan_a.id, "edit A"))
+            .await;
+
+        assert!(app.pending_update_draft.is_none());
+        assert!(app.state.modal.is_none());
+        assert!(app.write_plans.is_empty());
+        assert!(
+            app.guided_write_blocked_generation(&users_table())
+                .is_none(),
+            "a verified success must not demand a manual refresh"
+        );
+        assert!(
+            app.state.table_browse_result.is_none()
+                || app.guided_write_data_is_stale(&users_table()),
+            "rows that predate the verified write must not remain writable"
+        );
+        app.dispatch_confirmed_write_plan(draft_plan, "stale edit".to_string())
+            .await;
+        assert!(app.guided_write_locks.targets_by_plan_id.is_empty());
+        assert!(app.event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn guided_success_off_tables_invalidates_same_row_confirm_and_blocks_stale_dispatch() {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        app.tables_grid.selected_row = 0;
+        app.tables_grid.selected_col = 1;
+        app.open_update_form();
+        let modal = app.state.modal.as_mut().expect("guided update form");
+        let crate::state::modal::Modal::Form { fields, .. } = modal else {
+            panic!("expected guided form");
+        };
+        fields[1].input.set("Alicia".to_string());
+        app.handle_modal_key(KeyEvent::from(KeyCode::Enter)).await;
+        let confirm_plan = match app
+            .state
+            .modal
+            .as_ref()
+            .map(crate::state::modal::Modal::action)
+        {
+            Some(crate::state::modal::ModalAction::Safety(
+                crate::state::modal::SafetyModalAction::ConfirmWritePlan { plan_id },
+            )) => *plan_id,
+            other => panic!("expected guided confirm, got {other:?}"),
+        };
+        app.state.current_tab = Tab::Sql;
+        let mut plan_a = make_write_plan(
+            WritePlanId(confirm_plan.0 + 100),
+            "db",
+            None,
+            "users",
+            1,
+            true,
+        );
+        plan_a.original_primary_key = CompletePrimaryKey::from_schema_ordered_parts(vec![
+            crate::state::safety::PrimaryKeyPart {
+                column_id: 511,
+                value: crate::state::safety::SqlValue::U64(1),
+            },
+        ])
+        .expect("test primary key");
+        assert!(app.guided_write_locks.acquire(&plan_a));
+
+        app.handle_app_event(guided_success_event(plan_a.id, "edit A"))
+            .await;
+
+        assert!(app.state.modal.is_none());
+        assert!(!app.write_plans.contains_key(&confirm_plan));
+        assert!(
+            app.guided_write_blocked_generation(&users_table())
+                .is_none(),
+            "a verified success must not demand a manual refresh"
+        );
+        assert!(
+            app.state.table_browse_result.is_none()
+                || app.guided_write_data_is_stale(&users_table()),
+            "rows that predate the verified write must not remain writable"
+        );
+        app.dispatch_confirmed_write_plan(confirm_plan, "stale edit".to_string())
+            .await;
+        assert!(app.guided_write_locks.targets_by_plan_id.is_empty());
+        assert!(app.event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn verified_success_marks_data_stale_without_manual_refresh_block_and_reload_restores_guided_writes(
+    ) {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        app.tables_grid.selected_row = 0;
+        app.tables_grid.selected_col = 1;
+        app.open_update_form();
+        let modal = app.state.modal.as_mut().expect("guided update form");
+        let crate::state::modal::Modal::Form { fields, .. } = modal else {
+            panic!("expected guided form");
+        };
+        fields[1].input.set("Alicia".to_string());
+        app.handle_modal_key(KeyEvent::from(KeyCode::Enter)).await;
+        let confirm_plan = match app
+            .state
+            .modal
+            .as_ref()
+            .map(crate::state::modal::Modal::action)
+        {
+            Some(crate::state::modal::ModalAction::Safety(
+                crate::state::modal::SafetyModalAction::ConfirmWritePlan { plan_id },
+            )) => *plan_id,
+            other => panic!("expected guided confirm, got {other:?}"),
+        };
+        assert!(app.pending_update_confirmation_form.is_some());
+        let stale_plan = app
+            .write_plans
+            .get(&confirm_plan)
+            .cloned()
+            .expect("confirmed write plan");
+        app.state.current_tab = Tab::Sql;
+        let mut plan_a = make_write_plan(
+            WritePlanId(confirm_plan.0 + 100),
+            "db",
+            None,
+            "users",
+            1,
+            true,
+        );
+        plan_a.original_primary_key = CompletePrimaryKey::from_schema_ordered_parts(vec![
+            crate::state::safety::PrimaryKeyPart {
+                column_id: 511,
+                value: crate::state::safety::SqlValue::U64(1),
+            },
+        ])
+        .expect("test primary key");
+        assert!(app.guided_write_locks.acquire(&plan_a));
+        // A read owner is active, so the post-success reload defers instead of
+        // dispatching a real request from the test.
+        app.state.query_loading = true;
+
+        app.handle_app_event(guided_success_event(plan_a.id, "edit A"))
+            .await;
+
+        assert!(
+            app.guided_write_blocked_generation(&users_table())
+                .is_none(),
+            "a verified success must never demand a manual refresh"
+        );
+        assert_eq!(
+            app.guided_write_unavailable_reason(&users_table()),
+            Some(GuidedWriteUnavailable::StaleAfterVerifiedWrite),
+            "cached rows behind the invalidated owner must be treated as stale"
+        );
+        assert!(
+            app.deferred_guided_refresh.is_some(),
+            "the success must queue the reload that clears the stale barrier"
+        );
+
+        // The queued reload has not landed yet, so the stale same-row plan must
+        // still be refused, and the user must not be blamed for it.
+        app.state.error_message = None;
+        app.state.current_tab = Tab::Tables;
+        app.write_plans.insert(confirm_plan, stale_plan);
+        app.dispatch_confirmed_write_plan(confirm_plan, "stale edit".to_string())
+            .await;
+        assert!(
+            app.guided_write_locks.targets_by_plan_id.is_empty(),
+            "a stale same-row plan must never acquire transport ownership"
+        );
+        assert!(app.event_rx.try_recv().is_err());
+        let message = app.state.error_message.clone().unwrap_or_default();
+        assert!(
+            !message.contains("manual refresh"),
+            "success must not tell the user to refresh manually: {message}"
+        );
+        assert!(
+            message.contains("reload"),
+            "user must learn the reload is automatic: {message}"
+        );
+
+        app.write_plans.remove(&confirm_plan);
+        app.state.query_loading = false;
+        app.deferred_guided_refresh = None;
+        app.table_generation += 1;
+        let reload_context =
+            users_browse_context(&app, TableBrowseOrigin::Automatic, app.table_generation);
+        app.handle_app_event(AppEvent::TableBrowseResult {
+            context: reload_context,
+            result: query_result_two_rows(),
+        })
+        .await;
+
+        assert_eq!(
+            app.guided_write_unavailable_reason(&users_table()),
+            None,
+            "an ordinary reload must restore guided writes without a manual refresh"
+        );
+        app.state.modal = None;
+        app.tables_grid.selected_row = 0;
+        app.tables_grid.selected_col = 1;
+        app.open_update_form();
+        assert!(matches!(
+            app.state
+                .modal
+                .as_ref()
+                .map(crate::state::modal::Modal::action),
+            Some(crate::state::modal::ModalAction::Safety(
+                crate::state::modal::SafetyModalAction::DirtyRowChoice { .. }
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_barrier_retires_with_its_generation_so_a_dropped_reload_cannot_trap_the_user() {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        app.tables_grid.selected_row = 0;
+        app.tables_grid.selected_col = 1;
+        app.open_update_form();
+        let modal = app.state.modal.as_mut().expect("guided update form");
+        let crate::state::modal::Modal::Form { fields, .. } = modal else {
+            panic!("expected guided form");
+        };
+        fields[1].input.set("Alicia".to_string());
+        app.handle_modal_key(KeyEvent::from(KeyCode::Enter)).await;
+        let mut plan_a = make_write_plan(WritePlanId(9_300), "db", None, "users", 1, true);
+        plan_a.original_primary_key = CompletePrimaryKey::from_schema_ordered_parts(vec![
+            crate::state::safety::PrimaryKeyPart {
+                column_id: 511,
+                value: crate::state::safety::SqlValue::U64(1),
+            },
+        ])
+        .expect("test primary key");
+        assert!(app.guided_write_locks.acquire(&plan_a));
+        app.state.query_loading = true;
+
+        app.handle_app_event(guided_success_event(plan_a.id, "edit A"))
+            .await;
+
+        assert!(
+            app.guided_write_data_is_stale(&users_table()),
+            "rows behind the verified write must be refused while they are on screen"
+        );
+        assert!(app.deferred_guided_refresh.is_some());
+
+        // A WebSocket transaction update invalidates and drops the queued
+        // reload. The barrier is still refusing writes, so the app must drive
+        // the reload itself rather than trapping the user on a table whose
+        // queued reload was cancelled.
+        app.bump_table_generation();
+        app.state.query_loading = false;
+        app.flush_deferred_guided_refresh_if_unowned().await;
+        assert!(
+            app.deferred_guided_refresh.is_none(),
+            "the invalidated queue entry must not linger"
+        );
+        assert!(
+            app.state.query_loading,
+            "the barrier must drive its own reload"
+        );
+        let refresh_context = app.current_table_browse_request_context(
+            "db".to_string(),
+            "users".to_string(),
+            TableBrowseOrigin::Automatic,
+        );
+        app.handle_app_event(AppEvent::TableBrowseResult {
+            context: refresh_context,
+            result: query_result("fresh"),
+        })
+        .await;
+        assert_eq!(
+            app.guided_write_unavailable_reason(&users_table()),
+            None,
+            "a barrier must never outlive the reload that retires it"
+        );
+
+        app.state.error_message = None;
+        app.tables_grid.selected_row = 0;
+        app.tables_grid.selected_col = 1;
+        app.open_update_form();
+        assert!(
+            matches!(
+                app.state
+                    .modal
+                    .as_ref()
+                    .map(crate::state::modal::Modal::action),
+                Some(crate::state::modal::ModalAction::Safety(
+                    crate::state::modal::SafetyModalAction::DirtyRowChoice { .. }
+                ))
+            ),
+            "the user must be able to edit again once the stale rows are gone: {:?}",
+            app.state.error_message
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_success_clears_stranded_spreadsheet_awaiting_confirmation_for_same_row() {
+        let mut app = spreadsheet_app();
+        app.tables_grid.selected_col = 1;
+        app.begin_cell_edit();
+        if let Some(editor) = app
+            .state
+            .edit_mode
+            .as_mut()
+            .and_then(|edit_mode| edit_mode.editor.as_mut())
+        {
+            editor.set("Adele".to_string());
+        } else {
+            panic!("expected open cell editor");
+        }
+        app.commit_cell_edit();
+        app.save_pending_edits().await;
+        let plan_id = app
+            .spreadsheet_lifecycle_plan_id()
+            .expect("spreadsheet save plan");
+        assert_eq!(
+            app.spreadsheet_save_lifecycle,
+            Some(SpreadsheetSaveLifecycle::AwaitingConfirmation(plan_id))
+        );
+        app.state.current_tab = Tab::Sql;
+        let mut plan_a =
+            make_write_plan(WritePlanId(plan_id.0 + 100), "db", None, "users", 1, true);
+        plan_a.original_primary_key = CompletePrimaryKey::from_schema_ordered_parts(vec![
+            crate::state::safety::PrimaryKeyPart {
+                column_id: 511,
+                value: crate::state::safety::SqlValue::U64(1),
+            },
+        ])
+        .expect("test primary key");
+        assert!(app.guided_write_locks.acquire(&plan_a));
+
+        app.handle_app_event(guided_success_event(plan_a.id, "edit A"))
+            .await;
+
+        assert!(!app.write_plans.contains_key(&plan_id));
+        assert!(app.state.modal.is_none());
+        assert!(
+            app.spreadsheet_save_lifecycle.is_none(),
+            "an AwaitingConfirmation marker must not outlive its invalidated plan"
+        );
+        assert_eq!(
+            app.state
+                .edit_mode
+                .as_ref()
+                .map(|mode| mode.pending_count()),
+            Some(1),
+            "the user's own pending edits must survive an unrelated owner's success"
         );
     }
 
@@ -5858,12 +6904,8 @@ mod modal_helper_tests {
         assert!(app.guided_write_locks.acquire(&plan_a));
         let generation_before = app.table_generation;
 
-        app.handle_app_event(AppEvent::GuidedWriteOpSuccess {
-            plan_id: plan_a.id,
-            op: "edit A".to_string(),
-            response: serde_json::Value::Null,
-        })
-        .await;
+        app.handle_app_event(guided_success_event(plan_a.id, "edit A"))
+            .await;
         assert_eq!(app.table_generation, generation_before);
         assert_eq!(
             app.deferred_guided_refresh
@@ -6031,6 +7073,228 @@ mod modal_helper_tests {
         assert!(app.deferred_guided_refresh.is_none());
         assert_eq!(app.table_generation, generation_before + 1);
         assert_no_extra_table_refresh(&mut app);
+    }
+
+    #[tokio::test]
+    async fn guided_confirm_local_row_lock_rejection_restores_exact_update_form_without_dispatch() {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        app.tables_grid.selected_row = 0;
+        app.tables_grid.selected_col = 1;
+        app.open_update_form();
+        let draft_plan = app.pending_update_draft.as_ref().unwrap().plan_id;
+        let draft_generation = app.pending_update_draft.as_ref().unwrap().generations.row;
+        let modal = app.state.modal.as_mut().expect("guided update form");
+        let crate::state::modal::Modal::Form { fields, focus, .. } = modal else {
+            panic!("expected guided form");
+        };
+        fields[1].input.set("Alicia".to_string());
+        fields[2].input.set("7".to_string());
+        *focus = 2;
+        app.handle_modal_key(KeyEvent::from(KeyCode::Enter)).await;
+        let confirm_plan = match app
+            .state
+            .modal
+            .as_ref()
+            .map(crate::state::modal::Modal::action)
+        {
+            Some(crate::state::modal::ModalAction::Safety(
+                crate::state::modal::SafetyModalAction::ConfirmWritePlan { plan_id },
+            )) => *plan_id,
+            other => panic!("expected guided confirm, got {other:?}"),
+        };
+        let mut lock_plan = make_write_plan(
+            WritePlanId(confirm_plan.0 + 100),
+            "db",
+            None,
+            "users",
+            1,
+            true,
+        );
+        lock_plan.original_primary_key = CompletePrimaryKey::from_schema_ordered_parts(vec![
+            crate::state::safety::PrimaryKeyPart {
+                column_id: 511,
+                value: crate::state::safety::SqlValue::U64(1),
+            },
+        ])
+        .expect("test primary key");
+        assert!(app.guided_write_locks.acquire(&lock_plan));
+
+        app.dispatch_confirmed_write_plan(confirm_plan, "guided update".to_string())
+            .await;
+
+        assert!(app.write_plans.contains_key(&confirm_plan));
+        assert_guided_update_form_preserved(
+            &app,
+            draft_plan,
+            draft_generation,
+            2,
+            &["1", "Alicia", "7"],
+        );
+        assert!(app.event_rx.try_recv().is_err());
+        app.handle_modal_key(KeyEvent::from(KeyCode::Esc)).await;
+        assert!(app.pending_update_draft.is_none());
+        assert!(app.state.modal.is_none());
+        assert!(
+            app.pending_update_confirmation_form.is_none(),
+            "cancelling a restored guided form must not strand its confirmation snapshot"
+        );
+        assert!(
+            app.write_plans.is_empty(),
+            "cancelling a restored guided form must not strand its reinserted write plan"
+        );
+    }
+
+    #[tokio::test]
+    async fn guided_confirm_cancel_clears_snapshot_plan_and_modal_together() {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        app.tables_grid.selected_row = 0;
+        app.tables_grid.selected_col = 1;
+        app.open_update_form();
+        let modal = app.state.modal.as_mut().expect("guided update form");
+        let crate::state::modal::Modal::Form { fields, .. } = modal else {
+            panic!("expected guided form");
+        };
+        fields[1].input.set("Alicia".to_string());
+        app.handle_modal_key(KeyEvent::from(KeyCode::Enter)).await;
+        let confirm_plan = match app
+            .state
+            .modal
+            .as_ref()
+            .map(crate::state::modal::Modal::action)
+        {
+            Some(crate::state::modal::ModalAction::Safety(
+                crate::state::modal::SafetyModalAction::ConfirmWritePlan { plan_id },
+            )) => *plan_id,
+            other => panic!("expected guided confirm, got {other:?}"),
+        };
+        assert!(app.pending_update_confirmation_form.is_some());
+
+        app.handle_modal_key(KeyEvent::from(KeyCode::Esc)).await;
+
+        assert!(app.state.modal.is_none());
+        assert!(app.pending_update_draft.is_none());
+        assert!(
+            app.pending_update_confirmation_form.is_none(),
+            "cancelling the guided confirm must not strand its confirmation snapshot"
+        );
+        assert!(!app.write_plans.contains_key(&confirm_plan));
+        assert!(app.guided_write_locks.targets_by_plan_id.is_empty());
+        assert!(app.event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelled_guided_confirmation_does_not_let_later_same_row_success_close_a_live_confirmation(
+    ) {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        app.tables_grid.selected_row = 0;
+        app.tables_grid.selected_col = 1;
+        app.open_update_form();
+        let modal = app.state.modal.as_mut().expect("guided update form");
+        let crate::state::modal::Modal::Form { fields, .. } = modal else {
+            panic!("expected guided form");
+        };
+        fields[1].input.set("Alicia".to_string());
+        app.handle_modal_key(KeyEvent::from(KeyCode::Enter)).await;
+        app.handle_modal_key(KeyEvent::from(KeyCode::Esc)).await;
+
+        // A live confirmation for a *different* row must survive a success that
+        // only concerns the cancelled row.
+        app.tables_grid.selected_row = 1;
+        app.open_delete_confirm();
+        let live_plan = match app
+            .state
+            .modal
+            .as_ref()
+            .map(crate::state::modal::Modal::action)
+        {
+            Some(crate::state::modal::ModalAction::Safety(
+                crate::state::modal::SafetyModalAction::ConfirmWritePlan { plan_id },
+            )) => *plan_id,
+            other => panic!("expected live delete confirm, got {other:?}"),
+        };
+
+        let mut plan_a = make_write_plan(WritePlanId(9_001), "db", None, "users", 1, true);
+        plan_a.original_primary_key = CompletePrimaryKey::from_schema_ordered_parts(vec![
+            crate::state::safety::PrimaryKeyPart {
+                column_id: 511,
+                value: crate::state::safety::SqlValue::U64(1),
+            },
+        ])
+        .expect("test primary key");
+        assert!(app.guided_write_locks.acquire(&plan_a));
+        app.state.query_loading = true;
+
+        app.handle_app_event(guided_success_event(plan_a.id, "edit A"))
+            .await;
+
+        assert!(
+            matches!(
+                app.state.modal.as_ref().map(crate::state::modal::Modal::action),
+                Some(crate::state::modal::ModalAction::Safety(
+                    crate::state::modal::SafetyModalAction::ConfirmWritePlan { plan_id }
+                )) if *plan_id == live_plan
+            ),
+            "a cancelled confirmation must not let a later success close a live unrelated confirmation"
+        );
+        assert!(app.write_plans.contains_key(&live_plan));
+    }
+
+    #[tokio::test]
+    async fn unsafe_outcome_blocks_at_event_time_so_only_a_later_manual_refresh_unblocks() {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        let plan_id = WritePlanId(4_242);
+        let mut plan = make_write_plan(plan_id, "db", None, "users", 1, true);
+        plan.original_primary_key = CompletePrimaryKey::from_schema_ordered_parts(vec![
+            crate::state::safety::PrimaryKeyPart {
+                column_id: 511,
+                value: crate::state::safety::SqlValue::U64(1),
+            },
+        ])
+        .expect("test primary key");
+        assert!(app.guided_write_locks.acquire(&plan));
+        // A manual refresh started before the unsafe outcome is known.
+        app.table_generation = 7;
+        let in_flight_manual = users_browse_context(&app, TableBrowseOrigin::ManualRefresh, 7);
+
+        app.handle_app_event(guided_unknown_outcome_event(
+            plan_id,
+            "guided update",
+            "no proof",
+        ))
+        .await;
+
+        assert_eq!(
+            app.guided_write_blocked_generation(&users_table()),
+            Some(7),
+            "the block epoch must be the generation observed when the outcome landed"
+        );
+
+        app.handle_app_event(AppEvent::TableBrowseResult {
+            context: in_flight_manual,
+            result: query_result("Ada"),
+        })
+        .await;
+        assert_eq!(
+            app.guided_write_blocked_generation(&users_table()),
+            Some(7),
+            "a manual refresh already in flight cannot prove the post-outcome state"
+        );
+
+        app.table_generation = 8;
+        app.handle_app_event(AppEvent::TableBrowseResult {
+            context: users_browse_context(&app, TableBrowseOrigin::ManualRefresh, 8),
+            result: query_result("Ada"),
+        })
+        .await;
+        assert_eq!(
+            app.guided_write_blocked_generation(&users_table()),
+            None,
+            "a manual refresh started after the outcome must unblock"
+        );
     }
 
     #[tokio::test]
@@ -6209,8 +7473,11 @@ mod modal_helper_tests {
         );
         assert!(!app.state.schema_loading);
         assert_eq!(app.table_generation, generation_before + 1);
-        let browse_context =
-            app.current_table_browse_request_context("db".to_string(), "users".to_string());
+        let browse_context = app.current_table_browse_request_context(
+            "db".to_string(),
+            "users".to_string(),
+            TableBrowseOrigin::Automatic,
+        );
 
         app.handle_app_event(AppEvent::TableBrowseResult {
             context: browse_context,
@@ -6255,8 +7522,11 @@ mod modal_helper_tests {
         })
         .await;
 
-        let browse_context =
-            app.current_table_browse_request_context("db".to_string(), "users".to_string());
+        let browse_context = app.current_table_browse_request_context(
+            "db".to_string(),
+            "users".to_string(),
+            TableBrowseOrigin::Automatic,
+        );
         app.handle_app_event(AppEvent::TableBrowseError {
             context: browse_context,
             error: "terminal boom".to_string(),
@@ -6376,8 +7646,11 @@ mod modal_helper_tests {
     {
         let mut app = spreadsheet_app();
         app.state.edit_mode = None;
-        let read_context =
-            app.current_table_browse_request_context("db".to_string(), "users".to_string());
+        let read_context = app.current_table_browse_request_context(
+            "db".to_string(),
+            "users".to_string(),
+            TableBrowseOrigin::Automatic,
+        );
         app.state.query_loading = true;
         let generation_before = app.table_generation;
 
@@ -6403,8 +7676,11 @@ mod modal_helper_tests {
         );
         assert!(app.deferred_guided_refresh.is_none());
         assert_eq!(app.table_generation, generation_before + 1);
-        let refresh_context =
-            app.current_table_browse_request_context("db".to_string(), "users".to_string());
+        let refresh_context = app.current_table_browse_request_context(
+            "db".to_string(),
+            "users".to_string(),
+            TableBrowseOrigin::Automatic,
+        );
 
         app.handle_app_event(AppEvent::TableBrowseResult {
             context: refresh_context,
@@ -6531,11 +7807,14 @@ mod modal_helper_tests {
         app.tables_grid.selected_row = 0;
         app.tables_grid.selected_col = 1;
         app.open_update_form();
+        let draft_plan = app.pending_update_draft.as_ref().unwrap().plan_id;
+        let draft_generation = app.pending_update_draft.as_ref().unwrap().generations.row;
         let modal = app.state.modal.as_mut().expect("guided update form modal");
-        let crate::state::modal::Modal::Form { fields, .. } = modal else {
+        let crate::state::modal::Modal::Form { fields, focus, .. } = modal else {
             panic!("expected guided update form");
         };
         fields[1].input.set("Alicia".to_string());
+        *focus = 1;
         app.handle_modal_key(KeyEvent::from(KeyCode::Enter)).await;
         let plan_id = match app
             .state
@@ -6559,8 +7838,16 @@ mod modal_helper_tests {
         app.dispatch_confirmed_write_plan(plan_id, "guided update".to_string())
             .await;
 
-        assert!(app.deferred_guided_refresh.is_none());
-        assert_eq!(app.table_generation, generation_before + 1);
+        assert!(app.deferred_guided_refresh.is_some());
+        assert_eq!(app.table_generation, generation_before);
+        assert_guided_update_form_preserved(
+            &app,
+            draft_plan,
+            draft_generation,
+            1,
+            &["1", "Alicia", "5"],
+        );
+        assert!(app.event_rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -6610,12 +7897,8 @@ mod modal_helper_tests {
             "existing loading owner must not be clobbered while guided lock owns the row"
         );
 
-        app.handle_app_event(AppEvent::GuidedWriteOpSuccess {
-            plan_id,
-            op: "guided update".to_string(),
-            response: serde_json::Value::Null,
-        })
-        .await;
+        app.handle_app_event(guided_success_event(plan_id, "guided update"))
+            .await;
 
         assert!(app.guided_write_locks.targets_by_plan_id.is_empty());
         assert!(app.deferred_guided_refresh.is_none());
@@ -6623,12 +7906,8 @@ mod modal_helper_tests {
         assert_eq!(app.table_generation, generation_before + 1);
         let generation_after_drain = app.table_generation;
 
-        app.handle_app_event(AppEvent::GuidedWriteOpSuccess {
-            plan_id,
-            op: "duplicate guided update".to_string(),
-            response: serde_json::Value::Null,
-        })
-        .await;
+        app.handle_app_event(guided_success_event(plan_id, "duplicate guided update"))
+            .await;
 
         assert_eq!(app.table_generation, generation_after_drain);
     }
@@ -6636,8 +7915,11 @@ mod modal_helper_tests {
     #[tokio::test]
     async fn deferred_guided_refresh_waits_for_existing_table_read_owner_then_drains() {
         let mut app = spreadsheet_app();
-        let existing_context =
-            app.current_table_browse_request_context("db".to_string(), "users".to_string());
+        let existing_context = app.current_table_browse_request_context(
+            "db".to_string(),
+            "users".to_string(),
+            TableBrowseOrigin::Automatic,
+        );
         app.state.edit_mode = None;
         app.state.query_loading = true;
         queue_users_refresh(&mut app);
@@ -6763,12 +8045,8 @@ mod modal_helper_tests {
             app.spreadsheet_save_lifecycle.is_some(),
             "invalidated in-flight state remains correlated until result"
         );
-        app.handle_app_event(AppEvent::GuidedWriteOpError {
-            plan_id,
-            op: "edit".to_string(),
-            error: "stale".to_string(),
-        })
-        .await;
+        app.handle_app_event(guided_unknown_outcome_event(plan_id, "edit", "stale"))
+            .await;
         assert!(app.spreadsheet_save_lifecycle.is_none());
         assert!(
             app.state.edit_mode.is_none(),
@@ -7006,6 +8284,131 @@ mod modal_helper_tests {
         );
     }
 
+    #[test]
+    fn guided_write_sql_error_classifier_preserves_transport_categories_and_details() {
+        assert_eq!(
+            App::classify_guided_write_sql_error(&anyhow::anyhow!(
+                "SQL query HTTP 503: unavailable"
+            )),
+            TransportFailure::Http5xx(503)
+        );
+        assert_eq!(
+            App::classify_guided_write_sql_error(&anyhow::anyhow!("request cancelled by caller")),
+            TransportFailure::Cancelled
+        );
+        assert_eq!(
+            App::classify_guided_write_sql_error(&anyhow::anyhow!("operation timed out")),
+            TransportFailure::Timeout
+        );
+        assert_eq!(
+            App::classify_guided_write_sql_error(&anyhow::anyhow!(
+                "error sending request: connection refused"
+            )),
+            TransportFailure::Disconnected
+        );
+
+        let protocol_error = App::classify_guided_write_sql_error(&anyhow::anyhow!(
+            "decode failed: invalid JSON frame"
+        ));
+        assert_eq!(
+            protocol_error,
+            TransportFailure::Validation("decode failed: invalid JSON frame".into())
+        );
+        assert_ne!(protocol_error, TransportFailure::Disconnected);
+    }
+
+    #[test]
+    fn guided_write_sql_error_classifier_prefers_structured_http_and_preserves_protocol_details() {
+        assert_eq!(
+            App::classify_guided_write_sql_error(&anyhow::anyhow!(
+                "SQL query HTTP 503: backend timed out"
+            )),
+            TransportFailure::Http5xx(503)
+        );
+
+        let protocol_error = App::classify_guided_write_sql_error(&anyhow::anyhow!(
+            "error sending request: HTTP/2 protocol stream error"
+        ));
+        assert_eq!(
+            protocol_error,
+            TransportFailure::Validation(
+                "error sending request: HTTP/2 protocol stream error".into()
+            )
+        );
+        assert_ne!(protocol_error, TransportFailure::Disconnected);
+
+        assert_eq!(
+            App::classify_guided_write_sql_error(&anyhow::anyhow!(
+                "error sending request: connection reset by peer"
+            )),
+            TransportFailure::Disconnected
+        );
+        assert_eq!(
+            App::classify_guided_write_sql_error(&anyhow::anyhow!("request canceled by caller")),
+            TransportFailure::Cancelled
+        );
+        assert_eq!(
+            App::classify_guided_write_sql_error(&anyhow::anyhow!("backend timeout elapsed")),
+            TransportFailure::Timeout
+        );
+    }
+
+    #[test]
+    fn guided_write_sql_error_classifier_parsed_http_4xx_wins_over_body_heuristics() {
+        let cancelled_detail = "SQL query HTTP 409: operation cancelled";
+        assert_eq!(
+            App::classify_guided_write_sql_error(&anyhow::anyhow!(cancelled_detail)),
+            TransportFailure::Validation(cancelled_detail.into())
+        );
+
+        let timeout_detail = "SQL query HTTP 422: validation timed out while checking unique key";
+        assert_eq!(
+            App::classify_guided_write_sql_error(&anyhow::anyhow!(timeout_detail)),
+            TransportFailure::Validation(timeout_detail.into())
+        );
+    }
+
+    #[tokio::test]
+    async fn spreadsheet_postcondition_planning_failure_clears_marker_consumes_plan_without_dispatch(
+    ) {
+        let mut app = spreadsheet_app();
+        app.tables_grid.selected_col = 1;
+        app.begin_cell_edit();
+        app.state
+            .edit_mode
+            .as_mut()
+            .and_then(|edit_mode| edit_mode.editor.as_mut())
+            .unwrap()
+            .set("Adele".to_string());
+        app.commit_cell_edit();
+        app.save_pending_edits().await;
+        let plan_id = app.spreadsheet_lifecycle_plan_id().unwrap();
+
+        app.state.tables[0].columns[1].col_name = "bad\0column".to_string();
+        app.dispatch_confirmed_write_plan(plan_id, "spreadsheet save".to_string())
+            .await;
+
+        assert_eq!(
+            app.state
+                .edit_mode
+                .as_ref()
+                .map(|mode| mode.pending_count()),
+            Some(1)
+        );
+        assert!(app.spreadsheet_lifecycle_plan_id().is_none());
+        assert!(!app.write_plans.contains_key(&plan_id));
+        assert!(app.guided_write_locks.targets_by_plan_id.is_empty());
+        assert!(app.event_rx.try_recv().is_err());
+        assert!(!app.state.query_loading);
+        assert!(app.state.query_result.is_none());
+        assert!(app
+            .state
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Postcondition verification planning failed; nothing sent"));
+    }
+
     #[tokio::test]
     async fn spreadsheet_in_flight_freezes_edit_revert_exit_and_duplicate_save_until_result() {
         let mut app = spreadsheet_app();
@@ -7046,14 +8449,483 @@ mod modal_helper_tests {
             .targets_by_plan_id
             .contains_key(&plan_id));
 
-        app.handle_app_event(AppEvent::GuidedWriteOpError {
-            plan_id,
-            op: "edit".to_string(),
-            error: "nope".to_string(),
-        })
-        .await;
+        app.handle_app_event(guided_unknown_outcome_event(plan_id, "edit", "nope"))
+            .await;
         assert!(app.spreadsheet_save_lifecycle.is_none());
         assert_eq!(app.state.edit_mode.as_ref().unwrap().pending_count(), 1);
+    }
+
+    fn users_table() -> QualifiedTable {
+        QualifiedTable {
+            database: "db".into(),
+            schema: None,
+            table: "users".into(),
+        }
+    }
+
+    fn block_users_guided_writes(app: &mut App, generation: u64) {
+        app.guided_write_blocks
+            .insert(GuidedWriteBlockKey::from_table(&users_table()), generation);
+    }
+
+    fn users_browse_context(
+        app: &App,
+        origin: TableBrowseOrigin,
+        table_generation: u64,
+    ) -> TableBrowseRequestContext {
+        TableBrowseRequestContext {
+            database: "db".into(),
+            schema: None,
+            table: "users".into(),
+            origin,
+            server_context_generation: app.server_context_generation,
+            table_generation,
+            schema_generation: app.schema_generation,
+            database_generation: app.database_generation,
+        }
+    }
+
+    #[test]
+    fn blocked_enter_edit_mode_itself_refuses_and_explains_manual_refresh() {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        block_users_guided_writes(&mut app, 0);
+
+        app.enter_edit_mode();
+
+        assert!(app.state.edit_mode.is_none());
+        assert!(app
+            .state
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("manual refresh"));
+    }
+
+    #[test]
+    fn blocked_guided_update_form_refuses_and_explains_manual_refresh() {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        block_users_guided_writes(&mut app, 0);
+
+        app.open_update_form();
+
+        assert!(app.state.modal.is_none());
+        assert!(app.pending_update_draft.is_none());
+        assert!(app
+            .state
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("manual refresh"));
+    }
+
+    #[test]
+    fn blocked_guided_delete_confirmation_refuses_and_explains_manual_refresh() {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        block_users_guided_writes(&mut app, 0);
+
+        app.open_delete_confirm();
+
+        assert!(app.state.modal.is_none());
+        assert!(app
+            .state
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("manual refresh"));
+    }
+
+    #[tokio::test]
+    async fn blocked_spreadsheet_save_preserves_existing_dirty_row() {
+        let mut app = spreadsheet_app();
+        app.tables_grid.selected_col = 1;
+        app.begin_cell_edit();
+        if let Some(editor) = app
+            .state
+            .edit_mode
+            .as_mut()
+            .and_then(|edit_mode| edit_mode.editor.as_mut())
+        {
+            editor.set("Adele".to_string());
+        } else {
+            assert!(false, "expected open cell editor");
+        }
+        app.commit_cell_edit();
+        block_users_guided_writes(&mut app, 0);
+
+        app.save_pending_edits().await;
+
+        assert_eq!(
+            app.state
+                .edit_mode
+                .as_ref()
+                .map(|mode| mode.pending_count()),
+            Some(1)
+        );
+        assert!(app.write_plans.is_empty());
+        assert!(app.event_rx.try_recv().is_err());
+        assert!(app
+            .state
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("manual refresh"));
+    }
+
+    #[tokio::test]
+    async fn blocked_final_confirm_cleans_plan_without_event_lock_or_losing_spreadsheet_edits() {
+        let mut app = spreadsheet_app();
+        app.tables_grid.selected_col = 1;
+        app.begin_cell_edit();
+        if let Some(editor) = app
+            .state
+            .edit_mode
+            .as_mut()
+            .and_then(|edit_mode| edit_mode.editor.as_mut())
+        {
+            editor.set("Adele".to_string());
+        } else {
+            assert!(false, "expected open cell editor");
+        }
+        app.commit_cell_edit();
+        app.save_pending_edits().await;
+        let Some(plan_id) = app.spreadsheet_lifecycle_plan_id() else {
+            assert!(false, "expected spreadsheet save plan");
+            return;
+        };
+        block_users_guided_writes(&mut app, 0);
+
+        app.dispatch_confirmed_write_plan(plan_id, "spreadsheet save".into())
+            .await;
+
+        assert!(!app.write_plans.contains_key(&plan_id));
+        assert!(app.spreadsheet_lifecycle_plan_id().is_none());
+        assert_eq!(
+            app.state
+                .edit_mode
+                .as_ref()
+                .map(|mode| mode.pending_count()),
+            Some(1)
+        );
+        assert!(app.guided_write_locks.targets_by_plan_id.is_empty());
+        assert!(app.event_rx.try_recv().is_err());
+        assert!(app
+            .state
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("manual refresh"));
+    }
+
+    #[tokio::test]
+    async fn exact_newer_manual_refresh_unblocks_but_same_generation_automatic_navigation_error_stale_unrelated_and_navigation_do_not(
+    ) {
+        let mut app = spreadsheet_app();
+        block_users_guided_writes(&mut app, 0);
+        let users = users_table();
+
+        for (origin, generation) in [
+            (TableBrowseOrigin::ManualRefresh, 0),
+            (TableBrowseOrigin::Automatic, 1),
+            (TableBrowseOrigin::Navigation, 1),
+        ] {
+            app.table_generation = generation;
+            app.handle_app_event(AppEvent::TableBrowseResult {
+                context: users_browse_context(&app, origin, generation),
+                result: query_result("Ada"),
+            })
+            .await;
+            assert_eq!(app.guided_write_blocked_generation(&users), Some(0));
+        }
+
+        app.handle_app_event(AppEvent::TableBrowseError {
+            context: users_browse_context(&app, TableBrowseOrigin::ManualRefresh, 1),
+            error: "boom".into(),
+        })
+        .await;
+        assert_eq!(app.guided_write_blocked_generation(&users), Some(0));
+
+        app.handle_app_event(AppEvent::TableBrowseResult {
+            context: TableBrowseRequestContext {
+                table: "other".into(),
+                ..users_browse_context(&app, TableBrowseOrigin::ManualRefresh, 1)
+            },
+            result: query_result("Ada"),
+        })
+        .await;
+        assert_eq!(app.guided_write_blocked_generation(&users), Some(0));
+
+        app.state.selected_table_idx = None;
+        app.state.selected_table_idx = Some(0);
+        assert_eq!(app.guided_write_blocked_generation(&users), Some(0));
+
+        app.table_generation = 1;
+        app.handle_app_event(AppEvent::TableBrowseResult {
+            context: users_browse_context(&app, TableBrowseOrigin::ManualRefresh, 1),
+            result: query_result("Ada"),
+        })
+        .await;
+        assert_eq!(app.guided_write_blocked_generation(&users), None);
+    }
+
+    #[tokio::test]
+    async fn blocked_generic_write_success_does_not_auto_refresh_or_defer_current_table() {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        block_users_guided_writes(&mut app, 0);
+        let table_generation = app.table_generation;
+
+        app.handle_app_event(AppEvent::WriteOpSuccess {
+            op: "generic write".into(),
+            response: serde_json::Value::Null,
+        })
+        .await;
+
+        assert_eq!(app.table_generation, table_generation);
+        assert!(!app.state.query_loading);
+        assert!(app.deferred_guided_refresh.is_none());
+        assert_eq!(app.guided_write_blocked_generation(&users_table()), Some(0));
+    }
+
+    #[tokio::test]
+    async fn deferred_guided_refresh_flush_drops_target_that_became_blocked() {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        queue_users_refresh(&mut app);
+        assert!(app.deferred_guided_refresh.is_some());
+        block_users_guided_writes(&mut app, 0);
+        let table_generation = app.table_generation;
+
+        app.flush_deferred_guided_refresh_if_unowned().await;
+
+        assert_eq!(app.table_generation, table_generation);
+        assert!(!app.state.query_loading);
+        assert!(app.deferred_guided_refresh.is_none());
+        assert_eq!(app.guided_write_blocked_generation(&users_table()), Some(0));
+    }
+
+    #[tokio::test]
+    async fn deferred_guided_refresh_drains_once_after_stale_guided_unknown_terminal() {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        let table_a = QualifiedTable {
+            database: "db".into(),
+            schema: None,
+            table: "posts".into(),
+        };
+        let plan_id = WritePlanId(700);
+        let plan_a = make_write_plan(plan_id, "db", None, "posts", 1, true);
+        assert!(app.guided_write_locks.acquire(&plan_a));
+        queue_users_refresh(&mut app);
+        let generation_before = app.table_generation;
+
+        app.handle_app_event(AppEvent::GuidedWriteVerification {
+            plan_id,
+            op: "edit A".into(),
+            report: WriteVerificationReport {
+                outcome: MutationOutcome::Unknown {
+                    reason: "ambiguous outcome".into(),
+                },
+            },
+        })
+        .await;
+
+        assert!(app.deferred_guided_refresh.is_none());
+        assert!(app.state.query_loading);
+        assert_eq!(app.table_generation, generation_before + 1);
+        assert_eq!(app.guided_write_blocked_generation(&table_a), Some(0));
+        assert_eq!(app.guided_write_blocked_generation(&users_table()), None);
+        assert_no_extra_table_refresh(&mut app);
+
+        app.handle_app_event(AppEvent::GuidedWriteVerification {
+            plan_id,
+            op: "edit A duplicate".into(),
+            report: WriteVerificationReport {
+                outcome: MutationOutcome::Unknown {
+                    reason: "duplicate".into(),
+                },
+            },
+        })
+        .await;
+
+        assert_eq!(app.table_generation, generation_before + 1);
+    }
+
+    #[tokio::test]
+    async fn deferred_guided_refresh_drains_once_after_stale_guided_definitely_not_sent_terminal() {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        let table_a = QualifiedTable {
+            database: "db".into(),
+            schema: None,
+            table: "posts".into(),
+        };
+        let plan_id = WritePlanId(701);
+        let plan_a = make_write_plan(plan_id, "db", None, "posts", 1, true);
+        assert!(app.guided_write_locks.acquire(&plan_a));
+        queue_users_refresh(&mut app);
+        let generation_before = app.table_generation;
+
+        app.handle_app_event(AppEvent::GuidedWriteVerification {
+            plan_id,
+            op: "edit A".into(),
+            report: WriteVerificationReport {
+                outcome: MutationOutcome::DefinitelyNotSent {
+                    reason: "local failure".into(),
+                },
+            },
+        })
+        .await;
+
+        assert!(app.deferred_guided_refresh.is_none());
+        assert!(app.state.query_loading);
+        assert_eq!(app.table_generation, generation_before + 1);
+        assert_eq!(app.guided_write_blocked_generation(&table_a), None);
+        assert_eq!(app.guided_write_blocked_generation(&users_table()), None);
+        assert_no_extra_table_refresh(&mut app);
+
+        app.handle_app_event(AppEvent::GuidedWriteVerification {
+            plan_id,
+            op: "edit A duplicate".into(),
+            report: WriteVerificationReport {
+                outcome: MutationOutcome::DefinitelyNotSent {
+                    reason: "duplicate".into(),
+                },
+            },
+        })
+        .await;
+
+        assert_eq!(app.table_generation, generation_before + 1);
+    }
+
+    #[tokio::test]
+    async fn guided_write_unsafe_final_blocks_exact_table_guards_and_newer_browse_unblocks() {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        app.tables_grid.selected_row = 0;
+        app.tables_grid.selected_col = 1;
+        app.open_update_form();
+        let modal = app.state.modal.as_mut().expect("guided update form modal");
+        let crate::state::modal::Modal::Form { fields, .. } = modal else {
+            panic!("expected guided update form");
+        };
+        fields[1].input.set("Alicia".to_string());
+        app.handle_modal_key(KeyEvent::from(KeyCode::Enter)).await;
+        let plan_id = match app
+            .state
+            .modal
+            .as_ref()
+            .map(crate::state::modal::Modal::action)
+        {
+            Some(crate::state::modal::ModalAction::Safety(
+                crate::state::modal::SafetyModalAction::ConfirmWritePlan { plan_id },
+            )) => *plan_id,
+            other => panic!("expected confirmation modal, got {other:?}"),
+        };
+        app.state.modal = None;
+        app.dispatch_confirmed_write_plan(plan_id, "guided update".to_string())
+            .await;
+        assert_eq!(app.guided_write_locks.targets_by_plan_id.len(), 1);
+        queue_users_refresh(&mut app);
+
+        app.handle_app_event(AppEvent::GuidedWriteVerification {
+            plan_id,
+            op: "guided update".to_string(),
+            report: WriteVerificationReport {
+                outcome: MutationOutcome::Unknown {
+                    reason: "verification failed".into(),
+                },
+            },
+        })
+        .await;
+
+        let users = QualifiedTable {
+            database: "db".into(),
+            schema: None,
+            table: "users".into(),
+        };
+        assert_eq!(app.guided_write_blocked_generation(&users), Some(0));
+        assert!(app.deferred_guided_refresh.is_none());
+        assert!(app.guided_write_locks.targets_by_plan_id.is_empty());
+        assert!(app
+            .state
+            .log_buffer
+            .iter()
+            .any(|entry| entry.target.as_deref() == Some("guided-write-safety")));
+        app.open_update_form();
+        assert!(app.state.modal.is_none());
+        assert!(app
+            .state
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("manual refresh"));
+
+        app.handle_app_event(AppEvent::GuidedWriteVerification {
+            plan_id,
+            op: "duplicate".to_string(),
+            report: WriteVerificationReport {
+                outcome: MutationOutcome::SentAndConfirmed {
+                    affected_rows: None,
+                },
+            },
+        })
+        .await;
+        assert_eq!(app.guided_write_blocked_generation(&users), Some(0));
+
+        let stale_context = TableBrowseRequestContext {
+            database: "db".into(),
+            schema: None,
+            table: "users".into(),
+            origin: TableBrowseOrigin::Automatic,
+            server_context_generation: app.server_context_generation,
+            table_generation: 0,
+            schema_generation: app.schema_generation,
+            database_generation: app.database_generation,
+        };
+        app.handle_app_event(AppEvent::TableBrowseResult {
+            context: stale_context,
+            result: query_result("Ada"),
+        })
+        .await;
+        assert_eq!(app.guided_write_blocked_generation(&users), Some(0));
+
+        app.table_generation = 1;
+        let newer_context = TableBrowseRequestContext {
+            database: "db".into(),
+            schema: None,
+            table: "users".into(),
+            origin: TableBrowseOrigin::Automatic,
+            server_context_generation: app.server_context_generation,
+            table_generation: 1,
+            schema_generation: app.schema_generation,
+            database_generation: app.database_generation,
+        };
+        app.handle_app_event(AppEvent::TableBrowseResult {
+            context: newer_context,
+            result: query_result("Ada"),
+        })
+        .await;
+        assert_eq!(app.guided_write_blocked_generation(&users), Some(0));
+
+        let manual_newer_context = TableBrowseRequestContext {
+            database: "db".into(),
+            schema: None,
+            table: "users".into(),
+            origin: TableBrowseOrigin::ManualRefresh,
+            server_context_generation: app.server_context_generation,
+            table_generation: 1,
+            schema_generation: app.schema_generation,
+            database_generation: app.database_generation,
+        };
+        app.handle_app_event(AppEvent::TableBrowseResult {
+            context: manual_newer_context,
+            result: query_result("Ada"),
+        })
+        .await;
+        assert_eq!(app.guided_write_blocked_generation(&users), None);
     }
 
     #[tokio::test]
@@ -7136,7 +9008,9 @@ mod modal_helper_tests {
         app.handle_app_event(AppEvent::TableBrowseResult {
             context: TableBrowseRequestContext {
                 database: "db".to_string(),
+                schema: None,
                 table: "users".to_string(),
+                origin: TableBrowseOrigin::Automatic,
                 table_generation: 7,
                 server_context_generation: 0,
                 schema_generation: 1,
@@ -7155,7 +9029,9 @@ mod modal_helper_tests {
         app.handle_app_event(AppEvent::TableBrowseError {
             context: TableBrowseRequestContext {
                 database: "db".to_string(),
+                schema: None,
                 table: "users".to_string(),
+                origin: TableBrowseOrigin::Automatic,
                 table_generation: 7,
                 server_context_generation: 0,
                 schema_generation: 1,
@@ -7177,7 +9053,9 @@ mod modal_helper_tests {
         app.handle_app_event(AppEvent::TableBrowseResult {
             context: TableBrowseRequestContext {
                 database: "db".to_string(),
+                schema: None,
                 table: "users".to_string(),
+                origin: TableBrowseOrigin::Automatic,
                 table_generation: 7,
                 server_context_generation: 0,
                 schema_generation: 2,
@@ -7196,7 +9074,9 @@ mod modal_helper_tests {
         app.handle_app_event(AppEvent::TableBrowseError {
             context: TableBrowseRequestContext {
                 database: "db".to_string(),
+                schema: None,
                 table: "users".to_string(),
+                origin: TableBrowseOrigin::Automatic,
                 table_generation: 7,
                 server_context_generation: 0,
                 schema_generation: 2,
@@ -7259,6 +9139,23 @@ mod modal_helper_tests {
     }
 
     #[test]
+    fn guided_write_locks_same_complete_key_blocks_across_table_generations() {
+        let mut locks = GuidedWriteLocks::default();
+        let mut first = make_write_plan(WritePlanId(1), "db", Some("public"), "users", 7, true);
+        let mut same_row_newer_generation =
+            make_write_plan(WritePlanId(2), "db", Some("public"), "users", 7, false);
+        first.row_generation = 11;
+        same_row_newer_generation.row_generation = 12;
+
+        assert!(locks.acquire(&first));
+        assert!(locks.is_locked(&same_row_newer_generation));
+        assert!(!locks.acquire(&same_row_newer_generation));
+
+        let released = locks.release(first.id).expect("release preserves metadata");
+        assert_eq!(released.table_generation, 11);
+    }
+
+    #[test]
     fn guided_write_locks_different_database_table_or_key_are_not_locked() {
         let mut locks = GuidedWriteLocks::default();
         let base = make_write_plan(WritePlanId(1), "db", Some("public"), "users", 7, true);
@@ -7288,6 +9185,28 @@ mod modal_helper_tests {
         assert!(locks.release(WritePlanId(1)).is_none());
         assert!(!locks.is_locked(&same_target));
         assert!(locks.acquire(&same_target));
+    }
+
+    #[test]
+    fn postcondition_fetch_failures_map_critical_multiplicity_and_unknown_transport() {
+        let critical =
+            verification_report_from_postcondition_fetch_error(PostconditionFetchError::critical(
+                "complete-key new tuple verification returned 2 rows",
+            ));
+        assert!(matches!(
+            critical.outcome,
+            MutationOutcome::CriticalSafetyError { ref reason }
+                if reason.contains("complete-key new tuple")
+        ));
+
+        let unknown = verification_report_from_postcondition_fetch_error(
+            PostconditionFetchError::unknown("postcondition verification timed out"),
+        );
+        assert!(matches!(
+            unknown.outcome,
+            MutationOutcome::Unknown { ref reason }
+                if reason.contains("timed out")
+        ));
     }
 
     fn make_write_plan(

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, fmt};
 
 use crate::api::types::{ColumnInfo, TableInfo};
 use crate::state::safety::{
@@ -495,6 +495,499 @@ pub fn build_delete_sql(plan: &WritePlan, table: &TableInfo) -> Result<String, S
         encode_qualified_table(&plan.table)?,
         encode_key_predicate(&plan.original_primary_key, table)?
     ))
+}
+
+/// Pre-built SQL queries used to verify a mutation's postcondition.
+///
+/// These are constructed before the mutation is dispatched so the
+/// verification SELECT can run immediately after the write completes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PostconditionQueries {
+    Update {
+        original_key_lookup: String,
+        new_key_lookup: Option<String>,
+    },
+    Delete {
+        original_key_lookup: String,
+    },
+}
+
+/// Result of a postcondition lookup query.
+///
+/// `Zero` means the target row was not found, `One` carries the single
+/// matching row, and `Multiple` signals an ambiguous result that must
+/// be treated as a safety failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LookupRows {
+    Zero,
+    One(Vec<serde_json::Value>),
+    Multiple(usize),
+}
+
+/// Errors that can occur while building or executing postcondition
+/// verification queries.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PostconditionQueryError {
+    SqlEncoding(SqlEncodingError),
+    DuplicateColumnName(String),
+    MissingColumnName(String),
+    UnexpectedColumnName(String),
+    RowSchemaLengthMismatch { expected: usize, actual: usize },
+    MalformedValue { column_id: u32 },
+}
+
+impl From<SqlEncodingError> for PostconditionQueryError {
+    fn from(error: SqlEncodingError) -> Self {
+        Self::SqlEncoding(error)
+    }
+}
+
+pub fn plan_postcondition_queries(
+    plan: &WritePlan,
+    table: &TableInfo,
+) -> Result<PostconditionQueries, PostconditionQueryError> {
+    let original_key_lookup = build_key_lookup_sql(&plan.table, table, &plan.original_primary_key)?;
+    match &plan.mutation {
+        GuidedMutation::Delete => Ok(PostconditionQueries::Delete {
+            original_key_lookup,
+        }),
+        GuidedMutation::Update { changes } => {
+            let new_key = derived_new_primary_key(plan, changes)?;
+            let new_key_lookup = if new_key != plan.original_primary_key {
+                Some(build_key_lookup_sql(&plan.table, table, &new_key)?)
+            } else {
+                None
+            };
+            Ok(PostconditionQueries::Update {
+                original_key_lookup,
+                new_key_lookup,
+            })
+        }
+    }
+}
+
+fn derived_new_primary_key(
+    plan: &WritePlan,
+    changes: &[ColumnChange],
+) -> Result<CompletePrimaryKey, PostconditionQueryError> {
+    let mut parts = Vec::with_capacity(plan.original_primary_key.parts().len());
+    for part in plan.original_primary_key.parts() {
+        let value = changes
+            .iter()
+            .find(|change| change.column_id == u32::from(part.column_id))
+            .map(|change| change.new_value.clone())
+            .unwrap_or_else(|| part.value.clone());
+        parts.push(PrimaryKeyPart {
+            column_id: part.column_id,
+            value,
+        });
+    }
+    CompletePrimaryKey::from_schema_ordered_parts(parts)
+        .map_err(|_| PostconditionQueryError::SqlEncoding(SqlEncodingError::NullLiteralRejected))
+}
+
+fn build_key_lookup_sql(
+    target: &QualifiedTable,
+    table: &TableInfo,
+    key: &CompletePrimaryKey,
+) -> Result<String, SqlEncodingError> {
+    Ok(format!(
+        "SELECT {} FROM {} WHERE {} LIMIT 2",
+        explicit_column_list(table)?,
+        encode_qualified_table(target)?,
+        encode_key_predicate(key, table)?
+    ))
+}
+
+fn explicit_column_list(table: &TableInfo) -> Result<String, SqlEncodingError> {
+    table
+        .columns
+        .iter()
+        .map(|column| encode_identifier(&column.col_name))
+        .collect::<Result<Vec<_>, _>>()
+        .map(|columns| columns.join(", "))
+}
+
+pub fn normalize_lookup_result(
+    table: &TableInfo,
+    result: &crate::api::types::QueryResult,
+) -> Result<LookupRows, PostconditionQueryError> {
+    use std::collections::{HashMap, HashSet};
+
+    let mut names = HashSet::with_capacity(result.schema.len());
+    let mut index_by_name = HashMap::with_capacity(result.schema.len());
+    for (index, element) in result.schema.iter().enumerate() {
+        if !names.insert(element.name.clone()) {
+            return Err(PostconditionQueryError::DuplicateColumnName(
+                element.name.clone(),
+            ));
+        }
+        index_by_name.insert(element.name.as_str(), index);
+    }
+    for column in &table.columns {
+        if !index_by_name.contains_key(column.col_name.as_str()) {
+            return Err(PostconditionQueryError::MissingColumnName(
+                column.col_name.clone(),
+            ));
+        }
+    }
+    for element in &result.schema {
+        if !table
+            .columns
+            .iter()
+            .any(|column| column.col_name == element.name)
+        {
+            return Err(PostconditionQueryError::UnexpectedColumnName(
+                element.name.clone(),
+            ));
+        }
+    }
+
+    match result.rows.len() {
+        0 => Ok(LookupRows::Zero),
+        1 => {
+            let row = &result.rows[0];
+            if row.len() != result.schema.len() {
+                return Err(PostconditionQueryError::RowSchemaLengthMismatch {
+                    expected: result.schema.len(),
+                    actual: row.len(),
+                });
+            }
+            let mut normalized = Vec::with_capacity(table.columns.len());
+            for column in &table.columns {
+                let index = index_by_name[column.col_name.as_str()];
+                let value = row[index].clone();
+                typed_sql_value_from_json(column, &value).map_err(|_| {
+                    PostconditionQueryError::MalformedValue {
+                        column_id: column.col_id,
+                    }
+                })?;
+                normalized.push(value);
+            }
+            Ok(LookupRows::One(normalized))
+        }
+        count => Ok(LookupRows::Multiple(count)),
+    }
+}
+
+#[cfg(test)]
+fn verification_report_from_dml_result_and_postcondition(
+    plan: WritePlan,
+    _dml_result: &crate::api::types::QueryResult,
+    postcondition: Option<PostconditionEvidence>,
+) -> WriteVerificationReport {
+    verify_authoritative_mutation_result(&WriteVerificationRequest {
+        plan,
+        affected_rows: None,
+        postcondition,
+    })
+}
+
+#[cfg(test)]
+fn verification_report_from_update_lookup_rows(
+    plan: WritePlan,
+    table: &TableInfo,
+    row_by_original_key: LookupRows,
+    row_by_new_key: LookupRows,
+    old_key_still_present: Option<bool>,
+) -> WriteVerificationReport {
+    if let LookupRows::Multiple(count) = &row_by_original_key {
+        return critical(format!(
+            "complete-key postcondition lookup returned {count} rows; expected at most 1"
+        ));
+    }
+
+    let primary_key_changed = match &plan.mutation {
+        GuidedMutation::Update { changes } => changes.iter().any(|change| {
+            plan.original_primary_key
+                .parts()
+                .iter()
+                .any(|part| u32::from(part.column_id) == change.column_id)
+        }),
+        GuidedMutation::Delete => false,
+    };
+
+    if primary_key_changed && old_key_still_present == Some(true) {
+        return verify_authoritative_mutation_result(&WriteVerificationRequest {
+            plan,
+            affected_rows: None,
+            postcondition: Some(PostconditionEvidence::Update {
+                table: table.clone(),
+                row_by_original_key: match row_by_original_key {
+                    LookupRows::One(row) => Some(row),
+                    LookupRows::Zero => None,
+                    LookupRows::Multiple(_) => None,
+                },
+                row_by_new_key: None,
+                old_key_still_present,
+            }),
+        });
+    }
+
+    if let LookupRows::Multiple(count) = &row_by_new_key {
+        return critical(format!(
+            "complete-key postcondition lookup returned {count} rows; expected at most 1"
+        ));
+    }
+
+    verify_authoritative_mutation_result(&WriteVerificationRequest {
+        plan,
+        affected_rows: None,
+        postcondition: Some(PostconditionEvidence::Update {
+            table: table.clone(),
+            row_by_original_key: match row_by_original_key {
+                LookupRows::One(row) => Some(row),
+                LookupRows::Zero => None,
+                LookupRows::Multiple(_) => None,
+            },
+            row_by_new_key: match row_by_new_key {
+                LookupRows::One(row) => Some(row),
+                LookupRows::Zero => None,
+                LookupRows::Multiple(_) => None,
+            },
+            old_key_still_present,
+        }),
+    })
+}
+
+/// Whether a transport failure occurred before or after the mutation
+/// was handed to the server.
+///
+/// `BeforeTransportOwnership` failures prove the write was never sent;
+/// `AfterTransportOwnership` failures leave the outcome unknown.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MutationDispatchStage {
+    BeforeTransportOwnership,
+    AfterTransportOwnership,
+}
+
+/// Classification of a transport-level failure during mutation dispatch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TransportFailure {
+    Validation(String),
+    Timeout,
+    Disconnected,
+    Cancelled,
+    Http5xx(u16),
+    ProvenNotSent(String),
+}
+
+impl fmt::Display for TransportFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Validation(reason) | Self::ProvenNotSent(reason) => write!(f, "{reason}"),
+            Self::Timeout => write!(f, "mutation timed out after transport ownership"),
+            Self::Disconnected => write!(f, "connection dropped after transport ownership"),
+            Self::Cancelled => write!(f, "mutation cancelled after transport ownership"),
+            Self::Http5xx(status) => {
+                write!(f, "server returned HTTP {status} after transport ownership")
+            }
+        }
+    }
+}
+
+/// Evidence gathered from postcondition SELECT queries after a mutation.
+///
+/// Carries the raw lookup rows needed by
+/// [`verify_authoritative_mutation_result`] to decide whether the write
+/// actually took effect.
+#[derive(Clone, Debug)]
+pub enum PostconditionEvidence {
+    Update {
+        table: TableInfo,
+        row_by_original_key: Option<Vec<serde_json::Value>>,
+        row_by_new_key: Option<Vec<serde_json::Value>>,
+        old_key_still_present: Option<bool>,
+    },
+    Delete {
+        original_tuple_present: bool,
+    },
+}
+
+/// Input to authoritative mutation verification.
+///
+/// Combines the original write plan with either a server-reported
+/// affected-row count or postcondition evidence from follow-up SELECTs.
+#[derive(Clone, Debug)]
+pub struct WriteVerificationRequest {
+    pub plan: WritePlan,
+    pub affected_rows: Option<u64>,
+    pub postcondition: Option<PostconditionEvidence>,
+}
+
+/// The authoritative verdict on whether a mutation took effect.
+///
+/// Produced by [`verify_authoritative_mutation_result`]. The `outcome`
+/// field is the single source of truth for the caller's branching logic.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WriteVerificationReport {
+    pub outcome: MutationOutcome,
+}
+
+pub fn classify_mutation_error(
+    stage: MutationDispatchStage,
+    failure: TransportFailure,
+) -> MutationOutcome {
+    match (stage, failure) {
+        (_, TransportFailure::ProvenNotSent(reason)) => {
+            MutationOutcome::DefinitelyNotSent { reason }
+        }
+        (MutationDispatchStage::BeforeTransportOwnership, failure) => {
+            MutationOutcome::DefinitelyNotSent {
+                reason: failure.to_string(),
+            }
+        }
+        (MutationDispatchStage::AfterTransportOwnership, failure) => MutationOutcome::Unknown {
+            reason: failure.to_string(),
+        },
+    }
+}
+
+#[cfg(test)]
+fn can_auto_retry_mutation(outcome: &MutationOutcome) -> bool {
+    matches!(outcome, MutationOutcome::DefinitelyNotSent { .. })
+}
+
+pub fn verify_authoritative_mutation_result(
+    request: &WriteVerificationRequest,
+) -> WriteVerificationReport {
+    if let Some(affected_rows) = request.affected_rows {
+        return match affected_rows {
+            1 => confirmed(Some(1)),
+            0 => conflict("mutation matched no rows; target was not found or changed"),
+            count => critical(format!(
+                "mutation affected {count} rows; expected exactly 1"
+            )),
+        };
+    }
+
+    match (&request.plan.mutation, &request.postcondition) {
+        (
+            GuidedMutation::Update { changes },
+            Some(PostconditionEvidence::Update {
+                table,
+                row_by_original_key,
+                row_by_new_key,
+                old_key_still_present,
+            }),
+        ) => verify_update_postcondition(
+            &request.plan,
+            changes,
+            table,
+            row_by_original_key.as_deref(),
+            row_by_new_key.as_deref(),
+            *old_key_still_present,
+        ),
+        (GuidedMutation::Delete, Some(PostconditionEvidence::Delete { original_tuple_present: false })) => confirmed(None),
+        (GuidedMutation::Delete, Some(PostconditionEvidence::Delete { original_tuple_present: true })) => conflict("deleted tuple is still present after verification"),
+        (_, Some(_)) => unknown("postcondition evidence does not match mutation kind"),
+        _ => unknown("mutation result was not authoritative and no explicit postcondition verification was available"),
+    }
+}
+
+fn verify_update_postcondition(
+    plan: &WritePlan,
+    changes: &[ColumnChange],
+    table: &TableInfo,
+    row_by_original_key: Option<&[serde_json::Value]>,
+    row_by_new_key: Option<&[serde_json::Value]>,
+    old_key_still_present: Option<bool>,
+) -> WriteVerificationReport {
+    if table.table_name != plan.table.table {
+        return unknown("postcondition table does not match write plan table");
+    }
+    let primary_key_changed = changes.iter().any(|change| {
+        plan.original_primary_key
+            .parts()
+            .iter()
+            .any(|part| u32::from(part.column_id) == change.column_id)
+    });
+    if primary_key_changed {
+        match old_key_still_present {
+            Some(true) => {
+                return conflict("old primary-key tuple is still present after verification")
+            }
+            None => return unknown("old primary-key tuple absence was not checked"),
+            Some(false) => {}
+        }
+        let Some(new_row) = row_by_new_key else {
+            return conflict("updated tuple was not found by new primary key during verification");
+        };
+        return verify_changed_fields(table, new_row, changes);
+    }
+    let Some(current_row) = row_by_original_key else {
+        return conflict("updated tuple was not found by original key during verification");
+    };
+    verify_changed_fields(table, current_row, changes)
+}
+
+fn verify_changed_fields(
+    table: &TableInfo,
+    row: &[serde_json::Value],
+    changes: &[ColumnChange],
+) -> WriteVerificationReport {
+    for change in changes {
+        let Some((column_index, column)) = table
+            .columns
+            .iter()
+            .enumerate()
+            .find(|(_, column)| column.col_id == change.column_id)
+        else {
+            return unknown(format!(
+                "changed column {} is not in current schema",
+                change.column_id
+            ));
+        };
+        let Some(raw_value) = row.get(column_index) else {
+            return unknown(format!(
+                "verified row is missing changed column {}",
+                change.column_id
+            ));
+        };
+        let Ok(actual) = typed_sql_value_from_json(column, raw_value) else {
+            return unknown(format!(
+                "verified row has malformed value for changed column {}",
+                change.column_id
+            ));
+        };
+        if actual != change.new_value {
+            return conflict(format!(
+                "postcondition mismatch for column {}",
+                change.column_id
+            ));
+        }
+    }
+    confirmed(None)
+}
+
+fn confirmed(affected_rows: Option<u64>) -> WriteVerificationReport {
+    WriteVerificationReport {
+        outcome: MutationOutcome::SentAndConfirmed { affected_rows },
+    }
+}
+
+fn conflict(reason: impl Into<String>) -> WriteVerificationReport {
+    WriteVerificationReport {
+        outcome: MutationOutcome::Conflict {
+            reason: reason.into(),
+        },
+    }
+}
+
+fn unknown(reason: impl Into<String>) -> WriteVerificationReport {
+    WriteVerificationReport {
+        outcome: MutationOutcome::Unknown {
+            reason: reason.into(),
+        },
+    }
+}
+
+fn critical(reason: impl Into<String>) -> WriteVerificationReport {
+    WriteVerificationReport {
+        outcome: MutationOutcome::CriticalSafetyError {
+            reason: reason.into(),
+        },
+    }
 }
 
 pub fn revalidate_before_dispatch(
@@ -2993,6 +3486,982 @@ mod tests {
             Err(MutationOutcome::DefinitelyNotSent {
                 reason: "old value changed before confirmation".into()
             })
+        );
+    }
+
+    fn request_from_affected_rows(
+        plan_id: WritePlanId,
+        affected_rows: Option<u64>,
+    ) -> WriteVerificationRequest {
+        let key = CompletePrimaryKey::from_schema_ordered_parts(vec![PrimaryKeyPart {
+            column_id: 7,
+            value: SqlValue::U64(42),
+        }])
+        .unwrap();
+        WriteVerificationRequest {
+            plan: WritePlan {
+                id: plan_id,
+                table: QualifiedTable {
+                    database: "db".into(),
+                    schema: None,
+                    table: "inventory".into(),
+                },
+                original_primary_key: key,
+                schema_generation: 1,
+                row_generation: 1,
+                server_context_generation: 1,
+                database_generation: 1,
+                mutation: GuidedMutation::Delete,
+            },
+            affected_rows,
+            postcondition: None,
+        }
+    }
+
+    #[test]
+    fn authoritative_affected_row_count_classifies_success_not_found_and_critical_overwrite() {
+        assert_eq!(
+            verify_authoritative_mutation_result(&request_from_affected_rows(
+                WritePlanId(30),
+                Some(1)
+            ))
+            .outcome,
+            MutationOutcome::SentAndConfirmed {
+                affected_rows: Some(1)
+            }
+        );
+        let not_found = verify_authoritative_mutation_result(&request_from_affected_rows(
+            WritePlanId(31),
+            Some(0),
+        ));
+        assert_eq!(
+            not_found.outcome,
+            MutationOutcome::Conflict {
+                reason: "mutation matched no rows; target was not found or changed".into()
+            }
+        );
+
+        let report = verify_authoritative_mutation_result(&request_from_affected_rows(
+            WritePlanId(32),
+            Some(2),
+        ));
+
+        assert_eq!(
+            report.outcome,
+            MutationOutcome::CriticalSafetyError {
+                reason: "mutation affected 2 rows; expected exactly 1".into()
+            }
+        );
+    }
+
+    #[test]
+    fn unavailable_affected_count_requires_explicit_postconditions_for_normal_update() {
+        let table_info = table(vec![7]);
+        let plan = build_guided_update_plan(
+            WritePlanId(33),
+            QualifiedTable {
+                database: "db".into(),
+                schema: None,
+                table: table_info.table_name.clone(),
+            },
+            &table_info,
+            &[
+                serde_json::json!(42),
+                serde_json::json!("eu"),
+                serde_json::json!("Ada"),
+            ],
+            Generations {
+                schema: 1,
+                row: 1,
+                server_context: 1,
+                database: 1,
+            },
+            vec![ColumnChange {
+                column_id: 9,
+                old_value: Some(SqlValue::Text("Ada".into())),
+                new_value: SqlValue::Text("Grace".into()),
+            }],
+        )
+        .unwrap();
+
+        let report = verify_authoritative_mutation_result(&WriteVerificationRequest {
+            plan,
+            affected_rows: None,
+            postcondition: Some(PostconditionEvidence::Update {
+                table: table_info,
+                row_by_original_key: Some(vec![
+                    serde_json::json!(42),
+                    serde_json::json!("eu"),
+                    serde_json::json!("Grace"),
+                ]),
+                row_by_new_key: None,
+                old_key_still_present: None,
+            }),
+        });
+
+        assert_eq!(
+            report.outcome,
+            MutationOutcome::SentAndConfirmed {
+                affected_rows: None
+            }
+        );
+    }
+
+    #[test]
+    fn primary_key_update_requires_new_tuple_fields_and_old_tuple_absent() {
+        let table_info = table(vec![7]);
+        let plan = build_guided_update_plan(
+            WritePlanId(34),
+            QualifiedTable {
+                database: "db".into(),
+                schema: None,
+                table: table_info.table_name.clone(),
+            },
+            &table_info,
+            &[
+                serde_json::json!(42),
+                serde_json::json!("eu"),
+                serde_json::json!("Ada"),
+            ],
+            Generations {
+                schema: 1,
+                row: 1,
+                server_context: 1,
+                database: 1,
+            },
+            vec![ColumnChange {
+                column_id: 7,
+                old_value: Some(SqlValue::U64(42)),
+                new_value: SqlValue::U64(43),
+            }],
+        )
+        .unwrap();
+
+        let report = verify_authoritative_mutation_result(&WriteVerificationRequest {
+            plan,
+            affected_rows: None,
+            postcondition: Some(PostconditionEvidence::Update {
+                table: table_info,
+                row_by_original_key: None,
+                row_by_new_key: Some(vec![
+                    serde_json::json!(43),
+                    serde_json::json!("eu"),
+                    serde_json::json!("Ada"),
+                ]),
+                old_key_still_present: Some(false),
+            }),
+        });
+
+        assert_eq!(
+            report.outcome,
+            MutationOutcome::SentAndConfirmed {
+                affected_rows: None
+            }
+        );
+    }
+
+    #[test]
+    fn delete_requires_original_tuple_absent_when_count_unavailable() {
+        let table_info = table(vec![7]);
+        let plan = build_guided_delete_plan(
+            WritePlanId(35),
+            QualifiedTable {
+                database: "db".into(),
+                schema: None,
+                table: table_info.table_name.clone(),
+            },
+            &table_info,
+            &[
+                serde_json::json!(42),
+                serde_json::json!("eu"),
+                serde_json::json!("Ada"),
+            ],
+            Generations {
+                schema: 1,
+                row: 1,
+                server_context: 1,
+                database: 1,
+            },
+        )
+        .unwrap();
+
+        let report = verify_authoritative_mutation_result(&WriteVerificationRequest {
+            plan,
+            affected_rows: None,
+            postcondition: Some(PostconditionEvidence::Delete {
+                original_tuple_present: false,
+            }),
+        });
+
+        assert_eq!(
+            report.outcome,
+            MutationOutcome::SentAndConfirmed {
+                affected_rows: None
+            }
+        );
+    }
+
+    #[test]
+    fn missing_changed_field_mismatch_missing_row_and_old_key_policy_are_safe_failures() {
+        let table_info = table(vec![7]);
+        let plan = build_guided_update_plan(
+            WritePlanId(36),
+            QualifiedTable {
+                database: "db".into(),
+                schema: None,
+                table: table_info.table_name.clone(),
+            },
+            &table_info,
+            &[
+                serde_json::json!(42),
+                serde_json::json!("eu"),
+                serde_json::json!("Ada"),
+            ],
+            Generations {
+                schema: 1,
+                row: 1,
+                server_context: 1,
+                database: 1,
+            },
+            vec![ColumnChange {
+                column_id: 9,
+                old_value: Some(SqlValue::Text("Ada".into())),
+                new_value: SqlValue::Text("Grace".into()),
+            }],
+        )
+        .unwrap();
+
+        let missing_changed = verify_authoritative_mutation_result(&WriteVerificationRequest {
+            plan: plan.clone(),
+            affected_rows: None,
+            postcondition: Some(PostconditionEvidence::Update {
+                table: table_info.clone(),
+                row_by_original_key: Some(vec![serde_json::json!(42)]),
+                row_by_new_key: None,
+                old_key_still_present: None,
+            }),
+        });
+        assert!(matches!(
+            missing_changed.outcome,
+            MutationOutcome::Unknown { .. }
+        ));
+
+        let mismatch = verify_authoritative_mutation_result(&WriteVerificationRequest {
+            plan: plan.clone(),
+            affected_rows: None,
+            postcondition: Some(PostconditionEvidence::Update {
+                table: table_info.clone(),
+                row_by_original_key: Some(vec![
+                    serde_json::json!(42),
+                    serde_json::json!("eu"),
+                    serde_json::json!("Ada"),
+                ]),
+                row_by_new_key: None,
+                old_key_still_present: None,
+            }),
+        });
+        assert_eq!(
+            mismatch.outcome,
+            MutationOutcome::Conflict {
+                reason: "postcondition mismatch for column 9".into()
+            }
+        );
+
+        let missing_row = verify_authoritative_mutation_result(&WriteVerificationRequest {
+            plan: plan.clone(),
+            affected_rows: None,
+            postcondition: Some(PostconditionEvidence::Update {
+                table: table_info.clone(),
+                row_by_original_key: None,
+                row_by_new_key: None,
+                old_key_still_present: None,
+            }),
+        });
+        assert_eq!(
+            missing_row.outcome,
+            MutationOutcome::Conflict {
+                reason: "updated tuple was not found by original key during verification".into()
+            }
+        );
+
+        let pk_plan = build_guided_update_plan(
+            WritePlanId(37),
+            QualifiedTable {
+                database: "db".into(),
+                schema: None,
+                table: table_info.table_name.clone(),
+            },
+            &table_info,
+            &[
+                serde_json::json!(42),
+                serde_json::json!("eu"),
+                serde_json::json!("Ada"),
+            ],
+            Generations {
+                schema: 1,
+                row: 1,
+                server_context: 1,
+                database: 1,
+            },
+            vec![ColumnChange {
+                column_id: 7,
+                old_value: Some(SqlValue::U64(42)),
+                new_value: SqlValue::U64(43),
+            }],
+        )
+        .unwrap();
+        let old_present = verify_authoritative_mutation_result(&WriteVerificationRequest {
+            plan: pk_plan.clone(),
+            affected_rows: None,
+            postcondition: Some(PostconditionEvidence::Update {
+                table: table_info.clone(),
+                row_by_original_key: None,
+                row_by_new_key: Some(vec![
+                    serde_json::json!(43),
+                    serde_json::json!("eu"),
+                    serde_json::json!("Ada"),
+                ]),
+                old_key_still_present: Some(true),
+            }),
+        });
+        assert_eq!(
+            old_present.outcome,
+            MutationOutcome::Conflict {
+                reason: "old primary-key tuple is still present after verification".into()
+            }
+        );
+        let old_unchecked = verify_authoritative_mutation_result(&WriteVerificationRequest {
+            plan: pk_plan,
+            affected_rows: None,
+            postcondition: Some(PostconditionEvidence::Update {
+                table: table_info,
+                row_by_original_key: None,
+                row_by_new_key: Some(vec![
+                    serde_json::json!(43),
+                    serde_json::json!("eu"),
+                    serde_json::json!("Ada"),
+                ]),
+                old_key_still_present: None,
+            }),
+        });
+        assert!(matches!(
+            old_unchecked.outcome,
+            MutationOutcome::Unknown { .. }
+        ));
+    }
+
+    #[test]
+    fn absent_or_wrong_postcondition_evidence_is_unknown_or_critical() {
+        let no_evidence = verify_authoritative_mutation_result(&request_from_affected_rows(
+            WritePlanId(40),
+            None,
+        ));
+        assert!(matches!(
+            no_evidence.outcome,
+            MutationOutcome::Unknown { .. }
+        ));
+
+        let table_info = table(vec![7]);
+        let plan = build_guided_delete_plan(
+            WritePlanId(41),
+            QualifiedTable {
+                database: "db".into(),
+                schema: None,
+                table: "other_table".into(),
+            },
+            &table_info,
+            &[
+                serde_json::json!(42),
+                serde_json::json!("eu"),
+                serde_json::json!("Ada"),
+            ],
+            Generations {
+                schema: 1,
+                row: 1,
+                server_context: 1,
+                database: 1,
+            },
+        )
+        .unwrap();
+        let mismatch = verify_authoritative_mutation_result(&WriteVerificationRequest {
+            plan,
+            affected_rows: None,
+            postcondition: Some(PostconditionEvidence::Update {
+                table: table_info,
+                row_by_original_key: None,
+                row_by_new_key: None,
+                old_key_still_present: None,
+            }),
+        });
+        assert!(matches!(mismatch.outcome, MutationOutcome::Unknown { .. }));
+    }
+
+    #[test]
+    fn mismatched_update_postcondition_table_is_unknown_and_blocks_until_refresh() {
+        let mut table_info = table(vec![7]);
+        let plan = build_guided_update_plan(
+            WritePlanId(42),
+            QualifiedTable {
+                database: "db".into(),
+                schema: None,
+                table: table_info.table_name.clone(),
+            },
+            &table_info,
+            &[
+                serde_json::json!(42),
+                serde_json::json!("eu"),
+                serde_json::json!("Ada"),
+            ],
+            Generations {
+                schema: 1,
+                row: 1,
+                server_context: 1,
+                database: 1,
+            },
+            vec![ColumnChange {
+                column_id: 9,
+                old_value: Some(SqlValue::Text("Ada".into())),
+                new_value: SqlValue::Text("Grace".into()),
+            }],
+        )
+        .unwrap();
+        table_info.table_name = "inventory_archive".into();
+
+        let report = verify_authoritative_mutation_result(&WriteVerificationRequest {
+            plan,
+            affected_rows: None,
+            postcondition: Some(PostconditionEvidence::Update {
+                table: table_info,
+                row_by_original_key: Some(vec![
+                    serde_json::json!(42),
+                    serde_json::json!("eu"),
+                    serde_json::json!("Grace"),
+                ]),
+                row_by_new_key: None,
+                old_key_still_present: None,
+            }),
+        });
+
+        assert_eq!(
+            report.outcome,
+            MutationOutcome::Unknown {
+                reason: "postcondition table does not match write plan table".into()
+            }
+        );
+    }
+
+    #[test]
+    fn transport_failures_after_ownership_are_unknown_and_not_auto_retried() {
+        for failure in [
+            TransportFailure::Timeout,
+            TransportFailure::Disconnected,
+            TransportFailure::Cancelled,
+            TransportFailure::Http5xx(500),
+        ] {
+            let outcome = classify_mutation_error(
+                MutationDispatchStage::AfterTransportOwnership,
+                failure.clone(),
+            );
+            assert_eq!(
+                outcome,
+                MutationOutcome::Unknown {
+                    reason: failure.to_string()
+                }
+            );
+            assert!(!can_auto_retry_mutation(&outcome));
+        }
+        assert!(matches!(
+            classify_mutation_error(
+                MutationDispatchStage::BeforeTransportOwnership,
+                TransportFailure::Validation("bad".into())
+            ),
+            MutationOutcome::DefinitelyNotSent { .. }
+        ));
+        assert!(matches!(
+            classify_mutation_error(
+                MutationDispatchStage::AfterTransportOwnership,
+                TransportFailure::ProvenNotSent("not sent".into())
+            ),
+            MutationOutcome::DefinitelyNotSent { .. }
+        ));
+    }
+
+    #[test]
+    fn postcondition_sql_planning_uses_exact_columns_qualified_table_complete_keys_and_limit_two() {
+        let mut table_info = table(vec![7, 2]);
+        table_info.table_name = "weird table".into();
+        table_info.columns[0].col_name = "acct\"id".into();
+        table_info.columns[1].col_name = "region/name".into();
+        table_info.columns[2].col_name = "name".into();
+        let target = QualifiedTable {
+            database: "db".into(),
+            schema: Some("tenant.schema".into()),
+            table: table_info.table_name.clone(),
+        };
+        let base_row = [
+            serde_json::json!(42),
+            serde_json::json!("eu"),
+            serde_json::json!("Ada"),
+        ];
+        let normal = build_guided_update_plan(
+            WritePlanId(50),
+            target.clone(),
+            &table_info,
+            &base_row,
+            Generations {
+                schema: 1,
+                row: 1,
+                server_context: 1,
+                database: 1,
+            },
+            vec![ColumnChange {
+                column_id: 9,
+                old_value: Some(SqlValue::Text("Ada".into())),
+                new_value: SqlValue::Text("Grace".into()),
+            }],
+        )
+        .unwrap();
+        let normal_queries = plan_postcondition_queries(&normal, &table_info).unwrap();
+        assert_eq!(normal_queries, PostconditionQueries::Update { original_key_lookup: r#"SELECT "acct""id", "region/name", "name" FROM "tenant.schema"."weird table" WHERE "acct""id" = 42 AND "region/name" = 'eu' LIMIT 2"#.into(), new_key_lookup: None });
+
+        let pk = build_guided_update_plan(
+            WritePlanId(51),
+            target.clone(),
+            &table_info,
+            &base_row,
+            Generations {
+                schema: 1,
+                row: 1,
+                server_context: 1,
+                database: 1,
+            },
+            vec![ColumnChange {
+                column_id: 2,
+                old_value: Some(SqlValue::Text("eu".into())),
+                new_value: SqlValue::Text("us".into()),
+            }],
+        )
+        .unwrap();
+        let pk_queries = plan_postcondition_queries(&pk, &table_info).unwrap();
+        assert_eq!(pk_queries, PostconditionQueries::Update { original_key_lookup: r#"SELECT "acct""id", "region/name", "name" FROM "tenant.schema"."weird table" WHERE "acct""id" = 42 AND "region/name" = 'eu' LIMIT 2"#.into(), new_key_lookup: Some(r#"SELECT "acct""id", "region/name", "name" FROM "tenant.schema"."weird table" WHERE "acct""id" = 42 AND "region/name" = 'us' LIMIT 2"#.into()) });
+
+        let delete = build_guided_delete_plan(
+            WritePlanId(52),
+            target,
+            &table_info,
+            &base_row,
+            Generations {
+                schema: 1,
+                row: 1,
+                server_context: 1,
+                database: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(plan_postcondition_queries(&delete, &table_info).unwrap(), PostconditionQueries::Delete { original_key_lookup: r#"SELECT "acct""id", "region/name", "name" FROM "tenant.schema"."weird table" WHERE "acct""id" = 42 AND "region/name" = 'eu' LIMIT 2"#.into() });
+    }
+
+    #[test]
+    fn query_result_normalization_uses_schema_names_and_rejects_ambiguous_or_malformed_results() {
+        let table_info = table(vec![7]);
+        let reordered = crate::api::types::QueryResult {
+            schema: vec![schema("name"), schema("account"), schema("region")],
+            rows: vec![vec![
+                serde_json::json!("Grace"),
+                serde_json::json!(42),
+                serde_json::json!("eu"),
+            ]],
+            total_duration_micros: 0,
+        };
+        assert_eq!(
+            normalize_lookup_result(&table_info, &reordered).unwrap(),
+            LookupRows::One(vec![
+                serde_json::json!(42),
+                serde_json::json!("eu"),
+                serde_json::json!("Grace")
+            ])
+        );
+
+        let empty = crate::api::types::QueryResult {
+            schema: reordered.schema.clone(),
+            rows: vec![],
+            total_duration_micros: 0,
+        };
+        assert_eq!(
+            normalize_lookup_result(&table_info, &empty).unwrap(),
+            LookupRows::Zero
+        );
+        let duplicate = crate::api::types::QueryResult {
+            schema: vec![schema("account"), schema("account"), schema("name")],
+            rows: vec![],
+            total_duration_micros: 0,
+        };
+        assert!(matches!(
+            normalize_lookup_result(&table_info, &duplicate),
+            Err(PostconditionQueryError::DuplicateColumnName(_))
+        ));
+        let missing = crate::api::types::QueryResult {
+            schema: vec![schema("account"), schema("name")],
+            rows: vec![],
+            total_duration_micros: 0,
+        };
+        assert!(matches!(
+            normalize_lookup_result(&table_info, &missing),
+            Err(PostconditionQueryError::MissingColumnName(_))
+        ));
+        let malformed_len = crate::api::types::QueryResult {
+            schema: reordered.schema.clone(),
+            rows: vec![vec![serde_json::json!("Grace")]],
+            total_duration_micros: 0,
+        };
+        assert!(matches!(
+            normalize_lookup_result(&table_info, &malformed_len),
+            Err(PostconditionQueryError::RowSchemaLengthMismatch { .. })
+        ));
+        let malformed_type = crate::api::types::QueryResult {
+            schema: reordered.schema,
+            rows: vec![vec![
+                serde_json::json!("Grace"),
+                serde_json::json!("not-u64"),
+                serde_json::json!("eu"),
+            ]],
+            total_duration_micros: 0,
+        };
+        assert!(matches!(
+            normalize_lookup_result(&table_info, &malformed_type),
+            Err(PostconditionQueryError::MalformedValue { column_id: 7 })
+        ));
+        let multiple = crate::api::types::QueryResult {
+            schema: vec![schema("account"), schema("region"), schema("name")],
+            rows: vec![
+                vec![
+                    serde_json::json!(42),
+                    serde_json::json!("eu"),
+                    serde_json::json!("Grace"),
+                ],
+                vec![
+                    serde_json::json!(42),
+                    serde_json::json!("eu"),
+                    serde_json::json!("Other"),
+                ],
+            ],
+            total_duration_micros: 0,
+        };
+        assert_eq!(
+            normalize_lookup_result(&table_info, &multiple).unwrap(),
+            LookupRows::Multiple(2)
+        );
+    }
+
+    #[test]
+    fn dml_query_result_rows_are_never_copied_to_affected_rows() {
+        let report = verification_report_from_dml_result_and_postcondition(
+            request_from_affected_rows(WritePlanId(60), Some(99)).plan,
+            &crate::api::types::QueryResult {
+                schema: vec![schema("pretend_count")],
+                rows: vec![vec![serde_json::json!(3)]],
+                total_duration_micros: 0,
+            },
+            Some(PostconditionEvidence::Delete {
+                original_tuple_present: false,
+            }),
+        );
+        assert_eq!(
+            report.outcome,
+            MutationOutcome::SentAndConfirmed {
+                affected_rows: None
+            }
+        );
+    }
+
+    #[test]
+    fn pk_update_old_key_present_conflict_does_not_require_new_key_evidence() {
+        let table_info = table(vec![7, 2]);
+        let target = QualifiedTable {
+            database: "db".into(),
+            schema: None,
+            table: table_info.table_name.clone(),
+        };
+        let plan = match build_guided_update_plan(
+            WritePlanId(61),
+            target,
+            &table_info,
+            &[
+                serde_json::json!(42),
+                serde_json::json!("eu"),
+                serde_json::json!("Ada"),
+            ],
+            Generations {
+                schema: 1,
+                row: 1,
+                server_context: 1,
+                database: 1,
+            },
+            vec![ColumnChange {
+                column_id: 2,
+                old_value: Some(SqlValue::Text("eu".into())),
+                new_value: SqlValue::Text("us".into()),
+            }],
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                assert!(false, "expected valid guided update plan: {error:?}");
+                return;
+            }
+        };
+
+        let report = verification_report_from_update_lookup_rows(
+            plan,
+            &table_info,
+            LookupRows::One(vec![
+                serde_json::json!(42),
+                serde_json::json!("eu"),
+                serde_json::json!("Ada"),
+            ]),
+            LookupRows::Zero,
+            Some(true),
+        );
+
+        assert!(matches!(report.outcome, MutationOutcome::Conflict { .. }));
+    }
+
+    #[test]
+    fn pk_update_old_key_present_conflict_takes_precedence_over_new_key_multiplicity() {
+        let table_info = table(vec![7, 2]);
+        let plan = build_guided_update_plan(
+            WritePlanId(62),
+            QualifiedTable {
+                database: "db".into(),
+                schema: None,
+                table: table_info.table_name.clone(),
+            },
+            &table_info,
+            &[
+                serde_json::json!(42),
+                serde_json::json!("eu"),
+                serde_json::json!("Ada"),
+            ],
+            Generations {
+                schema: 1,
+                row: 1,
+                server_context: 1,
+                database: 1,
+            },
+            vec![ColumnChange {
+                column_id: 2,
+                old_value: Some(SqlValue::Text("eu".into())),
+                new_value: SqlValue::Text("us".into()),
+            }],
+        )
+        .unwrap();
+
+        let report = verification_report_from_update_lookup_rows(
+            plan,
+            &table_info,
+            LookupRows::One(vec![
+                serde_json::json!(42),
+                serde_json::json!("eu"),
+                serde_json::json!("Ada"),
+            ]),
+            LookupRows::Multiple(2),
+            Some(true),
+        );
+
+        assert!(matches!(
+            report.outcome,
+            MutationOutcome::Conflict { ref reason }
+                if reason.contains("old primary-key tuple is still present")
+        ));
+    }
+
+    fn schema(name: &str) -> crate::api::types::SchemaElement {
+        crate::api::types::SchemaElement {
+            name: name.into(),
+            algebraic_type: serde_json::Value::Null,
+        }
+    }
+    #[test]
+    fn task7_contract_wrong_evidence_is_unknown_not_critical() {
+        let table_info = table(vec![7]);
+        let plan = build_guided_delete_plan(
+            WritePlanId(141),
+            QualifiedTable {
+                database: "db".into(),
+                schema: None,
+                table: table_info.table_name.clone(),
+            },
+            &table_info,
+            &[
+                serde_json::json!(42),
+                serde_json::json!("eu"),
+                serde_json::json!("Ada"),
+            ],
+            Generations {
+                schema: 1,
+                row: 1,
+                server_context: 1,
+                database: 1,
+            },
+        )
+        .unwrap();
+
+        let report = verify_authoritative_mutation_result(&WriteVerificationRequest {
+            plan,
+            affected_rows: None,
+            postcondition: Some(PostconditionEvidence::Update {
+                table: table_info,
+                row_by_original_key: None,
+                row_by_new_key: None,
+                old_key_still_present: None,
+            }),
+        });
+
+        assert!(matches!(report.outcome, MutationOutcome::Unknown { .. }));
+    }
+
+    #[test]
+    fn task7_contract_rejects_unexpected_extra_schema_columns() {
+        let table_info = table(vec![7]);
+        let result = crate::api::types::QueryResult {
+            schema: vec![
+                schema("account"),
+                schema("region"),
+                schema("name"),
+                schema("extra"),
+            ],
+            rows: vec![vec![
+                serde_json::json!(42),
+                serde_json::json!("eu"),
+                serde_json::json!("Ada"),
+                serde_json::json!("unexpected"),
+            ]],
+            total_duration_micros: 0,
+        };
+
+        assert!(matches!(
+            normalize_lookup_result(&table_info, &result),
+            Err(PostconditionQueryError::UnexpectedColumnName(name)) if name == "extra"
+        ));
+    }
+
+    #[test]
+    fn task7_contract_lookup_multiplicity_classifies_as_critical() {
+        let table_info = table(vec![7]);
+        let plan = build_guided_update_plan(
+            WritePlanId(142),
+            QualifiedTable {
+                database: "db".into(),
+                schema: None,
+                table: table_info.table_name.clone(),
+            },
+            &table_info,
+            &[
+                serde_json::json!(42),
+                serde_json::json!("eu"),
+                serde_json::json!("Ada"),
+            ],
+            Generations {
+                schema: 1,
+                row: 1,
+                server_context: 1,
+                database: 1,
+            },
+            vec![ColumnChange {
+                column_id: 9,
+                old_value: Some(SqlValue::Text("Ada".into())),
+                new_value: SqlValue::Text("Grace".into()),
+            }],
+        )
+        .unwrap();
+
+        let report = verification_report_from_update_lookup_rows(
+            plan,
+            &table_info,
+            LookupRows::Multiple(2),
+            LookupRows::Zero,
+            None,
+        );
+
+        assert!(matches!(
+            report.outcome,
+            MutationOutcome::CriticalSafetyError { .. }
+        ));
+    }
+
+    #[test]
+    fn task7_contract_original_key_multiplicity_remains_critical_for_pk_update() {
+        let table_info = table(vec![7, 2]);
+        let plan = build_guided_update_plan(
+            WritePlanId(143),
+            QualifiedTable {
+                database: "db".into(),
+                schema: None,
+                table: table_info.table_name.clone(),
+            },
+            &table_info,
+            &[
+                serde_json::json!(42),
+                serde_json::json!("eu"),
+                serde_json::json!("Ada"),
+            ],
+            Generations {
+                schema: 1,
+                row: 1,
+                server_context: 1,
+                database: 1,
+            },
+            vec![ColumnChange {
+                column_id: 2,
+                old_value: Some(SqlValue::Text("eu".into())),
+                new_value: SqlValue::Text("us".into()),
+            }],
+        )
+        .unwrap();
+
+        let report = verification_report_from_update_lookup_rows(
+            plan,
+            &table_info,
+            LookupRows::Multiple(3),
+            LookupRows::Zero,
+            Some(true),
+        );
+
+        assert!(matches!(
+            report.outcome,
+            MutationOutcome::CriticalSafetyError { ref reason }
+                if reason.contains("complete-key postcondition lookup returned 3 rows")
+        ));
+    }
+
+    #[test]
+    fn task7_contract_transport_failure_variants_are_exact() {
+        fn accepts_exact_failure(failure: TransportFailure) -> String {
+            failure.to_string()
+        }
+
+        assert_eq!(
+            accepts_exact_failure(TransportFailure::Validation("bad".into())),
+            "bad"
+        );
+        assert_eq!(
+            accepts_exact_failure(TransportFailure::Timeout),
+            "mutation timed out after transport ownership"
+        );
+        assert_eq!(
+            accepts_exact_failure(TransportFailure::Disconnected),
+            "connection dropped after transport ownership"
+        );
+        assert_eq!(
+            accepts_exact_failure(TransportFailure::Cancelled),
+            "mutation cancelled after transport ownership"
+        );
+        assert_eq!(
+            accepts_exact_failure(TransportFailure::Http5xx(503)),
+            "server returned HTTP 503 after transport ownership"
+        );
+        assert_eq!(
+            accepts_exact_failure(TransportFailure::ProvenNotSent("not sent".into())),
+            "not sent"
         );
     }
 }

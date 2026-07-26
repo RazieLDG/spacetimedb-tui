@@ -9,6 +9,7 @@
 mod api;
 mod app;
 mod config;
+mod effects;
 mod state;
 mod ui;
 mod user_config;

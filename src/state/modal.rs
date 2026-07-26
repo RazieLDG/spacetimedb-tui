@@ -13,6 +13,7 @@
 //! Both variants funnel through [`ModalAction`] so the app event loop
 //! can dispatch them with a single match.
 
+use crate::state::safety::WritePlanId;
 use crate::ui::components::input::InputState;
 
 /// One labelled input field inside a [`Modal::Form`].
@@ -41,13 +42,24 @@ impl FormField {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SafetyModalAction {
+    ConfirmWritePlan {
+        plan_id: WritePlanId,
+    },
+    DirtyRowChoice {
+        requested_row: usize,
+        requested_column: u32,
+    },
+}
+
 /// What to do when a modal is accepted (Enter / `y`).
 ///
 /// We don't keep callbacks because that would require boxing
 /// closures with a tonne of lifetimes; instead we describe the
 /// intent and let the app event loop translate it back into the
 /// right async call.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ModalAction {
     /// Call the named reducer with the form's values, JSON-parsed in
     /// declaration order. Used by Module-tab Enter.
@@ -63,26 +75,6 @@ pub enum ModalAction {
     InsertRow {
         table: String,
         column_types: Vec<String>,
-    },
-    /// Update a single row by primary key. The PK column may be at
-    /// any index — `pk_index` tells the dispatcher which form field
-    /// is read-only and which `column_types[i]` to use for the
-    /// WHERE clause literal.
-    UpdateRow {
-        table: String,
-        pk_column: String,
-        column_types: Vec<String>,
-        /// Pre-formatted SQL literal for the WHERE clause, captured
-        /// at modal-open time from the row's raw JSON value via
-        /// `json_to_sql_literal`. Stored as a ready-to-paste literal
-        /// (e.g. `0xdeadbeef`, `42`, `'alice'`) so the dispatcher
-        /// doesn't have to re-derive it — and so editing the PK
-        /// field in the form can't corrupt the WHERE clause.
-        pk_sql_literal: String,
-        /// Index of the PK column inside `column_types` / `fields`,
-        /// so the dispatcher knows which field to skip when
-        /// generating the SET clause.
-        pk_index: usize,
     },
     /// Delete a single row identified by `where_sql` (already
     /// quoted / formatted by the caller). Confirm dialog only.
@@ -111,6 +103,9 @@ pub enum ModalAction {
     /// the user leaves edit mode with uncommitted changes we pop a
     /// confirm dialog; accepting it drops the pending edits.
     DiscardPendingEdits,
+    /// Type-safe write-plan modal action. The app owns the actual
+    /// write plan and modal state carries only stable IDs / coordinates.
+    Safety(SafetyModalAction),
 }
 
 impl ModalAction {
@@ -120,12 +115,17 @@ impl ModalAction {
         match self {
             ModalAction::CallReducer { reducer, .. } => format!("call {reducer}"),
             ModalAction::InsertRow { table, .. } => format!("insert into {table}"),
-            ModalAction::UpdateRow { table, .. } => format!("update {table}"),
             ModalAction::DeleteRow { table, .. } => format!("delete from {table}"),
             ModalAction::DeleteDatabase { database } => format!("delete db {database}"),
             ModalAction::TruncateTable { table } => format!("truncate {table}"),
             ModalAction::AddDatabaseAlias { database } => format!("alias {database}"),
             ModalAction::DiscardPendingEdits => "discard edits".to_string(),
+            ModalAction::Safety(SafetyModalAction::ConfirmWritePlan { plan_id }) => {
+                format!("confirm write plan {}", plan_id.0)
+            }
+            ModalAction::Safety(SafetyModalAction::DirtyRowChoice { .. }) => {
+                "prepare guided update".to_string()
+            }
         }
     }
 }
@@ -259,5 +259,38 @@ mod tests {
         );
         assert_eq!(m.title(), "Delete row?");
         assert!(matches!(m.action(), ModalAction::DeleteRow { .. }));
+    }
+
+    #[test]
+    fn safety_modal_actions_are_stable_value_actions() {
+        use crate::state::safety::WritePlanId;
+
+        let confirm = SafetyModalAction::ConfirmWritePlan {
+            plan_id: WritePlanId(42),
+        };
+        assert_eq!(confirm.clone(), confirm);
+        assert_eq!(
+            format!("{confirm:?}"),
+            "ConfirmWritePlan { plan_id: WritePlanId(42) }"
+        );
+
+        let dirty = SafetyModalAction::DirtyRowChoice {
+            requested_row: 7,
+            requested_column: 9,
+        };
+        assert_eq!(dirty.clone(), dirty);
+        assert_ne!(confirm, dirty);
+    }
+
+    #[test]
+    fn modal_action_can_carry_safety_plan_id_without_callback_state() {
+        use crate::state::safety::WritePlanId;
+
+        let action = ModalAction::Safety(SafetyModalAction::ConfirmWritePlan {
+            plan_id: WritePlanId(99),
+        });
+
+        assert_eq!(action.op_label(), "confirm write plan 99");
+        assert_eq!(action.clone(), action);
     }
 }

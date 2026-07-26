@@ -97,6 +97,137 @@ pub struct ConfirmationSnapshot<'a> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuidedFormValue {
+    pub input: String,
+    pub typed_value: SqlValue,
+}
+
+pub fn guided_form_value_from_raw(
+    column: &ColumnInfo,
+    raw: &serde_json::Value,
+) -> Result<GuidedFormValue, PrimaryKeyError> {
+    let declared = declared_type_name(&column.col_type).ok_or(PrimaryKeyError::TypeMismatch {
+        column_id: column_id_u16(column)?,
+        expected: "supported scalar type".into(),
+    })?;
+    let typed_value = typed_sql_value_from_json(column, raw)?;
+    Ok(GuidedFormValue {
+        input: guided_form_input_from_sql_value(&typed_value, declared),
+        typed_value,
+    })
+}
+
+pub fn guided_form_sql_value_from_user_input(
+    column: &ColumnInfo,
+    raw: &str,
+) -> Result<SqlValue, PrimaryKeyError> {
+    let column_id = column_id_u16(column)?;
+    let declared = declared_type_name(&column.col_type)
+        .ok_or(PrimaryKeyError::UnrepresentableValue { column_id })?;
+    match declared {
+        "String" => Ok(SqlValue::Text(raw.to_owned())),
+        "Bool" => {
+            raw.parse::<bool>()
+                .map(SqlValue::Bool)
+                .map_err(|_| PrimaryKeyError::TypeMismatch {
+                    column_id,
+                    expected: declared.to_owned(),
+                })
+        }
+        "Identity" | "ConnectionId" => Ok(SqlValue::Text(raw.to_owned())),
+        declared if declared.contains("Address") => Ok(SqlValue::Text(raw.to_owned())),
+        "U64" => raw
+            .parse::<u64>()
+            .map(SqlValue::U64)
+            .map_err(|_| PrimaryKeyError::TypeMismatch {
+                column_id,
+                expected: declared.to_owned(),
+            }),
+        "U8" | "U16" | "U32" => raw
+            .parse::<u64>()
+            .ok()
+            .filter(|value| integer_fits_unsigned_tag(*value, declared))
+            .map(SqlValue::U64)
+            .ok_or(PrimaryKeyError::TypeMismatch {
+                column_id,
+                expected: declared.to_owned(),
+            }),
+        "I8" | "I16" | "I32" | "I64" => raw
+            .parse::<i64>()
+            .ok()
+            .filter(|value| integer_fits_signed_tag(*value, declared))
+            .map(SqlValue::I64)
+            .ok_or(PrimaryKeyError::TypeMismatch {
+                column_id,
+                expected: declared.to_owned(),
+            }),
+        "F32" => raw
+            .parse::<f32>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .map(|value| SqlValue::F64Bits(f64::from(value).to_bits()))
+            .ok_or(PrimaryKeyError::UnrepresentableValue { column_id }),
+        "F64" => raw
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .map(|value| SqlValue::F64Bits(value.to_bits()))
+            .ok_or(PrimaryKeyError::UnrepresentableValue { column_id }),
+        "U128" | "U256" | "I128" | "I256" => {
+            if large_integer_string_fits_tag(raw, declared) {
+                Ok(SqlValue::Text(raw.to_owned()))
+            } else {
+                Err(PrimaryKeyError::TypeMismatch {
+                    column_id,
+                    expected: declared.to_owned(),
+                })
+            }
+        }
+        "Bytes" | "ByteArray" | "VecU8" => {
+            bytes_from_guided_input(raw)
+                .map(SqlValue::Bytes)
+                .ok_or(PrimaryKeyError::TypeMismatch {
+                    column_id,
+                    expected: declared.to_owned(),
+                })
+        }
+        _ => Err(PrimaryKeyError::UnrepresentableValue { column_id }),
+    }
+}
+
+pub fn guided_form_value_changed(
+    column: &ColumnInfo,
+    original: &GuidedFormValue,
+    raw: &str,
+) -> Result<bool, PrimaryKeyError> {
+    Ok(guided_form_sql_value_from_user_input(column, raw)? != original.typed_value)
+}
+
+fn guided_form_input_from_sql_value(value: &SqlValue, _declared: &str) -> String {
+    match value {
+        SqlValue::Null => String::new(),
+        SqlValue::Bool(value) => value.to_string(),
+        SqlValue::I64(value) => value.to_string(),
+        SqlValue::U64(value) => value.to_string(),
+        SqlValue::F64Bits(bits) => f64::from_bits(*bits).to_string(),
+        SqlValue::Text(value) => value.clone(),
+        SqlValue::Bytes(bytes) => format!("0x{}", bytes_to_hex(bytes)),
+        SqlValue::Unrepresentable(value) => value.clone(),
+    }
+}
+
+fn bytes_from_guided_input(raw: &str) -> Option<Vec<u8>> {
+    let hex = raw.strip_prefix("0x")?;
+    if hex.len() % 2 != 0 || !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).ok())
+        .collect()
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SqlEncodingError {
     EmptyIdentifier,
     NulInIdentifier,
@@ -106,6 +237,14 @@ pub enum SqlEncodingError {
     WrongMutationKind,
     NoChangedFields,
     TypeMismatch { column_id: u32, expected: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WritePlanBuildError {
+    PrimaryKey(PrimaryKeyError),
+    NoChangedFields,
+    TypeMismatch { column_id: u32, expected: String },
+    Encoding(SqlEncodingError),
 }
 
 pub fn type_tag(declared_type: &serde_json::Value) -> Result<TypeTag, SqlEncodingError> {
@@ -180,6 +319,129 @@ pub fn create_write_plan(
         server_context_generation: generations.server_context,
         database_generation: generations.database,
         mutation,
+    }
+}
+
+pub fn build_guided_update_plan(
+    id: WritePlanId,
+    qualified_table: QualifiedTable,
+    table: &TableInfo,
+    selected_raw_row: &[serde_json::Value],
+    generations: Generations,
+    changes: Vec<ColumnChange>,
+) -> Result<WritePlan, WritePlanBuildError> {
+    if changes.is_empty() {
+        return Err(WritePlanBuildError::NoChangedFields);
+    }
+
+    let change_refs: Vec<&ColumnChange> = changes.iter().collect();
+    validate_column_changes_against_table(&change_refs, table).map_err(|error| match error {
+        SqlEncodingError::TypeMismatch {
+            column_id,
+            expected,
+        } => WritePlanBuildError::TypeMismatch {
+            column_id,
+            expected,
+        },
+        other => WritePlanBuildError::Encoding(other),
+    })?;
+
+    let key = complete_primary_key_from_table_row(table, selected_raw_row)
+        .map_err(WritePlanBuildError::PrimaryKey)?;
+    Ok(create_write_plan(
+        id,
+        qualified_table,
+        key,
+        generations,
+        GuidedMutation::Update { changes },
+    ))
+}
+
+pub fn build_guided_delete_plan(
+    id: WritePlanId,
+    qualified_table: QualifiedTable,
+    table: &TableInfo,
+    selected_raw_row: &[serde_json::Value],
+    generations: Generations,
+) -> Result<WritePlan, WritePlanBuildError> {
+    let key = complete_primary_key_from_table_row(table, selected_raw_row)
+        .map_err(WritePlanBuildError::PrimaryKey)?;
+    Ok(create_write_plan(
+        id,
+        qualified_table,
+        key,
+        generations,
+        GuidedMutation::Delete,
+    ))
+}
+
+pub fn format_guided_update_confirmation(plan: &WritePlan) -> String {
+    let GuidedMutation::Update { changes } = &plan.mutation else {
+        return "Not an update plan".to_string();
+    };
+    let mut lines = vec![format!(
+        "Update one row in {}.{}",
+        format_qualified_database_schema_table(&plan.table),
+        plan.table.table
+    )];
+    lines.push(format!(
+        "Key: {}",
+        format_complete_key(&plan.original_primary_key)
+    ));
+    lines.push("Changes:".to_string());
+    for change in changes {
+        lines.push(format!(
+            "- column {}: {} -> {}",
+            change.column_id,
+            change
+                .old_value
+                .as_ref()
+                .map(format_sql_value)
+                .unwrap_or_else(|| "<unknown>".to_string()),
+            format_sql_value(&change.new_value)
+        ));
+    }
+    lines.join("\n")
+}
+
+pub fn format_guided_delete_confirmation(plan: &WritePlan, row: &[serde_json::Value]) -> String {
+    format!(
+        "Delete exactly one row from {}.{}\nKey: {}\nDestructive target: 1 row. Confirm only if this key and current row are correct. Current row: {}",
+        format_qualified_database_schema_table(&plan.table),
+        plan.table.table,
+        format_complete_key(&plan.original_primary_key),
+        row.iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn format_qualified_database_schema_table(table: &QualifiedTable) -> String {
+    match &table.schema {
+        Some(schema) => format!("{}.{}", table.database, schema),
+        None => table.database.clone(),
+    }
+}
+
+fn format_complete_key(key: &CompletePrimaryKey) -> String {
+    key.parts()
+        .iter()
+        .map(|part| format!("{}={}", part.column_id, format_sql_value(&part.value)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_sql_value(value: &SqlValue) -> String {
+    match value {
+        SqlValue::Null => "NULL".to_string(),
+        SqlValue::Bool(value) => value.to_string(),
+        SqlValue::I64(value) => value.to_string(),
+        SqlValue::U64(value) => value.to_string(),
+        SqlValue::F64Bits(bits) => f64::from_bits(*bits).to_string(),
+        SqlValue::Text(value) => format!("{value:?}"),
+        SqlValue::Bytes(bytes) => format!("0x{}", bytes_to_hex(bytes)),
+        SqlValue::Unrepresentable(value) => format!("<unrepresentable:{value}>"),
     }
 }
 
@@ -1035,7 +1297,10 @@ fn error_for_mode(mode: TaggedValueMode) -> DeclaredValueError {
 mod tests {
     use super::*;
     use crate::api::types::{ColumnInfo, TableInfo};
-    use crate::state::safety::{PrimaryKeyError, SqlValue};
+    use crate::state::safety::{
+        ColumnChange, CompletePrimaryKey, GuidedMutation, PrimaryKeyError, PrimaryKeyPart,
+        QualifiedTable, SqlValue, WritePlanId,
+    };
 
     fn col(id: u32, name: &str, type_name: &str) -> ColumnInfo {
         let col_type = match type_name {
@@ -1092,6 +1357,155 @@ mod tests {
             indexes: vec![],
             constraints: vec![],
         }
+    }
+
+    #[test]
+    fn guided_form_input_preserves_strings_and_parses_u64_full_range_without_hex_misclassification()
+    {
+        let string_col = scalar_col(1, "name", "String");
+        for raw in ["", "  padded  ", "{\"json\":true}", "[1,2]"] {
+            assert_eq!(
+                guided_form_sql_value_from_user_input(&string_col, raw).unwrap(),
+                SqlValue::Text(raw.to_string())
+            );
+        }
+
+        let u64_col = scalar_col(2, "count", "U64");
+        assert_eq!(
+            guided_form_sql_value_from_user_input(&u64_col, &u64::MAX.to_string()).unwrap(),
+            SqlValue::U64(u64::MAX)
+        );
+
+        let identity_col = scalar_col(3, "identity", "Identity");
+        let numeric_hex = "1234abcd";
+        assert_eq!(
+            guided_form_sql_value_from_user_input(&identity_col, numeric_hex).unwrap(),
+            SqlValue::Text(numeric_hex.to_string())
+        );
+    }
+
+    #[test]
+    fn guided_form_raw_round_trips_supported_tagged_shapes_and_typed_change_detection() {
+        let fixtures = [
+            (
+                "Identity",
+                serde_json::json!({"__identity__":"0x1234abcd"}),
+                SqlValue::Text("0x1234abcd".into()),
+            ),
+            (
+                "ConnectionId",
+                serde_json::json!({"ConnectionId":"0xabcd1234"}),
+                SqlValue::Text("0xabcd1234".into()),
+            ),
+            (
+                "U256",
+                serde_json::json!({"U256":"340282366920938463463374607431768211456"}),
+                SqlValue::Text("340282366920938463463374607431768211456".into()),
+            ),
+            (
+                "F32",
+                serde_json::json!({"F32": 1065353216_u32}),
+                SqlValue::F64Bits(1.0f64.to_bits()),
+            ),
+            (
+                "F64",
+                serde_json::json!({"F64": 4607182418800017408_u64}),
+                SqlValue::F64Bits(1.0f64.to_bits()),
+            ),
+            (
+                "Bool",
+                serde_json::json!({"Bool": true}),
+                SqlValue::Bool(true),
+            ),
+            (
+                "Bytes",
+                serde_json::json!({"Bytes": [0, 255]}),
+                SqlValue::Bytes(vec![0, 255]),
+            ),
+        ];
+        for (tag, raw, expected) in fixtures {
+            let column = scalar_col(7, "value", tag);
+            let form = guided_form_value_from_raw(&column, &raw).unwrap();
+            assert_eq!(form.typed_value, expected);
+            assert_eq!(
+                guided_form_sql_value_from_user_input(&column, &form.input).unwrap(),
+                form.typed_value
+            );
+        }
+
+        let string_col = scalar_col(8, "note", "String");
+        let original =
+            guided_form_value_from_raw(&string_col, &serde_json::json!("  padded  ")).unwrap();
+        assert!(!guided_form_value_changed(&string_col, &original, "  padded  ").unwrap());
+        assert!(guided_form_value_changed(&string_col, &original, "padded").unwrap());
+    }
+
+    #[test]
+    fn guided_confirmation_summaries_include_target_complete_key_and_typed_values() {
+        let key = CompletePrimaryKey::from_schema_ordered_parts(vec![
+            PrimaryKeyPart {
+                column_id: 1,
+                value: SqlValue::U64(42),
+            },
+            PrimaryKeyPart {
+                column_id: 2,
+                value: SqlValue::Text("north".into()),
+            },
+        ])
+        .unwrap();
+        let table = QualifiedTable {
+            database: "db".into(),
+            schema: Some("public".into()),
+            table: "inventory".into(),
+        };
+        let update = create_write_plan(
+            WritePlanId(99),
+            table.clone(),
+            key.clone(),
+            Generations {
+                schema: 1,
+                row: 2,
+                server_context: 3,
+                database: 4,
+            },
+            GuidedMutation::Update {
+                changes: vec![ColumnChange {
+                    column_id: 9,
+                    old_value: Some(SqlValue::Text("old".into())),
+                    new_value: SqlValue::Bytes(vec![0xab, 0xcd]),
+                }],
+            },
+        );
+        let update_summary = format_guided_update_confirmation(&update);
+        assert!(update_summary.contains("db.public.inventory"));
+        assert!(update_summary.contains("1=42, 2=\"north\""));
+        assert!(update_summary.contains("column 9: \"old\" -> 0xabcd"));
+
+        let delete = create_write_plan(
+            WritePlanId(100),
+            table,
+            key,
+            Generations {
+                schema: 1,
+                row: 2,
+                server_context: 3,
+                database: 4,
+            },
+            GuidedMutation::Delete,
+        );
+        let delete_summary = format_guided_delete_confirmation(
+            &delete,
+            &[serde_json::json!(42), serde_json::json!("north")],
+        );
+        assert!(delete_summary.contains("Delete exactly one row from db.public.inventory"));
+        assert!(delete_summary.contains("Key: 1=42, 2=\"north\""));
+        assert!(delete_summary.contains(
+            "Destructive target: 1 row. Confirm only if this key and current row are correct."
+        ));
+        assert!(!delete_summary.contains("will delete 1 row"));
+        assert!(!delete_summary.contains("will be verified"));
+        assert!(!delete_summary.contains("already confirmed"));
+        assert!(delete_summary.contains("42, \"north\""));
     }
 
     #[test]
@@ -1448,7 +1862,8 @@ mod tests {
             );
 
             let key =
-                complete_primary_key_from_table_row(&table_info, &[lower_pass.clone()]).unwrap();
+                complete_primary_key_from_table_row(&table_info, std::slice::from_ref(&lower_pass))
+                    .unwrap();
             let valid_stored = if type_name.starts_with('U') {
                 SqlValue::U64(max as u64)
             } else {
@@ -1941,6 +2356,179 @@ mod tests {
         assert_eq!(
             build_update_sql(&plan, &table_info).unwrap(),
             "UPDATE \"inventory\" SET \"name\" = 'Grace' WHERE \"account\" = 42 AND \"region\" = 'eu'"
+        );
+    }
+
+    #[test]
+    fn build_guided_update_plan_rejects_table_without_declared_pk_even_when_id_like_column_exists()
+    {
+        let mut no_key = table(vec![]);
+        no_key.columns[0].col_name = "id".into();
+
+        let result = build_guided_update_plan(
+            WritePlanId(20),
+            QualifiedTable {
+                database: "db".into(),
+                schema: None,
+                table: no_key.table_name.clone(),
+            },
+            &no_key,
+            &[
+                serde_json::json!(1),
+                serde_json::json!("eu"),
+                serde_json::json!("Ada"),
+            ],
+            Generations {
+                schema: 1,
+                row: 1,
+                server_context: 1,
+                database: 1,
+            },
+            vec![ColumnChange {
+                column_id: 9,
+                old_value: Some(SqlValue::Text("Ada".into())),
+                new_value: SqlValue::Text("Grace".into()),
+            }],
+        );
+
+        assert_eq!(
+            result.unwrap_err(),
+            WritePlanBuildError::PrimaryKey(PrimaryKeyError::NoDeclaredPrimaryKey)
+        );
+    }
+
+    #[test]
+    fn build_guided_update_plan_uses_actual_tableinfo_raw_row_and_generations() {
+        let table_info = table(vec![2, 7]);
+        let plan = build_guided_update_plan(
+            WritePlanId(21),
+            QualifiedTable {
+                database: "db".into(),
+                schema: None,
+                table: table_info.table_name.clone(),
+            },
+            &table_info,
+            &[
+                serde_json::json!(1),
+                serde_json::json!("eu"),
+                serde_json::json!("Ada"),
+            ],
+            Generations {
+                schema: 3,
+                row: 4,
+                server_context: 5,
+                database: 6,
+            },
+            vec![ColumnChange {
+                column_id: 9,
+                old_value: Some(SqlValue::Text("Ada".into())),
+                new_value: SqlValue::Text("Grace".into()),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(plan.schema_generation, 3);
+        assert_eq!(plan.row_generation, 4);
+        assert_eq!(plan.server_context_generation, 5);
+        assert_eq!(plan.database_generation, 6);
+        assert_eq!(plan.original_primary_key.parts()[0].column_id, 7);
+        assert_eq!(plan.original_primary_key.parts()[1].column_id, 2);
+    }
+
+    #[test]
+    fn build_guided_delete_plan_reuses_same_complete_key_policy() {
+        let table_info = table(vec![7]);
+        let plan = build_guided_delete_plan(
+            WritePlanId(22),
+            QualifiedTable {
+                database: "db".into(),
+                schema: None,
+                table: table_info.table_name.clone(),
+            },
+            &table_info,
+            &[
+                serde_json::json!(1),
+                serde_json::json!("eu"),
+                serde_json::json!("Ada"),
+            ],
+            Generations {
+                schema: 3,
+                row: 4,
+                server_context: 5,
+                database: 6,
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(plan.mutation, GuidedMutation::Delete));
+        assert_eq!(plan.original_primary_key.parts().len(), 1);
+    }
+
+    #[test]
+    fn build_guided_update_plan_rejects_empty_update() {
+        let table_info = table(vec![7]);
+
+        let result = build_guided_update_plan(
+            WritePlanId(23),
+            QualifiedTable {
+                database: "db".into(),
+                schema: None,
+                table: table_info.table_name.clone(),
+            },
+            &table_info,
+            &[
+                serde_json::json!(1),
+                serde_json::json!("eu"),
+                serde_json::json!("Ada"),
+            ],
+            Generations {
+                schema: 3,
+                row: 4,
+                server_context: 5,
+                database: 6,
+            },
+            vec![],
+        );
+
+        assert_eq!(result, Err(WritePlanBuildError::NoChangedFields));
+    }
+
+    #[test]
+    fn build_guided_update_plan_validates_every_change_declared_type() {
+        let table_info = table(vec![7]);
+
+        let result = build_guided_update_plan(
+            WritePlanId(24),
+            QualifiedTable {
+                database: "db".into(),
+                schema: None,
+                table: table_info.table_name.clone(),
+            },
+            &table_info,
+            &[
+                serde_json::json!(1),
+                serde_json::json!("eu"),
+                serde_json::json!("Ada"),
+            ],
+            Generations {
+                schema: 3,
+                row: 4,
+                server_context: 5,
+                database: 6,
+            },
+            vec![ColumnChange {
+                column_id: 9,
+                old_value: Some(SqlValue::Text("Ada".into())),
+                new_value: SqlValue::Bool(true),
+            }],
+        );
+
+        assert_eq!(
+            result,
+            Err(WritePlanBuildError::TypeMismatch {
+                column_id: 9,
+                expected: "String".into()
+            })
         );
     }
 

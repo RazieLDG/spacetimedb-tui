@@ -106,6 +106,7 @@ pub struct WritePlan {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MutationOutcome {
+    CriticalSafetyError { reason: String },
     DefinitelyNotSent { reason: String },
     SentAndConfirmed { affected_rows: Option<u64> },
     Conflict { reason: String },
@@ -166,6 +167,50 @@ mod tests {
                 value: SqlValue::Unrepresentable("array".into()),
             }]),
             Err(PrimaryKeyError::UnrepresentableValue { column_id: 0 })
+        );
+    }
+
+    #[test]
+    fn mutation_outcome_variants_are_constructible_for_transport_classification() {
+        assert_eq!(
+            MutationOutcome::DefinitelyNotSent {
+                reason: "local stale state".into(),
+            },
+            MutationOutcome::DefinitelyNotSent {
+                reason: "local stale state".into(),
+            }
+        );
+        assert_eq!(
+            MutationOutcome::SentAndConfirmed {
+                affected_rows: Some(1),
+            },
+            MutationOutcome::SentAndConfirmed {
+                affected_rows: Some(1),
+            }
+        );
+        assert_eq!(
+            MutationOutcome::Conflict {
+                reason: "old key still present".into(),
+            },
+            MutationOutcome::Conflict {
+                reason: "old key still present".into(),
+            }
+        );
+        assert_eq!(
+            MutationOutcome::Unknown {
+                reason: "verification unavailable".into(),
+            },
+            MutationOutcome::Unknown {
+                reason: "verification unavailable".into(),
+            }
+        );
+        assert_eq!(
+            MutationOutcome::CriticalSafetyError {
+                reason: "invariant violated".into(),
+            },
+            MutationOutcome::CriticalSafetyError {
+                reason: "invariant violated".into(),
+            }
         );
     }
 }

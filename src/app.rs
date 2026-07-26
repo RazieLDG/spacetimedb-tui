@@ -8,7 +8,10 @@
 ///    event arriving on the mpsc channel.
 /// 3. Dispatches the event to the appropriate handler.
 /// 4. Loops until `app_state.should_quit` is set.
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -18,11 +21,24 @@ use ratatui::widgets::Widget;
 
 use crate::{
     api::{
+        types::TableInfo,
         ws::{WsConfig, WsEvent, WsHandle},
         SpacetimeClient,
     },
     config::Config,
+    effects::write_ops::{
+        build_delete_sql, build_guided_delete_plan, build_guided_update_plan, build_update_sql,
+        complete_primary_key_from_table_row, format_guided_delete_confirmation,
+        format_guided_update_confirmation, guided_form_sql_value_from_user_input,
+        guided_form_value_changed, guided_form_value_from_raw, revalidate_before_dispatch,
+        typed_sql_value_from_json, ConfirmationSnapshot, Generations, GuidedFormValue,
+        WritePlanBuildError,
+    },
     state::{
+        safety::{
+            ColumnChange, CompletePrimaryKey, GuidedMutation, MutationOutcome, PrimaryKeyError,
+            QualifiedTable, WritePlan, WritePlanId,
+        },
         AppState, ConnectionStatus, FocusPanel, HistoryAdvance, SidebarFocus, SqlHistoryEntry, Tab,
     },
     ui::components::input::InputState,
@@ -42,11 +58,17 @@ pub enum AppEvent {
     /// Databases list fetched.
     DatabasesLoaded(Vec<String>),
     /// Tables / schema fetched for the selected database.
-    SchemaLoaded(crate::api::types::SchemaResponse),
+    SchemaLoaded {
+        context: SchemaRequestContext,
+        schema: crate::api::types::SchemaResponse,
+    },
     /// Schema fetch failed — carries a pre-formatted error message.
     /// Separate from the generic `Error` variant so the handler can
     /// clear `schema_loading` and flip `schema_load_failed` atomically.
-    SchemaError(String),
+    SchemaError {
+        context: SchemaRequestContext,
+        error: String,
+    },
     /// SQL query result arrived (user-typed SQL in the SQL console tab).
     QueryResult {
         result: crate::api::types::QueryResult,
@@ -57,10 +79,14 @@ pub enum AppEvent {
     /// sidebar). Kept separate from `QueryResult` so the Tables tab and the
     /// SQL tab do not share state.
     TableBrowseResult {
+        context: TableBrowseRequestContext,
         result: crate::api::types::QueryResult,
     },
     /// Table-browse load failed.
-    TableBrowseError { error: String },
+    TableBrowseError {
+        context: TableBrowseRequestContext,
+        error: String,
+    },
     /// SQL query failed.
     QueryError { sql: String, error: String },
     /// Log lines fetched.
@@ -79,6 +105,18 @@ pub enum AppEvent {
     },
     /// A reducer call (or write-SQL exec) failed.
     WriteOpError { op: String, error: String },
+    /// A guided row update/delete finished successfully and should release its row lock.
+    GuidedWriteOpSuccess {
+        plan_id: WritePlanId,
+        op: String,
+        response: serde_json::Value,
+    },
+    /// A guided row update/delete failed and should release its row lock.
+    GuidedWriteOpError {
+        plan_id: WritePlanId,
+        op: String,
+        error: String,
+    },
     /// A live log line from WebSocket.
     LogLine(crate::api::types::LogEntry),
     /// Ping result.
@@ -87,6 +125,86 @@ pub enum AppEvent {
     Notification(String),
     /// Generic error.
     Error(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SchemaRequestContext {
+    database: String,
+    schema_generation: u64,
+    database_generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableBrowseRequestContext {
+    database: String,
+    table: String,
+    table_generation: u64,
+    schema_generation: u64,
+    database_generation: u64,
+}
+
+#[derive(Clone, Debug)]
+struct PendingGuidedUpdateDraft {
+    plan_id: WritePlanId,
+    qualified_table: QualifiedTable,
+    table_info: TableInfo,
+    original_raw_row: Vec<serde_json::Value>,
+    generations: Generations,
+    original_form_values: Vec<GuidedFormValue>,
+    requested_row: usize,
+    requested_column: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GuidedWriteTarget {
+    table: QualifiedTable,
+    primary_key: CompletePrimaryKey,
+}
+
+impl GuidedWriteTarget {
+    fn from_plan(plan: &WritePlan) -> Self {
+        Self {
+            table: plan.table.clone(),
+            primary_key: plan.original_primary_key.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct GuidedWriteLocks {
+    targets_by_plan_id: HashMap<WritePlanId, GuidedWriteTarget>,
+}
+
+impl GuidedWriteLocks {
+    fn acquire(&mut self, plan: &WritePlan) -> bool {
+        let target = GuidedWriteTarget::from_plan(plan);
+        if self
+            .targets_by_plan_id
+            .values()
+            .any(|locked| locked == &target)
+        {
+            return false;
+        }
+        self.targets_by_plan_id.insert(plan.id, target);
+        true
+    }
+
+    fn is_locked(&self, plan: &WritePlan) -> bool {
+        let target = GuidedWriteTarget::from_plan(plan);
+        self.targets_by_plan_id
+            .values()
+            .any(|locked| locked == &target)
+    }
+
+    fn release(&mut self, plan_id: WritePlanId) -> bool {
+        self.targets_by_plan_id.remove(&plan_id).is_some()
+    }
+}
+
+fn database_nav_up_transition_requires_schema_reload(state: &mut AppState) -> bool {
+    let old = state.selected_database_idx;
+    state.database_prev();
+    state.selected_database_idx != old
 }
 
 // ── App struct ────────────────────────────────────────────────────────────────
@@ -124,6 +242,14 @@ pub struct App {
     /// Last time the Live tab polled `st_client` for the connected-client
     /// list. Throttled the same way metrics are.
     last_live_clients_fetch: Option<Instant>,
+    next_write_plan_id: WritePlanId,
+    write_plans: HashMap<WritePlanId, WritePlan>,
+    pending_update_draft: Option<PendingGuidedUpdateDraft>,
+    guided_write_locks: GuidedWriteLocks,
+    schema_generation: u64,
+    table_generation: u64,
+    server_context_generation: u64,
+    database_generation: u64,
 }
 
 /// How often the Metrics tab automatically refreshes server-side metrics.
@@ -162,12 +288,180 @@ impl App {
             auth_token: config.auth_token.clone(),
             last_metrics_fetch: None,
             last_live_clients_fetch: None,
+            next_write_plan_id: WritePlanId(1),
+            write_plans: HashMap::new(),
+            pending_update_draft: None,
+            guided_write_locks: GuidedWriteLocks::default(),
+            schema_generation: 0,
+            table_generation: 0,
+            server_context_generation: 0,
+            database_generation: 0,
             user_config: config.user_config.clone(),
             pending_session: if config.user_config.restore_session {
                 Some(crate::user_config::SessionState::load())
             } else {
                 None
             },
+        }
+    }
+
+    fn next_write_plan_id(&mut self) -> WritePlanId {
+        let id = self.next_write_plan_id;
+        self.next_write_plan_id = WritePlanId(self.next_write_plan_id.0.saturating_add(1));
+        id
+    }
+
+    fn current_generations(&self) -> Generations {
+        Generations {
+            schema: self.schema_generation,
+            row: self.table_generation,
+            server_context: self.server_context_generation,
+            database: self.database_generation,
+        }
+    }
+
+    fn discard_pending_guided_writes(&mut self) {
+        self.write_plans.clear();
+        self.pending_update_draft = None;
+    }
+
+    fn clear_table_browse_for_selection_change(&mut self) {
+        self.state.table_browse_result = None;
+        self.state.query_loading = false;
+        self.tables_grid = TableGridState::new();
+        self.discard_pending_guided_writes();
+    }
+
+    fn current_schema_request_context(&self, database: String) -> SchemaRequestContext {
+        SchemaRequestContext {
+            database,
+            schema_generation: self.schema_generation,
+            database_generation: self.database_generation,
+        }
+    }
+
+    fn current_table_browse_request_context(
+        &self,
+        database: String,
+        table: String,
+    ) -> TableBrowseRequestContext {
+        TableBrowseRequestContext {
+            database,
+            table,
+            table_generation: self.table_generation,
+            schema_generation: self.schema_generation,
+            database_generation: self.database_generation,
+        }
+    }
+
+    fn schema_context_matches_current(&self, context: &SchemaRequestContext) -> bool {
+        self.state.selected_database() == Some(context.database.as_str())
+            && self.schema_generation == context.schema_generation
+            && self.database_generation == context.database_generation
+    }
+
+    fn table_context_matches_current(&self, context: &TableBrowseRequestContext) -> bool {
+        self.state.selected_database() == Some(context.database.as_str())
+            && self
+                .state
+                .selected_table()
+                .is_some_and(|table| table.table_name == context.table)
+            && self.table_generation == context.table_generation
+            && self.schema_generation == context.schema_generation
+            && self.database_generation == context.database_generation
+    }
+
+    fn bump_schema_generation(&mut self) {
+        self.schema_generation = self.schema_generation.saturating_add(1);
+        self.discard_pending_guided_writes();
+    }
+
+    fn bump_table_generation(&mut self) {
+        self.table_generation = self.table_generation.saturating_add(1);
+        self.discard_pending_guided_writes();
+    }
+
+    fn bump_server_context_generation(&mut self) {
+        self.server_context_generation = self.server_context_generation.saturating_add(1);
+        self.discard_pending_guided_writes();
+    }
+
+    fn bump_database_generation(&mut self) {
+        self.database_generation = self.database_generation.saturating_add(1);
+        self.bump_schema_generation();
+        self.bump_table_generation();
+    }
+
+    fn selected_database_for_modal(&mut self) -> Option<String> {
+        match self.state.selected_database() {
+            Some(database) => Some(database.to_string()),
+            None => {
+                self.state.set_error("No database selected".to_string());
+                None
+            }
+        }
+    }
+
+    fn qualified_selected_table(&mut self, table: &TableInfo) -> Option<QualifiedTable> {
+        let database = self.selected_database_for_modal()?;
+        Some(QualifiedTable {
+            database,
+            schema: None,
+            table: table.table_name.clone(),
+        })
+    }
+
+    fn explain_primary_key_error(table: &TableInfo, error: PrimaryKeyError) -> String {
+        let column_name = |column_id: u16| {
+            table
+                .columns
+                .iter()
+                .find(|column| column.col_id == u32::from(column_id))
+                .map(|column| column.col_name.as_str())
+        };
+
+        match error {
+            PrimaryKeyError::NoDeclaredPrimaryKey => "missing declared primary key".to_string(),
+            PrimaryKeyError::DuplicateColumnId(column_id) => {
+                format!("duplicate primary key column id {column_id}")
+            }
+            PrimaryKeyError::UnknownColumnId(column_id) => {
+                format!("primary key column id {column_id} is not in the table schema")
+            }
+            PrimaryKeyError::ColumnIdOutOfRange { column_id } => {
+                format!("primary key column id {column_id} is out of range")
+            }
+            PrimaryKeyError::MissingValue { column_id } => match column_name(column_id) {
+                Some(name) => format!("primary key column '{name}' is missing from the row"),
+                None => format!("primary key column id {column_id} is missing from the row"),
+            },
+            PrimaryKeyError::NullValue { column_id } => match column_name(column_id) {
+                Some(name) => format!("primary key column '{name}' is null"),
+                None => format!("primary key column id {column_id} is null"),
+            },
+            PrimaryKeyError::UnrepresentableValue { column_id } => match column_name(column_id) {
+                Some(name) => format!("primary key column '{name}' cannot be represented safely"),
+                None => format!("primary key column id {column_id} cannot be represented safely"),
+            },
+            PrimaryKeyError::TypeMismatch {
+                column_id,
+                expected,
+            } => match column_name(column_id) {
+                Some(name) => format!("primary key column '{name}' must be {expected}"),
+                None => format!("primary key column id {column_id} must be {expected}"),
+            },
+        }
+    }
+
+    fn explain_write_plan_build_error(error: WritePlanBuildError) -> String {
+        match error {
+            WritePlanBuildError::PrimaryKey(error) => format!("primary key error: {error:?}"),
+            WritePlanBuildError::NoChangedFields => "No changed fields".to_string(),
+            WritePlanBuildError::TypeMismatch {
+                column_id,
+                expected,
+            } => format!("column {column_id} must be {expected}"),
+            WritePlanBuildError::Encoding(error) => format!("SQL encoding error: {error:?}"),
         }
     }
 
@@ -756,7 +1050,7 @@ impl App {
                 return;
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.nav_up();
+                self.nav_up().await;
                 return;
             }
             KeyCode::Char('g') | KeyCode::Home => {
@@ -1062,11 +1356,17 @@ impl App {
                     let old = self.state.selected_database_idx;
                     self.state.database_next();
                     if self.state.selected_database_idx != old {
+                        self.bump_database_generation();
                         self.load_schema().await;
                     }
                 }
                 SidebarFocus::Tables => {
+                    let old = self.state.selected_table_idx;
                     self.state.table_next();
+                    if self.state.selected_table_idx != old {
+                        self.bump_table_generation();
+                        self.clear_table_browse_for_selection_change();
+                    }
                 }
             },
             FocusPanel::Main => match self.state.current_tab {
@@ -1115,14 +1415,22 @@ impl App {
         }
     }
 
-    fn nav_up(&mut self) {
+    async fn nav_up(&mut self) {
         match self.state.focus {
             FocusPanel::Sidebar => match self.state.sidebar_focus {
                 SidebarFocus::Databases => {
-                    self.state.database_prev();
+                    if database_nav_up_transition_requires_schema_reload(&mut self.state) {
+                        self.bump_database_generation();
+                        self.load_schema().await;
+                    }
                 }
                 SidebarFocus::Tables => {
+                    let old = self.state.selected_table_idx;
                     self.state.table_prev();
+                    if self.state.selected_table_idx != old {
+                        self.bump_table_generation();
+                        self.clear_table_browse_for_selection_change();
+                    }
                 }
             },
             FocusPanel::Main => match self.state.current_tab {
@@ -1151,11 +1459,16 @@ impl App {
         match self.state.focus {
             FocusPanel::Sidebar => {
                 if let SidebarFocus::Tables = self.state.sidebar_focus {
+                    let old = self.state.selected_table_idx;
                     self.state.selected_table_idx = if self.state.tables.is_empty() {
                         None
                     } else {
                         Some(0)
                     };
+                    if self.state.selected_table_idx != old {
+                        self.bump_table_generation();
+                        self.clear_table_browse_for_selection_change();
+                    }
                 }
             }
             FocusPanel::Main => match self.state.current_tab {
@@ -1242,9 +1555,11 @@ impl App {
             Some(d) => d.to_string(),
             None => return,
         };
+        self.bump_schema_generation();
         self.state.tables.clear();
         self.state.selected_table_idx = None;
         self.state.current_schema = None;
+        self.clear_table_browse_for_selection_change();
         // Track the in-flight schema fetch so the sidebar can show
         // a real loading spinner and clear it on both success and
         // failure (fixes the "stuck on (loading…)" bug after HTTP
@@ -1254,16 +1569,29 @@ impl App {
 
         let client = self.client.clone();
         let tx = self.event_tx.clone();
+        let context = self.current_schema_request_context(db.clone());
         tokio::spawn(async move {
             match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.get_schema(&db)).await {
-                Ok(Ok(schema)) => send_event(&tx, AppEvent::SchemaLoaded(schema)),
+                Ok(Ok(schema)) => send_event(
+                    &tx,
+                    AppEvent::SchemaLoaded {
+                        context: context.clone(),
+                        schema,
+                    },
+                ),
                 Ok(Err(e)) => send_event(
                     &tx,
-                    AppEvent::SchemaError(format!("Schema load failed: {e:#}")),
+                    AppEvent::SchemaError {
+                        context: context.clone(),
+                        error: format!("Schema load failed: {e:#}"),
+                    },
                 ),
                 Err(_) => send_event(
                     &tx,
-                    AppEvent::SchemaError("Schema load timed out".to_string()),
+                    AppEvent::SchemaError {
+                        context: context.clone(),
+                        error: "Schema load timed out".to_string(),
+                    },
                 ),
             }
         });
@@ -1279,25 +1607,35 @@ impl App {
             None => return,
         };
 
+        self.bump_table_generation();
         self.state.query_loading = true;
         self.state.table_browse_result = None;
 
         let sql = format!("SELECT * FROM {table} LIMIT 200");
         let client = self.client.clone();
         let tx = self.event_tx.clone();
+        let context = self.current_table_browse_request_context(db.clone(), table.clone());
 
         tokio::spawn(async move {
             match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.query_sql(&db, &sql)).await {
-                Ok(Ok(result)) => send_event(&tx, AppEvent::TableBrowseResult { result }),
+                Ok(Ok(result)) => send_event(
+                    &tx,
+                    AppEvent::TableBrowseResult {
+                        context: context.clone(),
+                        result,
+                    },
+                ),
                 Ok(Err(e)) => send_event(
                     &tx,
                     AppEvent::TableBrowseError {
+                        context: context.clone(),
                         error: format!("{e:#}"),
                     },
                 ),
                 Err(_) => send_event(
                     &tx,
                     AppEvent::TableBrowseError {
+                        context: context.clone(),
                         error: "table load timed out".to_string(),
                     },
                 ),
@@ -1998,6 +2336,24 @@ impl App {
 
     // ── Modal dialogs (Faz 5: write operations) ──────────────────────────
 
+    fn discard_guided_state_for_modal(&mut self, modal: &crate::state::modal::Modal) {
+        use crate::state::modal::{Modal, ModalAction, SafetyModalAction};
+
+        match modal.action() {
+            ModalAction::Safety(SafetyModalAction::ConfirmWritePlan { plan_id }) => {
+                self.write_plans.remove(plan_id);
+            }
+            ModalAction::Safety(SafetyModalAction::DirtyRowChoice { .. }) => {
+                self.pending_update_draft = None;
+            }
+            _ => {}
+        }
+
+        if matches!(modal, Modal::Form { .. }) {
+            self.pending_update_draft = None;
+        }
+    }
+
     /// Route a key event into the active modal dialog. Called from
     /// `handle_key` when `state.modal.is_some()`.
     async fn handle_modal_key(&mut self, key: KeyEvent) {
@@ -2016,12 +2372,14 @@ impl App {
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     // Cancelled — drop the modal entirely.
+                    self.discard_guided_state_for_modal(&modal);
                     return;
                 }
                 _ => {}
             },
             crate::state::modal::Modal::Form { fields, focus, .. } => match key.code {
                 KeyCode::Esc => {
+                    self.discard_guided_state_for_modal(&modal);
                     return;
                 }
                 KeyCode::Enter => {
@@ -2086,10 +2444,15 @@ impl App {
     }
 
     /// Open an edit form pre-filled with the currently selected row's
-    /// values. Field 0 is the PK (used for the WHERE clause); the
-    /// rest are the editable column values. The submit handler builds
-    /// an `UPDATE table SET col=val,... WHERE pk=original_pk` SQL.
+    /// values. The form itself carries only a safety action with the
+    /// requested row/column; the selected raw row, table metadata, and
+    /// generation snapshot stay in a private app draft.
     fn open_update_form(&mut self) {
+        if self.state.schema_loading || self.state.query_loading {
+            self.state
+                .set_notification("Cannot update while table data is loading".to_string());
+            return;
+        }
         let Some(table) = self.state.selected_table().cloned() else {
             self.state.set_notification("No table selected".to_string());
             return;
@@ -2112,67 +2475,81 @@ impl App {
             .as_ref()
             .and_then(|qr| qr.rows.get(data_idx))
         {
-            Some(r) => r.clone(),
-            None => return,
+            Some(row) => row.clone(),
+            None => {
+                self.state.set_notification("No row selected".to_string());
+                return;
+            }
         };
+        if let Err(error) = complete_primary_key_from_table_row(&table, &row) {
+            self.state.set_error(format!(
+                "Cannot update row: {}",
+                Self::explain_primary_key_error(&table, error)
+            ));
+            return;
+        }
+        let Some(qualified_table) = self.qualified_selected_table(&table) else {
+            return;
+        };
+        let generations = self.current_generations();
+        let plan_id = self.next_write_plan_id();
+        let requested_column = table
+            .columns
+            .get(self.tables_grid.selected_col)
+            .map(|column| column.col_id)
+            .unwrap_or_default();
 
-        // Pick the PK column up-front so we can mark it read-only in
-        // the form labels and use it in the WHERE clause below.
-        let (pk_idx, pk_column) = pick_primary_key(&table);
-
-        // Pre-fill each form field with the row's current display value.
+        let mut original_form_values = Vec::with_capacity(table.columns.len());
         let fields: Vec<crate::state::modal::FormField> = table
             .columns
             .iter()
             .enumerate()
-            .map(|(i, c)| {
-                let type_label = type_tag(&c.col_type);
-                let pk_marker = if i == pk_idx {
-                    " — PK (read-only)"
+            .map(|(index, column)| {
+                let type_label = type_tag(&column.col_type);
+                let pk_marker = if table.primary_key_cols.contains(&(column.col_id as u16)) {
+                    " — PK"
                 } else {
                     ""
                 };
                 let mut field = crate::state::modal::FormField::new(format!(
                     "{} ({}{pk_marker})",
-                    c.col_name, type_label
+                    column.col_name, type_label
                 ));
-                let cell_text = row
-                    .get(i)
-                    .map(crate::ui::tabs::tables::value_to_display)
-                    .unwrap_or_default();
-                field.input.set(cell_text);
+                let form_value = row
+                    .get(index)
+                    .and_then(|raw| guided_form_value_from_raw(column, raw).ok())
+                    .unwrap_or(GuidedFormValue {
+                        input: row
+                            .get(index)
+                            .map_or_else(String::new, serde_json::Value::to_string),
+                        typed_value: crate::state::safety::SqlValue::Unrepresentable(
+                            row.get(index)
+                                .map_or_else(String::new, serde_json::Value::to_string),
+                        ),
+                    });
+                field.input.set(form_value.input.clone());
+                original_form_values.push(form_value);
                 field
             })
             .collect();
 
-        let column_types: Vec<String> = table
-            .columns
-            .iter()
-            .map(|c| type_tag(&c.col_type))
-            .collect();
-        // Build the PK WHERE literal directly from the raw JSON
-        // value so Identity / ConnectionId / U256 PKs round-trip
-        // correctly. Display strings (`value_to_display`) mangle
-        // these into `{__identity__:0xabc}` which the server
-        // cannot parse.
-        let pk_sql_literal = match row.get(pk_idx).and_then(|v| json_to_sql_literal(v).ok()) {
-            Some(lit) => lit,
-            None => {
-                self.state.set_error(format!(
-                    "Cannot edit row: primary key of {} has no SQL literal form",
-                    table.table_name
-                ));
-                return;
-            }
-        };
+        self.pending_update_draft = Some(PendingGuidedUpdateDraft {
+            plan_id,
+            qualified_table,
+            table_info: table.clone(),
+            original_raw_row: row,
+            generations,
+            original_form_values,
+            requested_row: data_idx,
+            requested_column,
+        });
 
-        let action = crate::state::modal::ModalAction::UpdateRow {
-            table: table.table_name.clone(),
-            pk_column,
-            column_types,
-            pk_sql_literal,
-            pk_index: pk_idx,
-        };
+        let action = crate::state::modal::ModalAction::Safety(
+            crate::state::modal::SafetyModalAction::DirtyRowChoice {
+                requested_row: data_idx,
+                requested_column,
+            },
+        );
         self.state.modal = Some(crate::state::modal::Modal::form(
             format!("Update row in {}", table.table_name),
             fields,
@@ -2259,9 +2636,14 @@ impl App {
     }
 
     /// Open a confirm dialog to delete the currently selected row.
-    /// Uses the heuristic in [`pick_primary_key`] for the WHERE clause.
+    /// Builds and stores a pure guided write plan immediately; the modal
+    /// carries only the stable plan ID.
     fn open_delete_confirm(&mut self) {
-        // Pull the data we need before borrowing mutably.
+        if self.state.schema_loading || self.state.query_loading {
+            self.state
+                .set_notification("Cannot delete while table data is loading".to_string());
+            return;
+        }
         let Some(table) = self.state.selected_table().cloned() else {
             self.state.set_notification("No table selected".to_string());
             return;
@@ -2285,37 +2667,40 @@ impl App {
             .as_ref()
             .and_then(|qr| qr.rows.get(data_idx))
         {
-            Some(r) => r.clone(),
-            None => return,
-        };
-
-        let (pk_idx, pk_name) = pick_primary_key(&table);
-        // Build the WHERE literal directly from the raw JSON value
-        // so Identity / ConnectionId / U256 PKs are emitted as real
-        // SQL literals (`0xdeadbeef`) instead of the mangled display
-        // form (`{__identity__:0xdeadbeef}`).
-        let pk_literal = match row.get(pk_idx).and_then(|v| json_to_sql_literal(v).ok()) {
-            Some(lit) => lit,
+            Some(row) => row.clone(),
             None => {
+                self.state.set_notification("No row selected".to_string());
+                return;
+            }
+        };
+        let Some(qualified_table) = self.qualified_selected_table(&table) else {
+            return;
+        };
+        let plan_id = self.next_write_plan_id();
+        let plan = match build_guided_delete_plan(
+            plan_id,
+            qualified_table,
+            &table,
+            &row,
+            self.current_generations(),
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
                 self.state.set_error(format!(
-                    "Cannot delete row: primary key of {} has no SQL literal form",
-                    table.table_name
+                    "Cannot delete row: {}",
+                    Self::explain_write_plan_build_error(error)
                 ));
                 return;
             }
         };
-        let where_sql = format!("{pk_name} = {pk_literal}");
-
         let prompt = format!(
-            "DELETE FROM {table_name} WHERE {where_sql}\n\n\
-             This will permanently remove one row.\n\
-             Press [y] to confirm, [n] to cancel.",
-            table_name = table.table_name,
+            "{}\n\nPress [y] to confirm, [n] to cancel.",
+            format_guided_delete_confirmation(&plan, &row)
         );
-        let action = crate::state::modal::ModalAction::DeleteRow {
-            table: table.table_name.clone(),
-            where_sql,
-        };
+        self.write_plans.insert(plan_id, plan);
+        let action = crate::state::modal::ModalAction::Safety(
+            crate::state::modal::SafetyModalAction::ConfirmWritePlan { plan_id },
+        );
         self.state.modal = Some(crate::state::modal::Modal::confirm(
             format!("Delete row from {}", table.table_name),
             prompt,
@@ -2414,15 +2799,8 @@ impl App {
     /// `AppEvent::WriteOpSuccess` / `WriteOpError`. The modal is
     /// dropped (the caller already moved it out of `state.modal`).
     async fn dispatch_modal_action(&mut self, modal: crate::state::modal::Modal) {
-        use crate::state::modal::{Modal, ModalAction};
+        use crate::state::modal::{Modal, ModalAction, SafetyModalAction};
 
-        let db = match self.state.selected_database() {
-            Some(d) => d.to_string(),
-            None => {
-                self.state.set_error("No database selected".to_string());
-                return;
-            }
-        };
         let op_label = modal.action().op_label();
 
         match modal {
@@ -2436,6 +2814,9 @@ impl App {
                         .zip(param_types.iter())
                         .map(|(f, t)| coerce_field_to_json(&f.input.value, t))
                         .collect();
+                    let Some(db) = self.selected_database_for_modal() else {
+                        return;
+                    };
                     self.spawn_call_reducer(db, reducer, args, op_label);
                 }
                 ModalAction::InsertRow {
@@ -2456,40 +2837,9 @@ impl App {
                         columns.join(", "),
                         values.join(", ")
                     );
-                    self.spawn_write_sql(db, sql, op_label);
-                }
-                ModalAction::UpdateRow {
-                    table,
-                    pk_column,
-                    column_types,
-                    pk_sql_literal,
-                    pk_index,
-                } => {
-                    // Skip the PK field when generating the SET clause
-                    // — it's the WHERE column, not an assignment.
-                    let assignments: Vec<String> = fields
-                        .iter()
-                        .zip(column_types.iter())
-                        .enumerate()
-                        .filter(|(i, _)| *i != pk_index)
-                        .map(|(_, (f, t))| {
-                            let col = extract_field_name(&f.label);
-                            format!("{col} = {}", sql_literal(&f.input.value, t))
-                        })
-                        .collect();
-                    if assignments.is_empty() {
-                        self.state.set_notification("Nothing to update".to_string());
+                    let Some(db) = self.selected_database_for_modal() else {
                         return;
-                    }
-                    // `pk_sql_literal` was built at modal-open time
-                    // from the row's raw JSON Value, so it already
-                    // handles Identity / ConnectionId / U256 PKs
-                    // correctly without going through the display-
-                    // string round trip.
-                    let sql = format!(
-                        "UPDATE {table} SET {} WHERE {pk_column} = {pk_sql_literal}",
-                        assignments.join(", ")
-                    );
+                    };
                     self.spawn_write_sql(db, sql, op_label);
                 }
                 ModalAction::DeleteDatabase { database } => {
@@ -2527,22 +2877,36 @@ impl App {
                         return;
                     }
                     let sql = format!("DELETE FROM {table}");
+                    let Some(db) = self.selected_database_for_modal() else {
+                        return;
+                    };
                     self.spawn_write_sql(db, sql, op_label);
                 }
                 ModalAction::DeleteRow { .. } => {
-                    // DeleteRow is always a Confirm, never a Form —
-                    // unreachable but handle gracefully.
+                    // DeleteRow is always a Confirm, never a Form.
                     self.state
                         .set_error("Internal: DeleteRow inside a Form".to_string());
                 }
                 ModalAction::DiscardPendingEdits => {
-                    // DiscardPendingEdits is always a Confirm, never
-                    // a Form — unreachable.
+                    // DiscardPendingEdits is always a Confirm, never a Form.
+                }
+                ModalAction::Safety(SafetyModalAction::DirtyRowChoice {
+                    requested_row,
+                    requested_column,
+                }) => {
+                    self.submit_guided_update_form(fields, requested_row, requested_column);
+                }
+                ModalAction::Safety(SafetyModalAction::ConfirmWritePlan { .. }) => {
+                    self.state
+                        .set_error("Internal: ConfirmWritePlan inside a Form".to_string());
                 }
             },
             Modal::Confirm { action, .. } => match action {
                 ModalAction::DeleteRow { table, where_sql } => {
                     let sql = format!("DELETE FROM {table} WHERE {where_sql}");
+                    let Some(db) = self.selected_database_for_modal() else {
+                        return;
+                    };
                     self.spawn_write_sql(db, sql, op_label);
                 }
                 ModalAction::DiscardPendingEdits => {
@@ -2552,12 +2916,146 @@ impl App {
                     self.state
                         .set_notification("Pending edits discarded".to_string());
                 }
+                ModalAction::Safety(SafetyModalAction::ConfirmWritePlan { plan_id }) => {
+                    self.dispatch_confirmed_write_plan(plan_id, op_label);
+                }
+                ModalAction::Safety(SafetyModalAction::DirtyRowChoice { .. }) => {
+                    self.state
+                        .set_error("Internal: DirtyRowChoice inside Confirm".to_string());
+                }
                 _ => {
                     self.state
                         .set_error("Internal: non-DeleteRow inside Confirm".to_string());
                 }
             },
         }
+    }
+
+    fn submit_guided_update_form(
+        &mut self,
+        fields: Vec<crate::state::modal::FormField>,
+        requested_row: usize,
+        requested_column: u32,
+    ) {
+        let Some(draft) = self.pending_update_draft.take() else {
+            self.state.set_error("No pending update draft".to_string());
+            return;
+        };
+        if draft.requested_row != requested_row || draft.requested_column != requested_column {
+            self.state
+                .set_error("Update draft no longer matches the modal".to_string());
+            return;
+        }
+        let changes = match build_guided_update_changes_from_form_fields(
+            &draft.table_info,
+            &draft.original_raw_row,
+            &draft.original_form_values,
+            &fields,
+        ) {
+            Ok(changes) => changes,
+            Err(error) => {
+                self.state.set_error(error);
+                return;
+            }
+        };
+        let plan = match build_guided_update_plan(
+            draft.plan_id,
+            draft.qualified_table,
+            &draft.table_info,
+            &draft.original_raw_row,
+            draft.generations,
+            changes,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.state.set_error(format!(
+                    "Cannot update row: {}",
+                    Self::explain_write_plan_build_error(error)
+                ));
+                return;
+            }
+        };
+        let plan_id = plan.id;
+        self.write_plans.remove(&plan_id);
+        let prompt = format!(
+            "{}\n\nPress [y] to confirm, [n] to cancel.",
+            format_guided_update_confirmation(&plan)
+        );
+        self.write_plans.insert(plan_id, plan);
+        self.state.modal = Some(crate::state::modal::Modal::confirm(
+            "Confirm row update",
+            prompt,
+            crate::state::modal::ModalAction::Safety(
+                crate::state::modal::SafetyModalAction::ConfirmWritePlan { plan_id },
+            ),
+        ));
+    }
+
+    fn dispatch_confirmed_write_plan(&mut self, plan_id: WritePlanId, op_label: String) {
+        let Some(plan) = self.write_plans.remove(&plan_id) else {
+            self.state
+                .set_error("Write plan is no longer available; nothing sent".to_string());
+            return;
+        };
+        if self.state.schema_loading || self.state.query_loading {
+            self.state
+                .set_error("Data is loading; write plan was not sent".to_string());
+            return;
+        }
+        let Some(table_info) = self.state.selected_table().cloned() else {
+            self.state
+                .set_error("No table selected; write plan was not sent".to_string());
+            return;
+        };
+        let Some(data_idx) = self.active_data_row_index() else {
+            self.state
+                .set_error("No row selected; write plan was not sent".to_string());
+            return;
+        };
+        let Some(current_raw_row) = self
+            .state
+            .table_browse_result
+            .as_ref()
+            .and_then(|result| result.rows.get(data_idx))
+            .cloned()
+        else {
+            self.state
+                .set_error("No row selected; write plan was not sent".to_string());
+            return;
+        };
+        let snapshot = ConfirmationSnapshot {
+            generations: self.current_generations(),
+            table: &table_info,
+            current_raw_row: &current_raw_row,
+            row_locked: self.guided_write_locks.is_locked(&plan),
+        };
+        if let Err(outcome) = revalidate_before_dispatch(&plan, &snapshot) {
+            self.state
+                .set_error(format_mutation_outcome_not_sent(outcome));
+            return;
+        }
+        let sql = match &plan.mutation {
+            GuidedMutation::Update { .. } => build_update_sql(&plan, &table_info),
+            GuidedMutation::Delete => build_delete_sql(&plan, &table_info),
+        };
+        let sql = match sql {
+            Ok(sql) => sql,
+            Err(error) => {
+                self.state.set_error(format!(
+                    "Write plan encoding failed; nothing sent: {error:?}"
+                ));
+                return;
+            }
+        };
+        if !self.guided_write_locks.acquire(&plan) {
+            self.state.set_error(format_mutation_outcome_not_sent(
+                MutationOutcome::DefinitelyNotSent {
+                    reason: "row locked before confirmation".to_string(),
+                },
+            ));
+            return;
+        }
+        self.spawn_guided_write_sql(plan.id, plan.table.database.clone(), sql, op_label);
     }
 
     /// Run `client.add_database_alias` on a background task. On
@@ -2725,6 +3223,47 @@ impl App {
                 Err(_) => send_event(
                     &tx,
                     AppEvent::WriteOpError {
+                        op: op_label,
+                        error: "request timed out".to_string(),
+                    },
+                ),
+            }
+        });
+    }
+
+    /// Run a guided row write and carry the plan id back so the exact
+    /// in-flight row lock can be released on either success or failure.
+    fn spawn_guided_write_sql(
+        &self,
+        plan_id: WritePlanId,
+        db: String,
+        sql: String,
+        op_label: String,
+    ) {
+        let client = self.client.clone();
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.query_sql(&db, &sql)).await {
+                Ok(Ok(_result)) => send_event(
+                    &tx,
+                    AppEvent::GuidedWriteOpSuccess {
+                        plan_id,
+                        op: op_label,
+                        response: serde_json::json!({"sql": sql}),
+                    },
+                ),
+                Ok(Err(e)) => send_event(
+                    &tx,
+                    AppEvent::GuidedWriteOpError {
+                        plan_id,
+                        op: op_label,
+                        error: format!("{e:#}"),
+                    },
+                ),
+                Err(_) => send_event(
+                    &tx,
+                    AppEvent::GuidedWriteOpError {
+                        plan_id,
                         op: op_label,
                         error: "request timed out".to_string(),
                     },
@@ -2911,6 +3450,7 @@ impl App {
     /// Closes any existing WebSocket connection before opening a new one and
     /// clears any stale live-data cache from a previous database.
     async fn connect_ws(&mut self) {
+        self.bump_server_context_generation();
         // Close existing connection if any
         if let Some(ref handle) = self.ws_handle {
             handle.close().await;
@@ -3048,6 +3588,7 @@ impl App {
         use crate::api::types::WsServerMessage;
         match msg {
             WsServerMessage::InitialSubscription(payload) => {
+                self.bump_table_generation();
                 // Initial snapshot — replace any existing live data for each table.
                 let mut total_rows = 0usize;
                 for table_update in payload.database_update.tables {
@@ -3062,6 +3603,7 @@ impl App {
                 );
             }
             WsServerMessage::TransactionUpdate(payload) => {
+                self.bump_table_generation();
                 // Incremental update — apply inserts/deletes to the cached
                 // live data. Deletes are matched by exact JSON value equality
                 // (the server's row identity model isn't exposed in the JSON
@@ -3146,8 +3688,10 @@ impl App {
                             if let Some(idx) =
                                 self.state.databases.iter().position(|d| d == last_db)
                             {
+                                let last_tab = session.last_tab;
                                 self.state.select_database(idx);
-                                if let Some(tab_idx) = session.last_tab {
+                                self.bump_database_generation();
+                                if let Some(tab_idx) = last_tab {
                                     self.state.current_tab = index_to_tab(tab_idx);
                                 }
                                 self.load_schema().await;
@@ -3157,11 +3701,15 @@ impl App {
                 }
                 if !self.state.databases.is_empty() && self.state.selected_database_idx.is_none() {
                     self.state.select_database(0);
+                    self.bump_database_generation();
                     self.load_schema().await;
                 }
             }
 
-            AppEvent::SchemaLoaded(schema) => {
+            AppEvent::SchemaLoaded { context, schema } => {
+                if !self.schema_context_matches_current(&context) {
+                    return;
+                }
                 self.state.schema_loading = false;
                 self.state.schema_load_failed = false;
                 self.state.tables = schema.tables.clone();
@@ -3191,13 +3739,16 @@ impl App {
                 self.connect_ws().await;
             }
 
-            AppEvent::SchemaError(msg) => {
+            AppEvent::SchemaError { context, error } => {
+                if !self.schema_context_matches_current(&context) {
+                    return;
+                }
                 // Clear the in-flight flag so the sidebar drops its
                 // "(loading…)" placeholder, then flip the terminal
                 // "failed" flag so it can show an error hint instead.
                 self.state.schema_loading = false;
                 self.state.schema_load_failed = true;
-                self.state.set_error(msg);
+                self.state.set_error(error);
             }
 
             AppEvent::QueryResult {
@@ -3236,7 +3787,10 @@ impl App {
                 self.state.set_error(error);
             }
 
-            AppEvent::TableBrowseResult { result } => {
+            AppEvent::TableBrowseResult { context, result } => {
+                if !self.table_context_matches_current(&context) {
+                    return;
+                }
                 self.state.query_loading = false;
                 let row_count = result.row_count();
                 self.state.table_browse_result = Some(result);
@@ -3246,7 +3800,10 @@ impl App {
                     .set_notification(format!("{row_count} rows loaded"));
             }
 
-            AppEvent::TableBrowseError { error } => {
+            AppEvent::TableBrowseError { context, error } => {
+                if !self.table_context_matches_current(&context) {
+                    return;
+                }
                 self.state.query_loading = false;
                 self.state.set_error(error);
             }
@@ -3283,6 +3840,35 @@ impl App {
             }
 
             AppEvent::WriteOpError { op, error } => {
+                self.state.query_loading = false;
+                self.state.set_error(format!("{op} failed: {error}"));
+            }
+
+            AppEvent::GuidedWriteOpSuccess {
+                plan_id,
+                op,
+                response,
+            } => {
+                self.guided_write_locks.release(plan_id);
+                self.state.query_loading = false;
+                let summary = if response.is_null() {
+                    op.clone()
+                } else {
+                    let s = response.to_string();
+                    let preview: String = s.chars().take(60).collect();
+                    format!("{op} → {preview}")
+                };
+                self.state.set_notification(format!("✓ {summary}"));
+                // Many writes invalidate the table-browse view, so a
+                // gentle refresh is useful — but only when the user
+                // is still looking at the Tables tab.
+                if self.state.current_tab == Tab::Tables && self.state.selected_table().is_some() {
+                    self.load_table_data().await;
+                }
+            }
+
+            AppEvent::GuidedWriteOpError { plan_id, op, error } => {
+                self.guided_write_locks.release(plan_id);
                 self.state.query_loading = false;
                 self.state.set_error(format!("{op} failed: {error}"));
             }
@@ -3379,12 +3965,92 @@ fn index_to_tab(idx: u8) -> Tab {
 fn type_tag(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Object(o) => o
-            .keys()
-            .next()
-            .cloned()
-            .unwrap_or_else(|| "Unknown".to_string()),
+        serde_json::Value::Object(o) if o.len() == 1 => {
+            let Some((name, value)) = o.iter().next() else {
+                return "Unknown".to_string();
+            };
+            if name == "AlgebraicType" {
+                type_tag(value)
+            } else {
+                name.clone()
+            }
+        }
         _ => "Unknown".to_string(),
+    }
+}
+
+fn build_guided_update_changes_from_form_fields(
+    table: &TableInfo,
+    original_raw_row: &[serde_json::Value],
+    original_form_values: &[GuidedFormValue],
+    fields: &[crate::state::modal::FormField],
+) -> Result<Vec<ColumnChange>, String> {
+    let mut changes = Vec::new();
+    for (column_index, column) in table.columns.iter().enumerate() {
+        let field = fields
+            .get(column_index)
+            .ok_or_else(|| format!("Missing form field for column {}", column.col_name))?;
+        let original_raw = original_raw_row
+            .get(column_index)
+            .ok_or_else(|| format!("Missing original value for column {}", column.col_name))?;
+        let original_form = original_form_values
+            .get(column_index)
+            .ok_or_else(|| format!("Missing original form value for column {}", column.col_name))?;
+        if matches!(
+            original_form.typed_value,
+            crate::state::safety::SqlValue::Unrepresentable(_)
+        ) {
+            if field.input.value == original_form.input {
+                continue;
+            }
+            return Err(format!(
+                "Cannot edit {}: original value is unsupported or unrepresentable for guided updates",
+                column.col_name
+            ));
+        }
+        if !guided_form_value_changed(column, original_form, &field.input.value).map_err(
+            |error| {
+                format!(
+                    "Cannot parse {} as {}: {error:?}",
+                    column.col_name,
+                    type_tag(&column.col_type)
+                )
+            },
+        )? {
+            continue;
+        }
+
+        let old_value = typed_sql_value_from_json(column, original_raw).map_err(|error| {
+            format!(
+                "Cannot read original value for {} as {}: {error:?}",
+                column.col_name,
+                type_tag(&column.col_type)
+            )
+        })?;
+        let new_value = guided_form_sql_value_from_user_input(column, &field.input.value)
+            .map_err(|error| format!("Cannot parse {}: {error:?}", column.col_name))?;
+        changes.push(ColumnChange {
+            column_id: column.col_id,
+            old_value: Some(old_value),
+            new_value,
+        });
+    }
+    Ok(changes)
+}
+
+fn format_mutation_outcome_not_sent(outcome: MutationOutcome) -> String {
+    match outcome {
+        MutationOutcome::CriticalSafetyError { reason } => {
+            format!("Critical guided-write safety error: {reason}")
+        }
+        MutationOutcome::DefinitelyNotSent { reason } => {
+            format!("Write plan was not sent: {reason}")
+        }
+        MutationOutcome::Conflict { reason } => format!("Write conflict before send: {reason}"),
+        MutationOutcome::Unknown { reason } => {
+            format!("Write status unknown before send: {reason}")
+        }
+        MutationOutcome::SentAndConfirmed { .. } => "Write plan was already sent".to_string(),
     }
 }
 
@@ -3758,6 +4424,618 @@ mod modal_helper_tests {
         assert_eq!(type_tag(&serde_json::json!("String")), "String");
         assert_eq!(type_tag(&serde_json::json!({"U64": []})), "U64");
         assert_eq!(type_tag(&serde_json::json!(null)), "Unknown");
+    }
+
+    #[test]
+    fn guided_update_form_changes_skip_unchanged_display_text_and_parse_only_changed_fields() {
+        use crate::state::modal::FormField;
+        use crate::state::safety::{ColumnChange, SqlValue};
+
+        fn typed_col(id: u32, name: &str, type_name: &str) -> ColumnInfo {
+            ColumnInfo {
+                col_id: id,
+                col_name: name.to_string(),
+                col_type: serde_json::json!({ "AlgebraicType": { type_name: {} } }),
+                is_autoinc: false,
+            }
+        }
+
+        let table = make_table_with_pk(
+            "sessions",
+            vec![
+                typed_col(1, "id", "Identity"),
+                typed_col(2, "connection", "ConnectionId"),
+                typed_col(3, "visits", "U64"),
+                typed_col(4, "name", "String"),
+            ],
+            vec![1],
+        );
+        let raw_row = vec![
+            serde_json::json!({ "__identity__": "1234" }),
+            serde_json::json!({ "__connection_id__": "abcd" }),
+            serde_json::json!(5),
+            serde_json::json!("Ada"),
+        ];
+        let mut original_form_values = Vec::new();
+        let mut fields: Vec<FormField> = table
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(idx, column)| {
+                let mut field = FormField::new(format!(
+                    "{} ({})",
+                    column.col_name,
+                    type_tag(&column.col_type)
+                ));
+                let form_value = guided_form_value_from_raw(column, &raw_row[idx]).unwrap();
+                field.input.set(form_value.input.clone());
+                original_form_values.push(form_value);
+                field
+            })
+            .collect();
+        fields[2].input.set("6".to_string());
+
+        let changes = build_guided_update_changes_from_form_fields(
+            &table,
+            &raw_row,
+            &original_form_values,
+            &fields,
+        )
+        .expect("changed U64 field should parse without touching unchanged hex fields");
+
+        assert_eq!(
+            changes,
+            vec![ColumnChange {
+                column_id: 3,
+                old_value: Some(SqlValue::U64(5)),
+                new_value: SqlValue::U64(6),
+            }]
+        );
+    }
+
+    #[test]
+    fn guided_update_form_skips_unchanged_null_non_pk_while_supported_field_changes() {
+        use crate::state::modal::FormField;
+        use crate::state::safety::{ColumnChange, SqlValue};
+
+        let table = make_table_with_pk(
+            "sessions",
+            vec![
+                typed_col_at(1, "id", "U64"),
+                typed_col_at(2, "nickname", "String"),
+                typed_col_at(3, "visits", "U64"),
+            ],
+            vec![1],
+        );
+        let raw_row = vec![
+            serde_json::json!(1),
+            serde_json::Value::Null,
+            serde_json::json!(5),
+        ];
+        let mut original_form_values = Vec::new();
+        let mut fields: Vec<FormField> = table
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(idx, column)| {
+                let mut field = FormField::new(column.col_name.clone());
+                let form_value = raw_row
+                    .get(idx)
+                    .and_then(|raw| guided_form_value_from_raw(column, raw).ok())
+                    .unwrap_or(GuidedFormValue {
+                        input: raw_row[idx].to_string(),
+                        typed_value: SqlValue::Unrepresentable(raw_row[idx].to_string()),
+                    });
+                field.input.set(form_value.input.clone());
+                original_form_values.push(form_value);
+                field
+            })
+            .collect();
+        fields[2].input.set("6".to_string());
+
+        let changes = build_guided_update_changes_from_form_fields(
+            &table,
+            &raw_row,
+            &original_form_values,
+            &fields,
+        )
+        .expect("unchanged null non-PK should be skipped");
+
+        assert_eq!(
+            changes,
+            vec![ColumnChange {
+                column_id: 3,
+                old_value: Some(SqlValue::U64(5)),
+                new_value: SqlValue::U64(6),
+            }]
+        );
+    }
+
+    #[test]
+    fn guided_update_form_skips_unchanged_opaque_non_pk_while_supported_field_changes() {
+        use crate::state::modal::FormField;
+        use crate::state::safety::{ColumnChange, SqlValue};
+
+        let table = make_table_with_pk(
+            "sessions",
+            vec![
+                typed_col_at(1, "id", "U64"),
+                typed_col_at(2, "metadata", "String"),
+                typed_col_at(3, "visits", "U64"),
+            ],
+            vec![1],
+        );
+        let raw_row = vec![
+            serde_json::json!(1),
+            serde_json::json!({"opaque": {"nested": true}}),
+            serde_json::json!(5),
+        ];
+        let mut original_form_values = Vec::new();
+        let mut fields: Vec<FormField> = table
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(idx, column)| {
+                let mut field = FormField::new(column.col_name.clone());
+                let form_value = raw_row
+                    .get(idx)
+                    .and_then(|raw| guided_form_value_from_raw(column, raw).ok())
+                    .unwrap_or(GuidedFormValue {
+                        input: raw_row[idx].to_string(),
+                        typed_value: SqlValue::Unrepresentable(raw_row[idx].to_string()),
+                    });
+                field.input.set(form_value.input.clone());
+                original_form_values.push(form_value);
+                field
+            })
+            .collect();
+        fields[2].input.set("6".to_string());
+
+        let changes = build_guided_update_changes_from_form_fields(
+            &table,
+            &raw_row,
+            &original_form_values,
+            &fields,
+        )
+        .expect("unchanged opaque non-PK should be skipped");
+
+        assert_eq!(
+            changes,
+            vec![ColumnChange {
+                column_id: 3,
+                old_value: Some(SqlValue::U64(5)),
+                new_value: SqlValue::U64(6),
+            }]
+        );
+    }
+
+    #[test]
+    fn guided_update_form_rejects_changed_opaque_non_pk_clearly() {
+        use crate::state::modal::FormField;
+        use crate::state::safety::SqlValue;
+
+        let table = make_table_with_pk(
+            "sessions",
+            vec![
+                typed_col_at(1, "id", "U64"),
+                typed_col_at(2, "metadata", "String"),
+            ],
+            vec![1],
+        );
+        let raw_row = vec![serde_json::json!(1), serde_json::json!({"opaque": true})];
+        let original_form_values = vec![
+            guided_form_value_from_raw(&table.columns[0], &raw_row[0]).unwrap(),
+            GuidedFormValue {
+                input: raw_row[1].to_string(),
+                typed_value: SqlValue::Unrepresentable(raw_row[1].to_string()),
+            },
+        ];
+        let mut fields = vec![FormField::new("id"), FormField::new("metadata")];
+        fields[0].input.set(original_form_values[0].input.clone());
+        fields[1].input.set("edited".to_string());
+
+        let error = build_guided_update_changes_from_form_fields(
+            &table,
+            &raw_row,
+            &original_form_values,
+            &fields,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("metadata"));
+        assert!(error.contains("unsupported") || error.contains("unrepresentable"));
+    }
+
+    #[test]
+    fn guided_update_form_unchanged_values_never_fabricate_changes() {
+        use crate::state::modal::FormField;
+        use crate::state::safety::SqlValue;
+
+        let table = make_table_with_pk(
+            "sessions",
+            vec![
+                typed_col_at(1, "id", "U64"),
+                typed_col_at(2, "metadata", "String"),
+            ],
+            vec![1],
+        );
+        let raw_row = vec![serde_json::json!(1), serde_json::json!({"opaque": true})];
+        let original_form_values = vec![
+            guided_form_value_from_raw(&table.columns[0], &raw_row[0]).unwrap(),
+            GuidedFormValue {
+                input: raw_row[1].to_string(),
+                typed_value: SqlValue::Unrepresentable(raw_row[1].to_string()),
+            },
+        ];
+        let mut fields = vec![FormField::new("id"), FormField::new("metadata")];
+        fields[0].input.set(original_form_values[0].input.clone());
+        fields[1].input.set(original_form_values[1].input.clone());
+
+        let changes = build_guided_update_changes_from_form_fields(
+            &table,
+            &raw_row,
+            &original_form_values,
+            &fields,
+        )
+        .expect("unchanged unrepresentable values should be ignored");
+
+        assert!(changes.is_empty());
+    }
+
+    fn typed_col_at(id: u32, name: &str, type_name: &str) -> ColumnInfo {
+        ColumnInfo {
+            col_id: id,
+            col_name: name.to_string(),
+            col_type: serde_json::json!({ "AlgebraicType": { type_name: {} } }),
+            is_autoinc: false,
+        }
+    }
+
+    fn test_app() -> App {
+        let config = crate::config::Config {
+            server_url: "http://localhost:3000".to_string(),
+            ws_url: "ws://localhost:3000".to_string(),
+            database: None,
+            auth_token: None,
+            theme: crate::config::ThemeColors::dark(),
+            theme_name: crate::config::ThemeName::Dark,
+            log_level: "off".to_string(),
+            user_config: crate::user_config::UserConfig::default(),
+        };
+        let client = crate::api::client::SpacetimeClient::new(config.server_url.clone(), None)
+            .expect("test client should construct");
+        App::new(&config, client)
+    }
+
+    fn schema_with_table(table_name: &str) -> crate::api::types::SchemaResponse {
+        crate::api::types::SchemaResponse {
+            typespace: serde_json::json!({}),
+            tables: vec![make_table_with_pk(
+                table_name,
+                vec![
+                    typed_col_at(1, "id", "U64"),
+                    typed_col_at(2, "name", "String"),
+                ],
+                vec![1],
+            )],
+            reducers: vec![],
+        }
+    }
+
+    #[test]
+    fn open_update_form_refuses_invalid_primary_key_before_creating_draft_or_modal() {
+        let mut app = test_app();
+        app.state.databases = vec!["db".to_string()];
+        app.state.selected_database_idx = Some(0);
+        app.state.tables = schema_with_table("users").tables;
+        app.state.selected_table_idx = Some(0);
+        app.state.current_tab = Tab::Tables;
+        app.state.table_browse_result = Some(crate::api::types::QueryResult {
+            schema: vec![
+                crate::api::types::SchemaElement {
+                    name: "id".to_string(),
+                    algebraic_type: serde_json::json!({ "AlgebraicType": { "U64": {} } }),
+                },
+                crate::api::types::SchemaElement {
+                    name: "name".to_string(),
+                    algebraic_type: serde_json::json!({ "AlgebraicType": { "String": {} } }),
+                },
+            ],
+            rows: vec![vec![serde_json::Value::Null, serde_json::json!("Ada")]],
+            total_duration_micros: 10,
+        });
+
+        app.open_update_form();
+
+        assert!(app.state.modal.is_none());
+        assert!(app.pending_update_draft.is_none());
+        assert_eq!(
+            app.state.error_message.as_deref(),
+            Some("Cannot update row: primary key column 'id' is null")
+        );
+    }
+
+    fn query_result(name: &str) -> crate::api::types::QueryResult {
+        crate::api::types::QueryResult {
+            schema: vec![
+                crate::api::types::SchemaElement {
+                    name: "id".to_string(),
+                    algebraic_type: serde_json::json!({ "AlgebraicType": { "U64": {} } }),
+                },
+                crate::api::types::SchemaElement {
+                    name: "name".to_string(),
+                    algebraic_type: serde_json::json!({ "AlgebraicType": { "String": {} } }),
+                },
+            ],
+            rows: vec![vec![serde_json::json!(1), serde_json::json!(name)]],
+            total_duration_micros: 10,
+        }
+    }
+
+    #[tokio::test]
+    async fn app_ignores_matching_database_but_stale_schema_generation_schema_events() {
+        let mut app = test_app();
+        app.state.databases = vec!["db".to_string()];
+        app.state.selected_database_idx = Some(0);
+        app.schema_generation = 2;
+        app.database_generation = 1;
+        app.state.schema_loading = true;
+
+        app.handle_app_event(AppEvent::SchemaLoaded {
+            context: SchemaRequestContext {
+                database: "db".to_string(),
+                schema_generation: 1,
+                database_generation: 1,
+            },
+            schema: schema_with_table("old"),
+        })
+        .await;
+        assert!(app.state.schema_loading);
+        assert!(app.state.tables.is_empty());
+
+        app.state.set_error("newer schema error");
+        app.handle_app_event(AppEvent::SchemaError {
+            context: SchemaRequestContext {
+                database: "db".to_string(),
+                schema_generation: 1,
+                database_generation: 1,
+            },
+            error: "stale".to_string(),
+        })
+        .await;
+        assert!(app.state.schema_loading);
+        assert!(!app.state.schema_load_failed);
+        assert_eq!(
+            app.state.error_message.as_deref(),
+            Some("newer schema error")
+        );
+
+        app.handle_app_event(AppEvent::SchemaLoaded {
+            context: SchemaRequestContext {
+                database: "db".to_string(),
+                schema_generation: 2,
+                database_generation: 1,
+            },
+            schema: schema_with_table("new"),
+        })
+        .await;
+        assert!(!app.state.schema_loading);
+        assert_eq!(app.state.tables[0].table_name, "new");
+
+        app.state.schema_loading = true;
+        app.handle_app_event(AppEvent::SchemaError {
+            context: SchemaRequestContext {
+                database: "db".to_string(),
+                schema_generation: 2,
+                database_generation: 1,
+            },
+            error: "matching".to_string(),
+        })
+        .await;
+        assert!(!app.state.schema_loading);
+        assert!(app.state.schema_load_failed);
+        assert_eq!(app.state.error_message.as_deref(), Some("matching"));
+    }
+
+    #[tokio::test]
+    async fn app_ignores_stale_table_browse_events_including_schema_generation() {
+        let mut app = test_app();
+        app.state.databases = vec!["db".to_string()];
+        app.state.selected_database_idx = Some(0);
+        app.state.tables = schema_with_table("users").tables;
+        app.state.selected_table_idx = Some(0);
+        app.schema_generation = 2;
+        app.table_generation = 7;
+        app.database_generation = 1;
+        app.state.query_loading = true;
+
+        app.handle_app_event(AppEvent::TableBrowseResult {
+            context: TableBrowseRequestContext {
+                database: "db".to_string(),
+                table: "users".to_string(),
+                table_generation: 7,
+                schema_generation: 1,
+                database_generation: 1,
+            },
+            result: query_result("stale"),
+        })
+        .await;
+        assert!(
+            app.state.query_loading,
+            "stale result must preserve newer loading state"
+        );
+        assert!(app.state.table_browse_result.is_none());
+
+        app.state.set_error("newer table error");
+        app.handle_app_event(AppEvent::TableBrowseError {
+            context: TableBrowseRequestContext {
+                database: "db".to_string(),
+                table: "users".to_string(),
+                table_generation: 7,
+                schema_generation: 1,
+                database_generation: 1,
+            },
+            error: "stale".to_string(),
+        })
+        .await;
+        assert!(
+            app.state.query_loading,
+            "stale error must preserve newer loading state"
+        );
+        assert!(app.state.table_browse_result.is_none());
+        assert_eq!(
+            app.state.error_message.as_deref(),
+            Some("newer table error")
+        );
+
+        app.handle_app_event(AppEvent::TableBrowseResult {
+            context: TableBrowseRequestContext {
+                database: "db".to_string(),
+                table: "users".to_string(),
+                table_generation: 7,
+                schema_generation: 2,
+                database_generation: 1,
+            },
+            result: query_result("fresh"),
+        })
+        .await;
+        assert!(!app.state.query_loading);
+        assert_eq!(
+            app.state.table_browse_result.as_ref().unwrap().rows[0][1],
+            serde_json::json!("fresh")
+        );
+
+        app.state.query_loading = true;
+        app.handle_app_event(AppEvent::TableBrowseError {
+            context: TableBrowseRequestContext {
+                database: "db".to_string(),
+                table: "users".to_string(),
+                table_generation: 7,
+                schema_generation: 2,
+                database_generation: 1,
+            },
+            error: "matching".to_string(),
+        })
+        .await;
+        assert!(!app.state.query_loading);
+        assert_eq!(app.state.error_message.as_deref(), Some("matching"));
+    }
+
+    #[tokio::test]
+    async fn app_navigation_invalidates_browse_data_and_grid_state() {
+        let mut app = test_app();
+        app.state.databases = vec!["a".to_string(), "b".to_string()];
+        app.state.selected_database_idx = Some(0);
+        app.state.tables = vec![
+            make_table_with_pk("one", vec![typed_col_at(1, "id", "U64")], vec![1]),
+            make_table_with_pk("two", vec![typed_col_at(1, "id", "U64")], vec![1]),
+        ];
+        app.state.selected_table_idx = Some(0);
+        app.state.table_browse_result = Some(query_result("old"));
+        app.tables_grid.selected_row = 1;
+        app.state.focus = FocusPanel::Sidebar;
+        app.state.sidebar_focus = SidebarFocus::Tables;
+        app.nav_down().await;
+        assert!(app.state.table_browse_result.is_none());
+        assert_eq!(app.tables_grid.selected_row, 0);
+
+        app.state.table_browse_result = Some(query_result("old"));
+        app.tables_grid.selected_row = 1;
+        app.state.sidebar_focus = SidebarFocus::Databases;
+        app.nav_down().await;
+        assert!(app.state.table_browse_result.is_none());
+        assert_eq!(app.tables_grid.selected_row, 0);
+    }
+
+    #[test]
+    fn database_nav_up_emits_schema_reload_when_selection_changes() {
+        let mut state = AppState::new("http://localhost:3000");
+        state.databases = vec!["alpha".to_string(), "beta".to_string()];
+        state.selected_database_idx = Some(1);
+
+        assert!(database_nav_up_transition_requires_schema_reload(
+            &mut state
+        ));
+        assert_eq!(state.selected_database(), Some("alpha"));
+    }
+
+    #[test]
+    fn guided_write_locks_same_target_is_locked_regardless_of_plan_id_or_mutation() {
+        let mut locks = GuidedWriteLocks::default();
+        let first = make_write_plan(WritePlanId(1), "db", Some("public"), "users", 7, true);
+        let same_target = make_write_plan(WritePlanId(2), "db", Some("public"), "users", 7, false);
+
+        assert!(locks.acquire(&first));
+        assert!(locks.is_locked(&same_target));
+        assert!(!locks.acquire(&same_target));
+    }
+
+    #[test]
+    fn guided_write_locks_different_database_table_or_key_are_not_locked() {
+        let mut locks = GuidedWriteLocks::default();
+        let base = make_write_plan(WritePlanId(1), "db", Some("public"), "users", 7, true);
+        let different_database =
+            make_write_plan(WritePlanId(2), "other", Some("public"), "users", 7, true);
+        let different_table =
+            make_write_plan(WritePlanId(3), "db", Some("public"), "posts", 7, true);
+        let different_key = make_write_plan(WritePlanId(4), "db", Some("public"), "users", 8, true);
+
+        assert!(locks.acquire(&base));
+        assert!(!locks.is_locked(&different_database));
+        assert!(!locks.is_locked(&different_table));
+        assert!(!locks.is_locked(&different_key));
+    }
+
+    #[test]
+    fn guided_write_locks_removing_by_plan_id_releases_target() {
+        let mut locks = GuidedWriteLocks::default();
+        let first = make_write_plan(WritePlanId(1), "db", Some("public"), "users", 7, true);
+        let same_target = make_write_plan(WritePlanId(2), "db", Some("public"), "users", 7, false);
+
+        assert!(locks.acquire(&first));
+        assert!(locks.release(WritePlanId(1)));
+        assert!(!locks.is_locked(&same_target));
+        assert!(locks.acquire(&same_target));
+    }
+
+    fn make_write_plan(
+        id: WritePlanId,
+        database: &str,
+        schema: Option<&str>,
+        table: &str,
+        pk: u64,
+        update: bool,
+    ) -> WritePlan {
+        use crate::state::safety::{
+            CompletePrimaryKey, GuidedMutation, PrimaryKeyPart, QualifiedTable, SqlValue,
+        };
+
+        let original_primary_key =
+            CompletePrimaryKey::from_schema_ordered_parts(vec![PrimaryKeyPart {
+                column_id: 1,
+                value: SqlValue::U64(pk),
+            }])
+            .expect("test primary key should be complete");
+        let mutation = if update {
+            GuidedMutation::Update { changes: vec![] }
+        } else {
+            GuidedMutation::Delete
+        };
+
+        WritePlan {
+            id,
+            table: QualifiedTable {
+                database: database.to_string(),
+                schema: schema.map(str::to_string),
+                table: table.to_string(),
+            },
+            original_primary_key,
+            schema_generation: 0,
+            row_generation: 0,
+            server_context_generation: 0,
+            database_generation: 0,
+            mutation,
+        }
     }
 
     #[test]

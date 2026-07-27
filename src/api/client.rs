@@ -123,7 +123,9 @@ impl SpacetimeClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("HTTP {status}: {body}");
         }
-        resp.json::<T>().await.context("Failed to decode JSON response")
+        resp.json::<T>()
+            .await
+            .context("Failed to decode JSON response")
     }
 
     // ------------------------------------------------------------------
@@ -201,7 +203,10 @@ impl SpacetimeClient {
             bail!("Schema HTTP {status}: {body_snip}");
         }
 
-        let raw: Value = resp.json().await.context("Failed to decode schema response")?;
+        let raw: Value = resp
+            .json()
+            .await
+            .context("Failed to decode schema response")?;
         parse_schema_response(raw)
     }
 
@@ -230,8 +235,8 @@ impl SpacetimeClient {
         );
         debug!("Calling reducer with {} args", args.len());
 
-        let body = serde_json::to_string(args)
-            .context("Failed to encode reducer arguments as JSON")?;
+        let body =
+            serde_json::to_string(args).context("Failed to encode reducer arguments as JSON")?;
 
         let resp = self
             .post(&url)
@@ -280,8 +285,7 @@ impl SpacetimeClient {
         debug!("Adding alias '{alias}' to {database}");
 
         // The endpoint expects a bare JSON string in the body, e.g. `"foo"`.
-        let body = serde_json::to_string(alias)
-            .context("Failed to encode alias as JSON string")?;
+        let body = serde_json::to_string(alias).context("Failed to encode alias as JSON string")?;
 
         let resp = self
             .post(&url)
@@ -335,7 +339,10 @@ impl SpacetimeClient {
             let snip: String = body.chars().take(200).collect();
             bail!("get-names HTTP {status}: {snip}");
         }
-        let raw: Value = resp.json().await.context("Failed to decode names response")?;
+        let raw: Value = resp
+            .json()
+            .await
+            .context("Failed to decode names response")?;
         // Response wraps the list: `{"names":[...]}`. Tolerate a
         // bare array too in case that ever changes.
         let list = match raw {
@@ -476,7 +483,11 @@ impl SpacetimeClient {
         let identities: Vec<String> = raw
             .get("identities")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
             .unwrap_or_default();
 
         // Resolve each identity to its friendly name(s) via
@@ -496,13 +507,21 @@ impl SpacetimeClient {
     /// Ping the server and return `true` if it responds.
     pub async fn ping(&self) -> bool {
         let url = format!("{}/v1/ping", self.base_url);
-        self.get(&url).send().await.map(|r| r.status().is_success()).unwrap_or(false)
+        self.get(&url)
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
     }
 
     /// Fetch server metrics (Prometheus format).
     pub async fn get_metrics(&self) -> Result<String> {
         let url = format!("{}/metrics", self.base_url);
-        let resp = self.get(&url).send().await.context("Metrics request failed")?;
+        let resp = self
+            .get(&url)
+            .send()
+            .await
+            .context("Metrics request failed")?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -655,14 +674,21 @@ fn parse_query_result(raw: Value) -> Result<QueryResult> {
                 })
                 .unwrap_or_default();
             let algebraic_type = col.get("algebraic_type").cloned().unwrap_or(Value::Null);
-            SchemaElement { name, algebraic_type }
+            SchemaElement {
+                name,
+                algebraic_type,
+            }
         })
         .collect();
 
     let rows: Vec<Vec<Value>> = obj
         .get("rows")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().map(|row| row.as_array().cloned().unwrap_or_default()).collect())
+        .map(|arr| {
+            arr.iter()
+                .map(|row| row.as_array().cloned().unwrap_or_default())
+                .collect()
+        })
         .unwrap_or_default();
 
     let total_duration_micros = obj
@@ -670,7 +696,11 @@ fn parse_query_result(raw: Value) -> Result<QueryResult> {
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
-    Ok(QueryResult { schema: schema_elements, rows, total_duration_micros })
+    Ok(QueryResult {
+        schema: schema_elements,
+        rows,
+        total_duration_micros,
+    })
 }
 
 /// Parse the raw v9 schema response into a [`SchemaResponse`].
@@ -696,7 +726,11 @@ fn parse_schema_response(raw: Value) -> Result<SchemaResponse> {
 
     let mut tables: Vec<crate::api::types::TableInfo> = Vec::new();
     for t in &tables_raw {
-        let table_name = t.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let table_name = t
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if table_name.is_empty() {
             continue;
         }
@@ -732,7 +766,11 @@ fn parse_schema_response(raw: Value) -> Result<SchemaResponse> {
         let primary_key_cols: Vec<u16> = t
             .get("primary_key")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|n| n.as_u64().map(|u| u as u16)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|n| n.as_u64().map(|u| u as u16))
+                    .collect()
+            })
             .unwrap_or_default();
 
         // Discover autoinc columns via the `sequences` array. Each
@@ -790,7 +828,11 @@ fn parse_schema_response(raw: Value) -> Result<SchemaResponse> {
         })
         .collect();
 
-    Ok(SchemaResponse { typespace, tables, reducers })
+    Ok(SchemaResponse {
+        typespace,
+        tables,
+        reducers,
+    })
 }
 
 /// Extract the lowercase string key from a SpacetimeDB enum value.
@@ -866,12 +908,10 @@ fn resolve_columns(
 fn extract_params(params_val: Option<&Value>) -> Vec<crate::api::types::ReducerParam> {
     let elements: &[Value] = match params_val {
         Some(Value::Array(arr)) => arr,
-        Some(obj @ Value::Object(_)) => {
-            match obj.get("elements").and_then(|e| e.as_array()) {
-                Some(arr) => arr,
-                None => return Vec::new(),
-            }
-        }
+        Some(obj @ Value::Object(_)) => match obj.get("elements").and_then(|e| e.as_array()) {
+            Some(arr) => arr,
+            None => return Vec::new(),
+        },
         _ => return Vec::new(),
     };
 
@@ -892,7 +932,10 @@ fn extract_params(params_val: Option<&Value>) -> Vec<crate::api::types::ReducerP
                 return None;
             }
             let algebraic_type = elem.get("algebraic_type").cloned().unwrap_or(Value::Null);
-            Some(crate::api::types::ReducerParam { name, algebraic_type })
+            Some(crate::api::types::ReducerParam {
+                name,
+                algebraic_type,
+            })
         })
         .collect()
 }
@@ -908,7 +951,12 @@ fn parse_ndjson_logs(text: &str) -> Result<Vec<LogEntry>> {
         match serde_json::from_str::<LogEntry>(trimmed) {
             Ok(entry) => entries.push(entry),
             Err(e) => {
-                warn!("Failed to parse log line {}: {} — {:?}", line_num + 1, e, trimmed);
+                warn!(
+                    "Failed to parse log line {}: {} — {:?}",
+                    line_num + 1,
+                    e,
+                    trimmed
+                );
             }
         }
     }
@@ -1157,10 +1205,22 @@ mod tests {
 
     #[test]
     fn test_extract_enum_tag_object() {
-        assert_eq!(extract_enum_tag(Some(&json!({"User": []})), "unknown"), "user");
-        assert_eq!(extract_enum_tag(Some(&json!({"System": []})), "unknown"), "system");
-        assert_eq!(extract_enum_tag(Some(&json!({"Public": []})), "unknown"), "public");
-        assert_eq!(extract_enum_tag(Some(&json!({"Private": []})), "unknown"), "private");
+        assert_eq!(
+            extract_enum_tag(Some(&json!({"User": []})), "unknown"),
+            "user"
+        );
+        assert_eq!(
+            extract_enum_tag(Some(&json!({"System": []})), "unknown"),
+            "system"
+        );
+        assert_eq!(
+            extract_enum_tag(Some(&json!({"Public": []})), "unknown"),
+            "public"
+        );
+        assert_eq!(
+            extract_enum_tag(Some(&json!({"Private": []})), "unknown"),
+            "private"
+        );
     }
 
     #[test]

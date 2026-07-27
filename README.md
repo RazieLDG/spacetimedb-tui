@@ -2,12 +2,14 @@
 
 > **A blazing-fast, keyboard-driven terminal UI for managing, querying, editing, and monitoring SpacetimeDB 2.0 — right from your shell.**
 
-Browse databases, run SQL, stream live transactions, edit rows in a spreadsheet, call reducers, and manage aliases — all with Vim-style key bindings and a command palette.
+Browse databases, run SQL, edit rows in a spreadsheet, call reducers, and manage aliases — all with Vim-style key bindings and a command palette. (Live transaction streaming is temporarily disabled while Phase 1 safety controls are tightened; see [Phase 1 safety behavior](#phase-1-safety-behavior).)
 
+[![CI](https://github.com/RazieLDG/spacetimedb-tui/actions/workflows/ci.yml/badge.svg)](https://github.com/RazieLDG/spacetimedb-tui/actions/workflows/ci.yml)
+[![Release](https://github.com/RazieLDG/spacetimedb-tui/actions/workflows/release.yml/badge.svg)](https://github.com/RazieLDG/spacetimedb-tui/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![SpacetimeDB](https://img.shields.io/badge/SpacetimeDB-2.0-blueviolet)](https://spacetimedb.com)
 [![Rust](https://img.shields.io/badge/Rust-1.78%2B-orange)](https://www.rust-lang.org)
-[![Tests](https://img.shields.io/badge/tests-122%20passing-brightgreen)](#)
+[![Tests](https://img.shields.io/badge/tests-127%20passing-brightgreen)](#)
 
 ---
 
@@ -35,7 +37,7 @@ Browse databases, run SQL, stream live transactions, edit rows in a spreadsheet,
 | 📜 **Log Viewer** | Tail structured logs with level filtering (`f` cycles `Trace` → `Panic`), pause/resume (`Space`), and a live `visible / total` counter. Tolerates both RFC 3339 and u64-microsecond timestamps. |
 | 📈 **Metrics Dashboard** | Per-tick **delta sparklines** (not cumulative ramps) for reducer calls and energy use, plus stat cards for clients / tables / reducer count / memory. Auto-refresh every 10s while visible. |
 | 🔬 **Module Inspector** | Browse reducers with full parameter signatures, user tables, system tables, and columns. |
-| ⚡ **Live Tab** | Real-time transaction feed driven by the WebSocket subscription, split 2/3 : 1/3 with a connected-client list polled from `st_client` every 10s. Status bar shows `● LIVE` / `◌ reconnect in Ns`. |
+| ⚡ **Live Tab** | Live updates are temporarily unavailable while safety controls are tightened. The tab shows a disabled notice and a connected-client list polled from `st_client` every 10s; use manual refresh for table data. Bounded scoped Live will return later. |
 
 ### Write
 
@@ -45,8 +47,14 @@ Browse databases, run SQL, stream live transactions, edit rows in a spreadsheet,
 | ➕ **Row Insert** | `i` on the Tables tab opens a column-typed form; submit issues `INSERT INTO <table> (…) VALUES (…)`. |
 | ✏️ **Row Update (form)** | `Shift+U` pre-fills every column of the selected row into an edit form with the PK marked read-only. Submit builds a correct `UPDATE … SET col=val WHERE pk=original_pk`, even if the PK is an `Identity` / `ConnectionId` / `U256`. |
 | 🗑️ **Row Delete** | `d` opens a y/n confirm showing the exact `DELETE FROM … WHERE pk = …` statement that will run. |
-| 📝 **Spreadsheet Edit Mode** | `Ctrl+E` enters a cell-by-cell editor on the Tables tab. Move with `h`/`j`/`k`/`l`, `Enter` to open an inline input, `Enter` to stage, `s` to flush all pending edits as batched `UPDATE`s, `u` to revert, `Esc` to exit (with a discard prompt if pending > 0). |
+| 📝 **Spreadsheet Edit Mode** | `Ctrl+E` enters a cell-by-cell editor on the Tables tab. Move with `h`/`j`/`k`/`l`, `Enter` to open an inline input, `Enter` to stage edits for one typed dirty row, `s` to save that row through one guided WritePlan/update confirmation, `u` to revert, `Esc` to exit (with a discard prompt if pending > 0). Edits on a different row ask Save / Discard / Stay; multi-row Save All is unavailable. |
 | 💾 **Clipboard + Export** | `y` copies the cell, `Y` copies the row as TSV (via OSC 52, no external dep). `e` exports to CSV, `E` exports to JSON under `./exports/`. |
+
+### Phase 1 safety behavior
+
+Live updates are temporarily unavailable while safety controls are tightened. Use manual refresh for table data. Bounded scoped Live will return later; broad automatic subscriptions are currently unavailable. Spreadsheet editing supports one-row spreadsheet Save: multiple changed cells in one row are saved as one guided write, while moving to another row prompts Save, Discard, or Stay. Guided update/delete require declared primary keys and matching generations, with no unsafe override. Raw SQL is a separately labeled expert path; Raw SQL does not receive the guided CRUD guarantee and is never automatically retried. Unknown mutation outcomes are not automatically retried; refresh the affected scope before another guided attempt.
+
+Phase 1 release validation requires formatting, warning-denied Clippy, all tests with the 127-test baseline plus Phase 1 additions, and a release build before the phase is called complete.
 
 ### Admin
 
@@ -74,11 +82,60 @@ Browse databases, run SQL, stream live transactions, edit rows in a spreadsheet,
 
 ### Prerequisites
 
-- **Rust 1.78+** — install via [rustup](https://rustup.rs)
 - A running **SpacetimeDB 2.0** instance (local or remote)
 - **SpacetimeDB CLI** configured (`spacetime login` or local server)
+- For source builds only: **Rust 1.78+** via [rustup](https://rustup.rs)
 
-### Build from Source
+### Option 1 — One-line installer (recommended)
+
+The repo ships ready-to-pipe installer scripts that detect your OS/architecture, download the matching archive from the latest GitHub release, and drop the binary onto a directory on your `PATH`.
+
+```bash
+# Linux / macOS — installs to ~/.local/bin by default
+curl -fsSL https://raw.githubusercontent.com/RazieLDG/spacetimedb-tui/main/scripts/install.sh | bash
+
+# Pin a version or override the install dir
+curl -fsSL https://raw.githubusercontent.com/RazieLDG/spacetimedb-tui/main/scripts/install.sh \
+    | bash -s -- --version v0.1.0 --dir /usr/local/bin
+```
+
+```powershell
+# Windows (PowerShell 5.1+ / 7+)
+irm https://raw.githubusercontent.com/RazieLDG/spacetimedb-tui/main/scripts/install.ps1 | iex
+
+# Pin a version and auto-append the install dir to user PATH
+iex "& { $(irm https://raw.githubusercontent.com/RazieLDG/spacetimedb-tui/main/scripts/install.ps1) } -Version v0.1.0 -AddToPath"
+```
+
+Both scripts are idempotent — re-running upgrades the binary in place.
+
+### Option 2 — Pre-built binaries (manual)
+
+Every tagged release ships pre-built archives for the three tier-1 desktop platforms. Grab the right archive for your machine from the [latest release](https://github.com/RazieLDG/spacetimedb-tui/releases/latest):
+
+| Platform | Archive |
+|---|---|
+| Linux x86_64 (glibc) | `spacetimedb-tui-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS Intel | `spacetimedb-tui-vX.Y.Z-x86_64-apple-darwin.tar.gz` |
+| macOS Apple Silicon | `spacetimedb-tui-vX.Y.Z-aarch64-apple-darwin.tar.gz` |
+| Windows x86_64 | `spacetimedb-tui-vX.Y.Z-x86_64-pc-windows-msvc.zip` |
+
+Unpack and drop `spacetimedb-tui` (or `spacetimedb-tui.exe` on Windows) anywhere on your `PATH`:
+
+```bash
+# Linux / macOS
+tar xzf spacetimedb-tui-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+sudo mv spacetimedb-tui-v0.1.0-x86_64-unknown-linux-gnu/spacetimedb-tui /usr/local/bin/
+```
+
+```powershell
+# Windows (PowerShell)
+Expand-Archive spacetimedb-tui-v0.1.0-x86_64-pc-windows-msvc.zip
+Move-Item .\spacetimedb-tui-v0.1.0-x86_64-pc-windows-msvc\spacetimedb-tui.exe `
+          "$env:USERPROFILE\bin\spacetimedb-tui.exe"
+```
+
+### Option 3 — Build from source
 
 ```bash
 # 1. Clone the repository
@@ -257,9 +314,10 @@ Press `?` at any time to open a scrollable help overlay listing every binding. U
 |---|---|
 | `h` / `j` / `k` / `l` | Move cell cursor |
 | `Enter` / `i` | Open inline editor on selected cell |
-| `Enter` (in editor) | Commit value to pending list |
+| `Enter` (in editor) | Commit value to the current typed dirty row |
 | `Esc` (in editor) | Cancel inline edit |
-| `s` | Save all pending edits (spawns batched `UPDATE`s) |
+| different row | Save / Discard / Stay gate when moving to another row with unsaved edits |
+| `s` | Save one typed dirty row through one guided WritePlan/update confirmation; multi-row Save All is unavailable |
 | `u` | Revert pending edit on active cell |
 | `Ctrl+E` / `Esc` | Exit edit mode (asks to discard if pending > 0) |
 
@@ -334,7 +392,7 @@ Built and tested against **SpacetimeDB 2.0** HTTP + WebSocket APIs.
 | Add alias | `POST /v1/database/{db}/names` |
 | Delete database | `DELETE /v1/database/{db}` |
 | Log streaming | `GET /v1/database/{db}/logs` |
-| Live subscription | `GET /v1/database/{db}/subscribe` (WebSocket) |
+| Live subscription | `GET /v1/database/{db}/subscribe` (WebSocket) — **temporarily disabled in Phase 1**; manual refresh is used instead |
 | Metrics | `GET /metrics` (Prometheus format) |
 
 ### WebSocket Subprotocol

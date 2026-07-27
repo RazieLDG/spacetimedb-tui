@@ -66,7 +66,6 @@ impl TableGridState {
             }
         }
     }
-
 }
 
 /// Compute the original-data index for a given display-order row when
@@ -265,11 +264,7 @@ impl<'a> TableGrid<'a> {
         if n == 0 {
             return vec![];
         }
-        let mut widths: Vec<usize> = self
-            .headers
-            .iter()
-            .map(|h| h.width().max(4))
-            .collect();
+        let mut widths: Vec<usize> = self.headers.iter().map(|h| h.width().max(4)).collect();
 
         for row in self.rows {
             for (i, cell) in row.iter().enumerate() {
@@ -334,9 +329,7 @@ impl<'a> StatefulWidget for TableGrid<'a> {
             if let Some(ref t) = self.title {
                 b = b.title(Span::styled(
                     format!(" {t} "),
-                    Style::default()
-                        .fg(ACCENT)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 ));
             }
             b
@@ -481,8 +474,13 @@ impl<'a> StatefulWidget for TableGrid<'a> {
         // Ensure scroll so selected row is visible
         state.ensure_visible(available_rows);
 
-        for display_idx in state.scroll_row..(state.scroll_row + available_rows).min(row_order.len()) {
-            let ri = row_order[display_idx];
+        let end_idx = (state.scroll_row + available_rows).min(row_order.len());
+        for (display_idx, &ri) in row_order
+            .iter()
+            .enumerate()
+            .take(end_idx)
+            .skip(state.scroll_row)
+        {
             let row = &self.rows[ri];
             let screen_y = data_start_y + (display_idx - state.scroll_row) as u16;
             if screen_y >= inner.y + inner.height {
@@ -507,7 +505,7 @@ impl<'a> StatefulWidget for TableGrid<'a> {
                 SELECTED_BG
             } else if is_match {
                 Color::Rgb(60, 50, 20) // subtle amber for search matches
-            } else if ri % 2 == 0 {
+            } else if ri.is_multiple_of(2) {
                 Color::Reset
             } else {
                 Color::Rgb(22, 22, 24)
@@ -579,18 +577,13 @@ impl<'a> StatefulWidget for TableGrid<'a> {
                     let display_col = unicode_width::UnicodeWidthStr::width(before) as u16;
                     if (display_col as usize) < w {
                         let cur_x = x + display_col;
-                        let cur_ch = val[cursor.min(val.len())..]
-                            .chars()
-                            .next()
-                            .unwrap_or(' ');
-                        buf[(cur_x, screen_y)]
-                            .set_char(cur_ch)
-                            .set_style(
-                                Style::default()
-                                    .fg(Color::Black)
-                                    .bg(Color::Rgb(255, 220, 100))
-                                    .add_modifier(Modifier::BOLD),
-                            );
+                        let cur_ch = val[cursor.min(val.len())..].chars().next().unwrap_or(' ');
+                        buf[(cur_x, screen_y)].set_char(cur_ch).set_style(
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Rgb(255, 220, 100))
+                                .add_modifier(Modifier::BOLD),
+                        );
                     }
                 }
                 x += w as u16;
@@ -620,10 +613,7 @@ impl<'a> StatefulWidget for TableGrid<'a> {
             let ind_x = inner.x + inner.width.saturating_sub(indicator.len() as u16);
             let ind_y = inner.y + inner.height - 1;
             if ind_y < inner.y + inner.height {
-                let line = Line::from(Span::styled(
-                    indicator,
-                    Style::default().fg(FG_MUTED),
-                ));
+                let line = Line::from(Span::styled(indicator, Style::default().fg(FG_MUTED)));
                 buf.set_line(ind_x, ind_y, &line, inner.width);
             }
         }
@@ -637,15 +627,18 @@ impl<'a> StatefulWidget for TableGrid<'a> {
 fn compare_cells(a: &str, b: &str) -> std::cmp::Ordering {
     match (a.parse::<f64>(), b.parse::<f64>()) {
         (Ok(na), Ok(nb)) => na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal),
-        _ => a
-            .to_ascii_lowercase()
-            .cmp(&b.to_ascii_lowercase()),
+        _ => a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()),
     }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
-
+//
+// `render_empty` (a tiny one-line helper) follows this test module
+// on purpose so the tests can share the file with the widget they
+// cover. Suppress clippy's "items after test module" lint rather
+// than splitting the file.
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
@@ -714,18 +707,12 @@ mod tests {
     fn compare_cells_numeric_beats_lex() {
         // Lex order would put "10" before "2"; numeric order is the
         // other way round. We want numeric.
-        assert_eq!(
-            compare_cells("2", "10"),
-            std::cmp::Ordering::Less
-        );
+        assert_eq!(compare_cells("2", "10"), std::cmp::Ordering::Less);
     }
 
     #[test]
     fn compare_cells_falls_back_to_lex_when_non_numeric() {
-        assert_eq!(
-            compare_cells("alice", "Bob"),
-            std::cmp::Ordering::Less
-        );
+        assert_eq!(compare_cells("alice", "Bob"), std::cmp::Ordering::Less);
     }
 }
 
@@ -733,7 +720,11 @@ mod tests {
 
 /// Render a placeholder message inside `area` when there is no data.
 pub fn render_empty(area: Rect, buf: &mut Buffer, msg: &str, focused: bool) {
-    let border_color = if focused { BORDER_FOCUSED } else { BORDER_NORMAL };
+    let border_color = if focused {
+        BORDER_FOCUSED
+    } else {
+        BORDER_NORMAL
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color));

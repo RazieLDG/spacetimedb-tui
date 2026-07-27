@@ -7,3 +7,4 @@ pub mod export;
 pub mod layout;
 pub mod sidebar;
 pub mod tabs;
+pub mod text;

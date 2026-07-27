@@ -1,0 +1,89 @@
+name: CI
+
+# Runs on every push to main and every pull request. Validates
+# formatting, lints, tests, and a release build on the three tier-1
+# desktop platforms. Keeps the matrix minimal so PR feedback stays
+# under ~3 minutes per OS.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-flight runs on the same branch / PR when a new push
+# arrives so we don't burn minutes on superseded commits.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Tell cargo to be verbose about timing but not spammy with
+  # incremental rebuild diagnostics on CI.
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-D warnings"
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ────────────────────────────────────────────────────────────────
+  # Fast lint pass — fmt + clippy, single platform. Runs in parallel
+  # with the heavier test matrix so failures surface quickly.
+  # ────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: lint
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        # Deny every warning so PRs have to fix lints before merge.
+        # --locked ensures Cargo.lock is honoured — no surprise
+        # dependency bumps during CI.
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  # ────────────────────────────────────────────────────────────────
+  # Test + release build matrix on the three tier-1 desktop OSes.
+  # Windows uses MSVC (default for `windows-latest`), macOS gets the
+  # Apple Silicon runner (aarch64), Linux is ubuntu-latest (x86_64).
+  # ────────────────────────────────────────────────────────────────
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: test-${{ matrix.os }}
+
+      - name: cargo test
+        run: cargo test --all-features --locked --verbose
+
+      - name: cargo build --release
+        # Smoke check that the release build actually links — this
+        # is what ends up in the GitHub release later, so catching a
+        # platform-specific link error on CI saves a broken release.
+        run: cargo build --release --locked --verbose

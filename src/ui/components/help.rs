@@ -106,7 +106,7 @@ const SECTIONS: &[Section] = &[
             Binding { key: "Enter / i",       desc: "Open inline editor on selected cell" },
             Binding { key: "Enter",           desc: "Commit inline editor value to pending list" },
             Binding { key: "Esc (in editor)", desc: "Cancel inline edit without committing" },
-            Binding { key: "s",               desc: "Save all pending edits (spawn UPDATE statements)" },
+            Binding { key: "s",               desc: "Save one typed dirty row through one guided update confirmation" },
             Binding { key: "u",               desc: "Revert pending edit on active cell" },
             Binding { key: "Ctrl+E / Esc",    desc: "Exit edit mode (asks if pending edits > 0)" },
         ],
@@ -147,8 +147,8 @@ const SECTIONS: &[Section] = &[
     Section {
         title: "Live",
         bindings: &[
-            Binding { key: "6",               desc: "Jump to the Live tab (tx feed + clients)" },
-            Binding { key: "r",               desc: "Force re-subscribe to the WebSocket feed" },
+            Binding { key: "6",               desc: "Jump to the Live tab (disabled notice + clients)" },
+            Binding { key: "r",               desc: "Force refresh of the connected-clients metadata poll" },
         ],
     },
     Section {
@@ -177,12 +177,29 @@ impl HelpOverlay {
         Self { scroll }
     }
 
-    /// Total number of lines the overlay would render with the
-    /// current section list. Used by `app.rs` to clamp the scroll
-    /// offset so a user mashing `↓` doesn't push the state into
-    /// nonsense values that take dozens of `↑` presses to recover.
+    /// Total number of lines the overlay can render, used by `app.rs`
+    /// to clamp the scroll offset so a user mashing `↓` doesn't push
+    /// the state into nonsense values that take dozens of `↑` presses
+    /// to recover.
+    ///
+    /// The binding sections have a fixed, width-independent line count.
+    /// The Phase 1 notice is word-wrapped to the popup width at render
+    /// time, so its exact line count is not known here; we count one
+    /// line per word (plus the header and trailing blank line) as a
+    /// strict upper bound. The render path clamps the *displayed* scroll
+    /// to the real wrapped line count, so overestimating here only lets
+    /// the stored offset run a few lines past the visible end on wide
+    /// terminals — it never hides the last bindings (the bug an
+    /// underestimate would cause).
     pub fn total_lines() -> usize {
         let mut n = 0usize;
+
+        // Phase 1 safety notice: header + one line per word (upper
+        // bound on the wrapped line count) + trailing blank line.
+        n += 1;
+        n += phase_one_safety_help_text().split_whitespace().count();
+        n += 1;
+
         for section in SECTIONS {
             n += 1; // header
             n += section.bindings.len();
@@ -209,9 +226,7 @@ impl Widget for HelpOverlay {
         let block = Block::default()
             .title(Span::styled(
                 " ⌨  Key Bindings — press ? to close ",
-                Style::default()
-                    .fg(ACCENT)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(BORDER))
@@ -226,6 +241,24 @@ impl Widget for HelpOverlay {
 
         // Build all lines
         let mut lines: Vec<Line> = Vec::new();
+
+        // Phase 1 safety notice — kept truthful with README/CHANGELOG by
+        // `phase_one_truth_gate_tests`.
+        let notice_width = inner.width.saturating_sub(2) as usize;
+        lines.push(Line::from(Span::styled(
+            "  Phase 1 safety ",
+            Style::default()
+                .fg(SECTION_FG)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        )));
+        for wrapped in wrap_notice(phase_one_safety_help_text(), notice_width) {
+            lines.push(Line::from(Span::styled(
+                format!("  {wrapped}"),
+                Style::default().fg(FG_MUTED),
+            )));
+        }
+        lines.push(Line::from(""));
+
         for section in SECTIONS {
             // Section header
             lines.push(Line::from(Span::styled(
@@ -273,6 +306,128 @@ impl Widget for HelpOverlay {
             let hint_y = inner.y + inner.height.saturating_sub(1);
             let hint_line = Line::from(Span::styled(hint, Style::default().fg(FG_MUTED)));
             buf.set_line(hint_x, hint_y, &hint_line, inner.width);
+        }
+    }
+}
+
+/// Phase 1 safety behavior summary shown in help/docs.
+///
+/// Kept in sync with README.md and CHANGELOG.md by
+/// `phase_one_truth_gate_tests`.
+pub fn phase_one_safety_help_text() -> &'static str {
+    "Phase 1 safety: Live updates are temporarily unavailable while safety controls are tightened. Use manual refresh for table data. Bounded scoped Live will return later; broad automatic subscriptions are currently unavailable. Spreadsheet editing supports one-row spreadsheet Save only: changed cells in one row are saved as one guided WritePlan, and changing rows prompts Save, Discard, or Stay. Guided update/delete require declared primary keys and matching generations, with no unsafe override. Raw SQL is a separately labeled expert path; Raw SQL does not receive the guided CRUD guarantee and is never automatically retried. Unknown mutation outcomes are not automatically retried; refresh the affected scope before another guided attempt."
+}
+
+/// Word-wrap `text` to at most `width` columns, breaking on spaces.
+///
+/// A `width` of 0 yields a single line containing the whole text (the
+/// renderer clamps overflow). Words longer than `width` are kept intact
+/// rather than split mid-word so no line is silently truncated inside a
+/// token.
+fn wrap_notice(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_owned()];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current.len() + 1 + word.len() <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn total_lines_counts_the_phase_one_notice_section() {
+        // Binding sections alone: header + bindings + trailing blank
+        // per section.
+        let bindings_only: usize = SECTIONS
+            .iter()
+            .map(|section| 1 + section.bindings.len() + 1)
+            .sum();
+
+        // The overlay also renders the Phase 1 safety notice (header +
+        // wrapped body + trailing blank line). total_lines() must count
+        // it, otherwise app.rs clamps the scroll offset too low and the
+        // last bindings become unreachable.
+        assert!(
+            HelpOverlay::total_lines() > bindings_only,
+            "total_lines() {} must exceed bindings-only {} to include the Phase 1 notice",
+            HelpOverlay::total_lines(),
+            bindings_only
+        );
+
+        // Upper-bound accounting: notice header + one line per word +
+        // trailing blank, then the binding sections.
+        let notice_words = phase_one_safety_help_text().split_whitespace().count();
+        assert_eq!(HelpOverlay::total_lines(), bindings_only + notice_words + 2);
+    }
+
+    fn spreadsheet_s_description() -> &'static str {
+        SECTIONS
+            .iter()
+            .find(|section| section.title == "Spreadsheet edit mode (Tables tab)")
+            .and_then(|section| section.bindings.iter().find(|binding| binding.key == "s"))
+            .map(|binding| binding.desc)
+            .expect("spreadsheet s binding exists")
+    }
+
+    #[test]
+    fn spreadsheet_save_binding_describes_one_typed_dirty_row_guided_update() {
+        let desc = spreadsheet_s_description();
+        assert!(desc.contains("one typed dirty row"), "desc was: {desc}");
+        assert!(
+            desc.contains("one guided update confirmation"),
+            "desc was: {desc}"
+        );
+        for forbidden in [
+            "Save all",
+            "Save All",
+            "all pending edits",
+            "batched UPDATE",
+            "spawn UPDATE",
+            "spawns UPDATE",
+        ] {
+            assert!(
+                !desc.contains(forbidden),
+                "desc must not contain {forbidden:?}: {desc}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod phase_one_truth_gate_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn phase_one_behavior_claims_are_truthful_in_docs_and_help() {
+        let readme = fs::read_to_string("README.md").unwrap();
+        let changelog = fs::read_to_string("CHANGELOG.md").unwrap();
+        let help = phase_one_safety_help_text();
+
+        for text in [&readme, &changelog, help] {
+            assert!(text.contains("Live updates are temporarily unavailable"));
+            assert!(text.contains("one-row spreadsheet Save"));
+            assert!(text.contains("Unknown mutation outcomes are not automatically retried"));
+            assert!(text.contains("Guided update/delete require declared primary keys and matching generations, with no unsafe override"));
+            assert!(text.contains("Raw SQL is a separately labeled expert path"));
+            assert!(text.contains("Raw SQL does not receive the guided CRUD guarantee and is never automatically retried"));
         }
     }
 }

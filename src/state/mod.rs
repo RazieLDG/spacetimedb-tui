@@ -8,9 +8,10 @@ pub mod app_state;
 pub mod edit_mode;
 pub mod modal;
 pub mod palette;
+pub mod safety;
 
 // Re-export the most commonly used items.
 pub use app_state::{
     AppState, ConnectionStatus, FocusPanel, HistoryAdvance, MetricsSnapshot, SidebarFocus,
-    SqlHistoryEntry, Tab, TxLogEntry,
+    SqlHistoryEntry, Tab,
 };

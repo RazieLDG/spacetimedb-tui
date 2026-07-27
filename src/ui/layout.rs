@@ -29,12 +29,12 @@ const BORDER_NORMAL: Color = Color::Rgb(40, 50, 65);
 /// Maps [`Tab`] variants to their display labels (with shortcut hints).
 pub fn tab_title(tab: Tab) -> &'static str {
     match tab {
-        Tab::Tables  => " 1:Tables ",
-        Tab::Sql     => " 2:SQL ",
-        Tab::Logs    => " 3:Logs ",
+        Tab::Tables => " 1:Tables ",
+        Tab::Sql => " 2:SQL ",
+        Tab::Logs => " 3:Logs ",
         Tab::Metrics => " 4:Metrics ",
-        Tab::Module  => " 5:Module ",
-        Tab::Live    => " 6:Live ",
+        Tab::Module => " 5:Module ",
+        Tab::Live => " 6:Live ",
     }
 }
 
@@ -67,8 +67,8 @@ pub fn render_layout(area: Rect, buf: &mut Buffer, app: &AppState) -> ContentAre
         .split(area);
 
     let title_area = outer[0];
-    let tab_area   = outer[1];
-    let body_area  = outer[2];
+    let tab_area = outer[1];
+    let body_area = outer[2];
     // status_area = outer[3] — drawn by status_bar module
 
     // ── Title bar ─────────────────────────────────────────────────────────
@@ -86,12 +86,16 @@ pub fn render_layout(area: Rect, buf: &mut Buffer, app: &AppState) -> ContentAre
         ])
         .split(body_area);
 
-    let sidebar_area  = body[0];
-    let content_area  = body[1];
+    let sidebar_area = body[0];
+    let content_area = body[1];
 
     // Draw the sidebar outer border (items rendered by sidebar module)
     let sidebar_focused = app.focus == FocusPanel::Sidebar;
-    let sidebar_border = if sidebar_focused { ACCENT } else { BORDER_NORMAL };
+    let sidebar_border = if sidebar_focused {
+        ACCENT
+    } else {
+        BORDER_NORMAL
+    };
     Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(sidebar_border))
@@ -127,19 +131,16 @@ fn render_title_bar(area: Rect, buf: &mut Buffer, app: &AppState) {
             .bg(BG_TITLE)
             .add_modifier(Modifier::BOLD),
     );
-    let ver = Span::styled(
-        "v0.1 ",
-        Style::default().fg(FG_MUTED).bg(BG_TITLE),
-    );
+    let ver = Span::styled("v0.1 ", Style::default().fg(FG_MUTED).bg(BG_TITLE));
     let left = Line::from(vec![name, ver]);
     buf.set_line(area.x, area.y, &left, area.width / 2);
 
     // Right: connection status + server URL
     let (status_text, status_color) = match &app.connection.status {
-        ConnectionStatus::Connected    => ("● Connected", SUCCESS),
-        ConnectionStatus::Connecting   => ("◌ Connecting…", WARNING),
+        ConnectionStatus::Connected => ("● Connected", SUCCESS),
+        ConnectionStatus::Connecting => ("◌ Connecting…", WARNING),
         ConnectionStatus::Disconnected => ("○ Disconnected", FG_MUTED),
-        ConnectionStatus::Error(_)     => ("✗ Error", ERROR_FG),
+        ConnectionStatus::Error(_) => ("✗ Error", ERROR_FG),
     };
 
     let url_text = format!("  {}  ", app.connection.base_url);

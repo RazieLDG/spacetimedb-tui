@@ -32,7 +32,11 @@ const BG_SPARK: Color = Color::Rgb(15, 22, 34);
 /// Render the metrics dashboard tab.
 pub fn render_metrics(area: Rect, buf: &mut Buffer, app: &AppState) {
     let focused = app.focus == FocusPanel::Main;
-    let border_color = if focused { BORDER_FOCUSED } else { BORDER_NORMAL };
+    let border_color = if focused {
+        BORDER_FOCUSED
+    } else {
+        BORDER_NORMAL
+    };
 
     let outer = Block::default()
         .borders(Borders::ALL)
@@ -52,9 +56,9 @@ pub fn render_metrics(area: Rect, buf: &mut Buffer, app: &AppState) {
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),  // stat cards row
-            Constraint::Length(6),  // sparklines
-            Constraint::Min(0),     // extra key-value pairs
+            Constraint::Length(5), // stat cards row
+            Constraint::Length(6), // sparklines
+            Constraint::Min(0),    // extra key-value pairs
         ])
         .split(inner);
 
@@ -80,28 +84,32 @@ fn render_stat_cards(area: Rect, buf: &mut Buffer, app: &AppState) {
     let m = &app.metrics;
 
     render_card(
-        cards[0], buf,
+        cards[0],
+        buf,
         "Connected Clients",
         &m.connected_clients.to_string(),
         "👥",
         ACCENT,
     );
     render_card(
-        cards[1], buf,
+        cards[1],
+        buf,
         "Tables",
         &app.tables.len().to_string(),
         "📋",
         SUCCESS,
     );
     render_card(
-        cards[2], buf,
+        cards[2],
+        buf,
         "Reducer Calls",
         &m.total_reducer_calls.to_string(),
         "⚡",
         FG_VALUE,
     );
     render_card(
-        cards[3], buf,
+        cards[3],
+        buf,
         "Memory",
         &format_bytes(m.memory_bytes),
         "💾",
@@ -131,12 +139,9 @@ fn render_card(area: Rect, buf: &mut Buffer, label: &str, value: &str, icon: &st
     // Value (large, centred)
     let val_line = Line::from(Span::styled(
         format!("  {value}"),
-        Style::default()
-            .fg(color)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
     ));
     buf.set_line(inner.x, inner.y + 1, &val_line, inner.width);
-
 }
 
 // ── Sparklines ────────────────────────────────────────────────────────────────
@@ -173,13 +178,7 @@ fn render_sparklines(area: Rect, buf: &mut Buffer, app: &AppState) {
     render_sparkline_panel(cols[1], buf, "Energy Δ /10s", &energy_deltas, FG_VALUE);
 }
 
-fn render_sparkline_panel(
-    area: Rect,
-    buf: &mut Buffer,
-    title: &str,
-    data: &[u64],
-    color: Color,
-) {
+fn render_sparkline_panel(area: Rect, buf: &mut Buffer, title: &str, data: &[u64], color: Color) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Rgb(40, 55, 75)))
@@ -214,10 +213,7 @@ fn render_extra_metrics(area: Rect, buf: &mut Buffer, app: &AppState) {
     let block = Block::default()
         .borders(Borders::TOP)
         .border_style(Style::default().fg(Color::Rgb(40, 55, 75)))
-        .title(Span::styled(
-            " Raw Metrics ",
-            Style::default().fg(FG_MUTED),
-        ));
+        .title(Span::styled(" Raw Metrics ", Style::default().fg(FG_MUTED)));
     let inner = block.inner(area);
     block.render(area, buf);
 
@@ -272,7 +268,10 @@ fn kv_line<'a>(key: &str, value: &str) -> Line<'a> {
     let key_padded = format!("  {:<width$}", key, width = key_w);
     Line::from(vec![
         Span::styled(key_padded, Style::default().fg(FG_MUTED)),
-        Span::styled(value.to_string(), Style::default().fg(FG_VALUE).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            value.to_string(),
+            Style::default().fg(FG_VALUE).add_modifier(Modifier::BOLD),
+        ),
     ])
 }
 

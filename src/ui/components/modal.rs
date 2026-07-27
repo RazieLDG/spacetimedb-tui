@@ -83,9 +83,21 @@ fn render_confirm(area: Rect, buf: &mut Buffer, prompt: &str) {
     // Footer hint
     let hint_y = area.y + area.height - 1;
     let hint = Line::from(vec![
-        Span::styled(" [y] ", Style::default().fg(ACCENT).bg(BG).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " [y] ",
+            Style::default()
+                .fg(ACCENT)
+                .bg(BG)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("confirm  ", Style::default().fg(FG_PRIMARY).bg(BG)),
-        Span::styled(" [n / Esc] ", Style::default().fg(ACCENT).bg(BG).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " [n / Esc] ",
+            Style::default()
+                .fg(ACCENT)
+                .bg(BG)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("cancel ", Style::default().fg(FG_PRIMARY).bg(BG)),
     ]);
     buf.set_line(area.x, hint_y, &hint, area.width);
@@ -120,20 +132,14 @@ fn render_form(
             Style::default().fg(FG_FIELD_LABEL).bg(BG)
         };
         let arrow = if is_focused { "▶ " } else { "  " };
-        let label = Line::from(Span::styled(
-            format!("{arrow}{}", field.label),
-            label_style,
-        ));
+        let label = Line::from(Span::styled(format!("{arrow}{}", field.label), label_style));
         buf.set_line(area.x, y, &label, area.width);
         y += 1;
 
         // Input line — show the value, with a visible cursor when
         // focused, plus a placeholder when empty.
         let display_text = if field.input.value.is_empty() {
-            field
-                .placeholder
-                .clone()
-                .unwrap_or_default()
+            field.placeholder.clone().unwrap_or_default()
         } else {
             field.input.value.clone()
         };
@@ -142,11 +148,16 @@ fn render_form(
         } else {
             Style::default().fg(FG_PRIMARY).bg(BG)
         };
-        let placeholder_style = Style::default().fg(FG_MUTED).bg(input_style.bg.unwrap_or(BG));
+        let placeholder_style = Style::default()
+            .fg(FG_MUTED)
+            .bg(input_style.bg.unwrap_or(BG));
 
         // Pad the input to the full width so the focus background
         // covers the whole row.
-        let padded = format!("  {display_text:<width$}", width = (area.width as usize).saturating_sub(2));
+        let padded = format!(
+            "  {display_text:<width$}",
+            width = (area.width as usize).saturating_sub(2)
+        );
         let input_line = if field.input.value.is_empty() && !is_focused {
             Line::from(Span::styled(padded, placeholder_style))
         } else {
@@ -159,8 +170,7 @@ fn render_form(
         if is_focused {
             // Cursor X = 2 (left padding) + cursor display column,
             // clamped to inside the popup.
-            let display_col_within_input =
-                field.input.value[..field.input.cursor].chars().count();
+            let display_col_within_input = field.input.value[..field.input.cursor].chars().count();
             let cursor_x = area.x + 2 + display_col_within_input as u16;
             if cursor_x < area.x + area.width {
                 let ch = field
@@ -169,14 +179,12 @@ fn render_form(
                     .chars()
                     .nth(display_col_within_input)
                     .unwrap_or(' ');
-                buf[(cursor_x, y)]
-                    .set_char(ch)
-                    .set_style(
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(ACCENT)
-                            .add_modifier(Modifier::BOLD),
-                    );
+                buf[(cursor_x, y)].set_char(ch).set_style(
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                );
             }
         }
 
@@ -187,11 +195,29 @@ fn render_form(
     if area.height > 0 {
         let hint_y = area.y + area.height - 1;
         let hint = Line::from(vec![
-            Span::styled(" [Tab] ", Style::default().fg(ACCENT).bg(BG).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " [Tab] ",
+                Style::default()
+                    .fg(ACCENT)
+                    .bg(BG)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled("next field  ", Style::default().fg(FG_PRIMARY).bg(BG)),
-            Span::styled(" [Enter] ", Style::default().fg(ACCENT).bg(BG).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " [Enter] ",
+                Style::default()
+                    .fg(ACCENT)
+                    .bg(BG)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled("submit  ", Style::default().fg(FG_PRIMARY).bg(BG)),
-            Span::styled(" [Esc] ", Style::default().fg(ACCENT).bg(BG).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " [Esc] ",
+                Style::default()
+                    .fg(ACCENT)
+                    .bg(BG)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled("cancel ", Style::default().fg(FG_PRIMARY).bg(BG)),
         ]);
         buf.set_line(area.x, hint_y, &hint, area.width);
@@ -205,5 +231,10 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
     let h = h.min(area.height);
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(h) / 2;
-    Rect { x, y, width: w, height: h }
+    Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    }
 }

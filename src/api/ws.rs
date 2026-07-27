@@ -146,9 +146,16 @@ pub struct WsHandle {
 
 impl WsHandle {
     /// Send a subscription request to the server.
+    ///
+    /// Phase 4 scoped-subscription infrastructure; not yet called from
+    /// production code.
+    #[allow(dead_code)]
     pub async fn subscribe(&self, queries: Vec<String>, request_id: u32) -> Result<()> {
         self.cmd_tx
-            .send(WsCommand::Subscribe { queries, request_id })
+            .send(WsCommand::Subscribe {
+                queries,
+                request_id,
+            })
             .await
             .context("WebSocket task has shut down")
     }
@@ -164,7 +171,12 @@ impl WsHandle {
 /// Commands sent from the TUI to the WebSocket background task.
 #[derive(Debug)]
 enum WsCommand {
-    Subscribe { queries: Vec<String>, request_id: u32 },
+    /// Phase 4 scoped-subscription command; not yet issued from production.
+    #[allow(dead_code)]
+    Subscribe {
+        queries: Vec<String>,
+        request_id: u32,
+    },
     Close,
 }
 
@@ -181,7 +193,12 @@ pub fn spawn_subscription(config: WsConfig) -> Result<WsHandle> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<WsCommand>(32);
     let (event_tx, event_rx) = mpsc::channel::<WsEvent>(config.channel_capacity);
 
-    tokio::spawn(subscription_task(url, config.auth_token.clone(), cmd_rx, event_tx));
+    tokio::spawn(subscription_task(
+        url,
+        config.auth_token.clone(),
+        cmd_rx,
+        event_tx,
+    ));
 
     Ok(WsHandle { cmd_tx, event_rx })
 }
@@ -196,7 +213,12 @@ pub fn spawn_log_follow(config: WsConfig) -> Result<WsHandle> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<WsCommand>(32);
     let (event_tx, event_rx) = mpsc::channel::<WsEvent>(config.channel_capacity);
 
-    tokio::spawn(log_follow_task(url, config.auth_token.clone(), cmd_rx, event_tx));
+    tokio::spawn(log_follow_task(
+        url,
+        config.auth_token.clone(),
+        cmd_rx,
+        event_tx,
+    ));
 
     Ok(WsHandle { cmd_tx, event_rx })
 }
@@ -305,9 +327,7 @@ async fn subscription_task(
                 return;
             }
             ConnectOutcome::Lost(reason) => {
-                let _ = event_tx
-                    .send(WsEvent::Disconnected { reason })
-                    .await;
+                let _ = event_tx.send(WsEvent::Disconnected { reason }).await;
                 // If the consumer is gone, abort the retry loop too.
                 if event_tx.is_closed() {
                     return;
@@ -360,9 +380,7 @@ async fn connect_subscription_once(
                 let status = resp.status();
                 if status.is_client_error() || status.is_server_error() {
                     error!("WebSocket handshake returned HTTP {status}");
-                    return ConnectOutcome::Fatal(format!(
-                        "Server returned HTTP {status}"
-                    ));
+                    return ConnectOutcome::Fatal(format!("Server returned HTTP {status}"));
                 }
             }
             error!("WebSocket connect failed: {e}");
@@ -629,7 +647,10 @@ mod tests {
             channel_capacity: 64,
         };
         let url = cfg.subscription_url().unwrap();
-        assert_eq!(url.as_str(), "ws://localhost:3000/v1/database/mydb/subscribe");
+        assert_eq!(
+            url.as_str(),
+            "ws://localhost:3000/v1/database/mydb/subscribe"
+        );
     }
 
     #[test]
@@ -680,10 +701,7 @@ mod tests {
         // `{"type":"Subscribe",...}` the server rejects the message and
         // replies with an oversized Close frame, which tungstenite surfaces
         // as "Control frame too big". Guard against that regression.
-        let env = SubscribeEnvelope::new(
-            vec!["SELECT * FROM users".to_string()],
-            7,
-        );
+        let env = SubscribeEnvelope::new(vec!["SELECT * FROM users".to_string()], 7);
         let json = serde_json::to_string(&env).unwrap();
         assert_eq!(
             json,

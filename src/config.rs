@@ -526,6 +526,214 @@ impl Config {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 2: source-preserving configuration resolution
+// ---------------------------------------------------------------------------
+
+use clap::parser::ValueSource;
+
+/// Where a configuration value came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigSource {
+    CommandLine,
+    Environment,
+    RestoredSession,
+    UserConfig,
+    SpacetimeCliConfig,
+    BuiltIn,
+}
+
+/// A resolved value paired with its provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolved<T> {
+    pub value: T,
+    pub source: ConfigSource,
+}
+
+impl<T> Resolved<T> {
+    pub fn new(value: T, source: ConfigSource) -> Self {
+        Self { value, source }
+    }
+}
+
+/// Fully resolved startup configuration with provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedConfig {
+    pub host: Resolved<String>,
+    pub port: Resolved<u16>,
+    pub tls: Resolved<bool>,
+    pub token: Resolved<Option<String>>,
+    pub database: Resolved<Option<String>>,
+    pub theme: Resolved<String>,
+}
+
+/// All inputs to configuration resolution, layered by source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigResolutionInput {
+    pub cli_host: Option<Resolved<String>>,
+    pub cli_port: Option<Resolved<u16>>,
+    pub cli_tls: Option<Resolved<bool>>,
+    pub cli_token: Option<Resolved<String>>,
+    pub cli_database: Option<Resolved<String>>,
+    pub cli_theme: Option<Resolved<String>>,
+    pub env_host: Option<String>,
+    pub env_port: Option<u16>,
+    pub env_tls: Option<bool>,
+    pub env_token: Option<String>,
+    pub env_database: Option<String>,
+    pub env_theme: Option<String>,
+    pub restored_database: Option<String>,
+    pub user_default_database: Option<String>,
+    pub user_theme: Option<String>,
+    pub detected_host: Option<String>,
+    pub detected_port: Option<u16>,
+    pub detected_tls: Option<bool>,
+    pub detected_token: Option<String>,
+    pub restore_session: bool,
+}
+
+impl ConfigResolutionInput {
+    pub fn empty() -> Self {
+        Self {
+            cli_host: None,
+            cli_port: None,
+            cli_tls: None,
+            cli_token: None,
+            cli_database: None,
+            cli_theme: None,
+            env_host: None,
+            env_port: None,
+            env_tls: None,
+            env_token: None,
+            env_database: None,
+            env_theme: None,
+            restored_database: None,
+            user_default_database: None,
+            user_theme: None,
+            detected_host: None,
+            detected_port: None,
+            detected_tls: None,
+            detected_token: None,
+            restore_session: true,
+        }
+    }
+}
+
+pub fn config_source_from_clap(source: ValueSource) -> ConfigSource {
+    match source {
+        ValueSource::CommandLine => ConfigSource::CommandLine,
+        ValueSource::EnvVariable => ConfigSource::Environment,
+        ValueSource::DefaultValue => ConfigSource::BuiltIn,
+        _ => ConfigSource::BuiltIn,
+    }
+}
+
+/// Resolve configuration with CLI > env > restored session > user config >
+/// detected > built-in precedence.
+pub fn resolve_config(input: ConfigResolutionInput) -> ResolvedConfig {
+    let host = input
+        .cli_host
+        .or_else(|| {
+            input
+                .env_host
+                .map(|value| Resolved::new(value, ConfigSource::Environment))
+        })
+        .or_else(|| {
+            input
+                .detected_host
+                .map(|value| Resolved::new(value, ConfigSource::SpacetimeCliConfig))
+        })
+        .unwrap_or_else(|| Resolved::new("localhost".to_string(), ConfigSource::BuiltIn));
+
+    let port = input
+        .cli_port
+        .or_else(|| {
+            input
+                .env_port
+                .map(|value| Resolved::new(value, ConfigSource::Environment))
+        })
+        .or_else(|| {
+            input
+                .detected_port
+                .map(|value| Resolved::new(value, ConfigSource::SpacetimeCliConfig))
+        })
+        .unwrap_or_else(|| Resolved::new(3000, ConfigSource::BuiltIn));
+
+    let tls = input
+        .cli_tls
+        .or_else(|| {
+            input
+                .env_tls
+                .map(|value| Resolved::new(value, ConfigSource::Environment))
+        })
+        .or_else(|| {
+            input
+                .detected_tls
+                .map(|value| Resolved::new(value, ConfigSource::SpacetimeCliConfig))
+        })
+        .unwrap_or_else(|| Resolved::new(false, ConfigSource::BuiltIn));
+
+    let token = input
+        .cli_token
+        .map(|resolved| Resolved::new(Some(resolved.value), resolved.source))
+        .or_else(|| {
+            input
+                .env_token
+                .map(|value| Resolved::new(Some(value), ConfigSource::Environment))
+        })
+        .or_else(|| {
+            input
+                .detected_token
+                .map(|value| Resolved::new(Some(value), ConfigSource::SpacetimeCliConfig))
+        })
+        .unwrap_or_else(|| Resolved::new(None, ConfigSource::BuiltIn));
+
+    let database = input
+        .cli_database
+        .map(|resolved| Resolved::new(Some(resolved.value), resolved.source))
+        .or_else(|| {
+            input
+                .env_database
+                .map(|value| Resolved::new(Some(value), ConfigSource::Environment))
+        })
+        .or_else(|| {
+            input.restore_session.then(|| {
+                input
+                    .restored_database
+                    .map(|value| Resolved::new(Some(value), ConfigSource::RestoredSession))
+            }).flatten()
+        })
+        .or_else(|| {
+            input
+                .user_default_database
+                .map(|value| Resolved::new(Some(value), ConfigSource::UserConfig))
+        })
+        .unwrap_or_else(|| Resolved::new(None, ConfigSource::BuiltIn));
+
+    let theme = input
+        .cli_theme
+        .or_else(|| {
+            input
+                .env_theme
+                .map(|value| Resolved::new(value, ConfigSource::Environment))
+        })
+        .or_else(|| {
+            input
+                .user_theme
+                .map(|value| Resolved::new(value, ConfigSource::UserConfig))
+        })
+        .unwrap_or_else(|| Resolved::new("dark".to_string(), ConfigSource::BuiltIn));
+
+    ResolvedConfig {
+        host,
+        port,
+        tls,
+        token,
+        database,
+        theme,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -629,5 +837,84 @@ mod tests {
         // Spot-check a few fields are non-zero.
         assert_ne!(t.accent, (0, 0, 0));
         assert_ne!(t.error, (0, 0, 0));
+    }
+}
+
+#[cfg(test)]
+mod phase2_config_tests {
+    use super::*;
+    use clap::parser::ValueSource;
+
+    #[test]
+    fn explicit_cli_default_looking_values_win_over_environment_and_detected_config() {
+        let input = ConfigResolutionInput {
+            cli_host: Some(Resolved::new("localhost".to_string(), ConfigSource::CommandLine)),
+            cli_port: Some(Resolved::new(3000, ConfigSource::CommandLine)),
+            cli_tls: Some(Resolved::new(false, ConfigSource::CommandLine)),
+            cli_token: None,
+            cli_database: None,
+            cli_theme: None,
+            env_host: Some("remote.example".to_string()),
+            env_port: Some(443),
+            env_tls: Some(true),
+            env_token: Some("env-token".to_string()),
+            env_database: None,
+            env_theme: None,
+            restored_database: None,
+            user_default_database: None,
+            user_theme: Some("custom-user-theme".to_string()),
+            detected_host: Some("detected.example".to_string()),
+            detected_port: Some(80),
+            detected_tls: Some(true),
+            detected_token: Some("detected-token".to_string()),
+            restore_session: true,
+        };
+
+        let resolved = resolve_config(input);
+
+        assert_eq!(
+            resolved.host,
+            Resolved::new("localhost".to_string(), ConfigSource::CommandLine)
+        );
+        assert_eq!(resolved.port, Resolved::new(3000, ConfigSource::CommandLine));
+        assert_eq!(resolved.tls, Resolved::new(false, ConfigSource::CommandLine));
+        assert_eq!(
+            resolved.token,
+            Resolved::new(Some("env-token".to_string()), ConfigSource::Environment)
+        );
+        assert_eq!(
+            resolved.theme,
+            Resolved::new("custom-user-theme".to_string(), ConfigSource::UserConfig)
+        );
+    }
+
+    #[test]
+    fn clap_value_source_maps_explicit_no_tls_to_command_line() {
+        assert_eq!(
+            config_source_from_clap(ValueSource::CommandLine),
+            ConfigSource::CommandLine
+        );
+        assert_eq!(
+            config_source_from_clap(ValueSource::DefaultValue),
+            ConfigSource::BuiltIn
+        );
+    }
+
+    #[test]
+    fn cli_theme_accepts_custom_theme_string() {
+        let input = ConfigResolutionInput {
+            cli_theme: Some(Resolved::new(
+                "solarized-company".to_string(),
+                ConfigSource::CommandLine,
+            )),
+            ..ConfigResolutionInput::empty()
+        };
+
+        let resolved = resolve_config(input);
+
+        assert_eq!(
+            resolved.theme,
+            Resolved::new("solarized-company".to_string(), ConfigSource::CommandLine)
+        );
     }
 }

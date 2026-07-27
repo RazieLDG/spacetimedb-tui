@@ -494,6 +494,50 @@ impl AppState {
         }
     }
 
+    /// Create an `AppState` restored from a saved session snapshot.
+    pub fn from_session_state(
+        base_url: impl Into<String>,
+        session: &crate::user_config::SessionState,
+    ) -> Self {
+        let (mode, workspace) = match session.last_tab {
+            Some(1) => (
+                crate::state::workbench::WorkbenchMode::Data,
+                crate::state::workbench::Workspace::Sql,
+            ),
+            Some(2) => (
+                crate::state::workbench::WorkbenchMode::Observe,
+                crate::state::workbench::Workspace::Logs,
+            ),
+            Some(3) => (
+                crate::state::workbench::WorkbenchMode::Observe,
+                crate::state::workbench::Workspace::Metrics,
+            ),
+            Some(4) => (
+                crate::state::workbench::WorkbenchMode::Operate,
+                crate::state::workbench::Workspace::Module,
+            ),
+            Some(5) => (
+                crate::state::workbench::WorkbenchMode::Observe,
+                crate::state::workbench::Workspace::Live,
+            ),
+            Some(0) | None => (
+                crate::state::workbench::WorkbenchMode::Data,
+                crate::state::workbench::Workspace::Tables,
+            ),
+            Some(_) => (
+                crate::state::workbench::WorkbenchMode::Data,
+                crate::state::workbench::Workspace::Tables,
+            ),
+        };
+
+        let mut state = Self::new(base_url);
+        state.navigation.active_database = session.last_database.clone();
+        state.navigation.active_resource = session.last_table.clone();
+        state.workbench.mode = mode;
+        state.workbench.workspace = workspace;
+        state
+    }
+
     // ------------------------------------------------------------------
     // Database navigation helpers
     // ------------------------------------------------------------------

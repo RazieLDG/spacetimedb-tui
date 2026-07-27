@@ -50,7 +50,7 @@ fn session_path() -> Option<PathBuf> {
 /// Every field is optional so that a brand-new file with just one
 /// setting still parses correctly. CLI args override anything we
 /// pull out of here.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UserConfig {
     /// Default theme to use when `--theme` is not passed.
     /// Accepted values: `"dark"`, `"light"`, `"high-contrast"`, or the
@@ -73,6 +73,17 @@ pub struct UserConfig {
 
 fn default_true() -> bool {
     true
+}
+
+impl Default for UserConfig {
+    fn default() -> Self {
+        Self {
+            theme: None,
+            default_database: None,
+            themes_dir: None,
+            restore_session: true,
+        }
+    }
 }
 
 impl UserConfig {
@@ -213,5 +224,47 @@ mod tests {
         assert_eq!(s.last_database.as_deref(), Some("only-this"));
         assert!(s.last_table.is_none());
         assert!(s.last_tab.is_none());
+    }
+}
+
+#[cfg(test)]
+mod phase2_user_config_tests {
+    use super::*;
+    use crate::state::app_state::AppState;
+    use crate::state::workbench::{WorkbenchMode, Workspace};
+
+    #[test]
+    fn default_user_config_restores_session() {
+        assert!(UserConfig::default().restore_session);
+    }
+
+    #[test]
+    fn legacy_session_tabs_map_deterministically_to_single_navigation_and_workbench_owners() {
+        let session = SessionState {
+            last_database: Some("inventory".to_string()),
+            last_tab: Some(1),
+            ..SessionState::default()
+        };
+
+        let state = AppState::from_session_state("http://localhost:3000".to_string(), &session);
+
+        assert_eq!(state.navigation.active_database.as_deref(), Some("inventory"));
+        assert_eq!(state.workbench.mode, WorkbenchMode::Data);
+        assert_eq!(state.workbench.workspace, Workspace::Sql);
+    }
+
+    #[test]
+    fn invalid_legacy_session_tab_falls_back_to_safe_data_tables_workspace() {
+        let session = SessionState {
+            last_database: Some("inventory".to_string()),
+            last_tab: Some(99),
+            ..SessionState::default()
+        };
+
+        let state = AppState::from_session_state("http://localhost:3000".to_string(), &session);
+
+        assert_eq!(state.navigation.active_database.as_deref(), Some("inventory"));
+        assert_eq!(state.workbench.mode, WorkbenchMode::Data);
+        assert_eq!(state.workbench.workspace, Workspace::Tables);
     }
 }

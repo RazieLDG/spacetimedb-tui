@@ -347,6 +347,16 @@ fn wrap_notice(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+// ── Phase 2: registry-driven contextual help ─────────────────────────────────
+
+use crate::app::command::{CommandContext, CommandRegistry, ContextualHelpLine};
+
+/// Generate contextual help lines from the command registry for the given
+/// context. Phase 3 UI will call this instead of the static binding list.
+pub fn contextual_help_lines(context: &CommandContext) -> Vec<ContextualHelpLine> {
+    CommandRegistry::default().contextual_help(context)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

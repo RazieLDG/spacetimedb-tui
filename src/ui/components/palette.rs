@@ -156,3 +156,13 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
         height: h,
     }
 }
+
+// ── Phase 2: registry-driven palette entries ─────────────────────────────────
+
+use crate::app::command::{CommandContext, CommandRegistry, PaletteEntry};
+
+/// Generate palette entries from the command registry for the given context.
+/// Phase 3 palette UI will call this instead of the legacy `Command::ALL`.
+pub fn palette_entries_for_context(context: &CommandContext) -> Vec<PaletteEntry> {
+    CommandRegistry::default().palette_entries(context)
+}

@@ -161,6 +161,27 @@ pub struct HelpLine {
 }
 
 // ---------------------------------------------------------------------------
+// PaletteEntry and ContextualHelpLine (Task 3)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaletteEntry {
+    pub command_id: CommandId,
+    pub label: &'static str,
+    pub description: &'static str,
+    pub enabled: bool,
+    pub disabled_reason: Option<DisabledReason>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextualHelpLine {
+    pub command_id: CommandId,
+    pub label: &'static str,
+    pub primary_binding: Option<String>,
+    pub disabled_reason: Option<DisabledReason>,
+}
+
+// ---------------------------------------------------------------------------
 // Static spec tables
 // ---------------------------------------------------------------------------
 
@@ -440,6 +461,46 @@ impl CommandRegistry {
         }
         evaluate_availability(spec.availability, context)
     }
+
+    pub fn palette_entries(&self, context: &CommandContext) -> Vec<PaletteEntry> {
+        COMMAND_SPECS
+            .iter()
+            .map(|spec| {
+                let availability = self.availability(spec.id, context);
+                PaletteEntry {
+                    command_id: spec.id,
+                    label: spec.label,
+                    description: spec.description,
+                    enabled: availability == Availability::Available,
+                    disabled_reason: match availability {
+                        Availability::Available => None,
+                        Availability::Disabled(reason) => Some(reason),
+                    },
+                }
+            })
+            .collect()
+    }
+
+    pub fn contextual_help(&self, context: &CommandContext) -> Vec<ContextualHelpLine> {
+        COMMAND_SPECS
+            .iter()
+            .map(|spec| {
+                let availability = self.availability(spec.id, context);
+                ContextualHelpLine {
+                    command_id: spec.id,
+                    label: spec.label,
+                    primary_binding: spec
+                        .bindings
+                        .first()
+                        .map(|binding| binding.display.to_string()),
+                    disabled_reason: match availability {
+                        Availability::Available => None,
+                        Availability::Disabled(reason) => Some(reason),
+                    },
+                }
+            })
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -619,5 +680,46 @@ mod tests {
                 evaluate_availability(spec.availability, &context)
             );
         }
+    }
+
+    #[test]
+    fn palette_entries_are_generated_from_registered_commands() {
+        let registry = CommandRegistry::default();
+        let entries = registry.palette_entries(&CommandContext {
+            mode: WorkbenchMode::Data,
+            focus: FocusContext::Workspace,
+            has_active_database: true,
+            has_active_resource: true,
+            schema_current: true,
+            connection_online: true,
+            live_available: false,
+            write_plan_available: false,
+        });
+
+        assert!(entries.iter().any(|entry| {
+            entry.command_id == CommandId::RefreshActiveResource
+                && entry.enabled
+                && entry.label == "Refresh active resource"
+        }));
+    }
+
+    #[test]
+    fn help_marks_disabled_commands_with_registry_reason() {
+        let registry = CommandRegistry::default();
+        let lines = registry.contextual_help(&CommandContext {
+            mode: WorkbenchMode::Data,
+            focus: FocusContext::Workspace,
+            has_active_database: true,
+            has_active_resource: false,
+            schema_current: true,
+            connection_online: true,
+            live_available: false,
+            write_plan_available: false,
+        });
+
+        assert!(lines.iter().any(|line| {
+            line.command_id == CommandId::RefreshActiveResource
+                && line.disabled_reason == Some(DisabledReason::NoActiveResource)
+        }));
     }
 }

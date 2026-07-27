@@ -222,7 +222,92 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::event::AppEvent;
+    use crate::app::event::{AppEvent, Effect, ReadOperation, TableTarget};
+    use crate::effects::request::{RequestContext, RequestId, RequestScope};
+    use crate::effects::task_registry::TaskRegistry;
+    use crate::terminal::TerminalOps;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+
+    // -- Test fixtures --
+
+    #[derive(Default)]
+    pub struct RecordingApiTransport {
+        pub requests: Mutex<Vec<(ReadOperation, RequestContext)>>,
+    }
+
+    impl ApiTransport for RecordingApiTransport {
+        fn execute_read(
+            &self,
+            operation: ReadOperation,
+            context: RequestContext,
+        ) -> Pin<Box<dyn Future<Output = AppEvent> + Send + 'static>> {
+            self.requests.lock().unwrap().push((operation, context));
+            Box::pin(async { AppEvent::Tick })
+        }
+    }
+
+    pub struct NoopSubscriptionTransport;
+
+    impl SubscriptionTransport for NoopSubscriptionTransport {
+        type Request = ();
+
+        fn connect(
+            &self,
+            _request: Self::Request,
+        ) -> Pin<Box<dyn Future<Output = AppEvent> + Send + '_>> {
+            Box::pin(async { AppEvent::Tick })
+        }
+    }
+
+    #[derive(Default)]
+    pub struct RecordingSessionStore {
+        pub snapshots: Mutex<Vec<crate::user_config::SessionState>>,
+    }
+
+    impl SessionStore for RecordingSessionStore {
+        fn save(
+            &self,
+            snapshot: crate::user_config::SessionState,
+        ) -> Pin<Box<dyn Future<Output = AppEvent> + Send + 'static>> {
+            self.snapshots.lock().unwrap().push(snapshot);
+            Box::pin(async { AppEvent::Tick })
+        }
+    }
+
+    pub struct NoopTerminalOps;
+
+    impl TerminalOps for NoopTerminalOps {
+        type Error = std::convert::Infallible;
+
+        fn enable_raw_mode(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn enter_alternate_screen(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn enable_mouse_capture(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn show_cursor(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn disable_mouse_capture(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn leave_alternate_screen(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn disable_raw_mode(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    // -- Tests --
 
     #[test]
     fn bounded_event_channel_reports_capacity_and_refuses_overflow() {
@@ -232,5 +317,146 @@ mod tests {
         assert!(channel.try_send(AppEvent::Tick).is_ok());
         assert!(channel.try_send(AppEvent::Tick).is_ok());
         assert!(channel.try_send(AppEvent::Tick).is_err());
+    }
+
+    #[tokio::test]
+    async fn runner_dispatches_load_active_resource_through_typed_api_transport_port() {
+        let api = RecordingApiTransport::default();
+        let mut channel = bounded_event_channel(1);
+        let mut runner = EffectRunner::new(
+            api,
+            NoopSubscriptionTransport,
+            NoopTerminalOps,
+            TaskRegistry::new(),
+            Arc::new(RecordingSessionStore::default()),
+            channel.sender(),
+        );
+        let target = TableTarget {
+            database: "inventory".to_string(),
+            table: "items".to_string(),
+        };
+        let context = RequestContext::new(
+            RequestId::from_u64(1),
+            RequestScope::TableRows {
+                database: "inventory".into(),
+                table: "items".into(),
+                view: "browse".into(),
+            },
+            7,
+        );
+
+        let task_id = runner
+            .dispatch(Effect::LoadTableRows {
+                target: target.clone(),
+                context: context.clone(),
+            })
+            .unwrap();
+        let event = channel.recv().await.unwrap();
+        let report = runner.tasks.join_next().await.unwrap();
+        let requests = runner.api.requests.lock().unwrap();
+
+        assert_eq!(report.id, task_id);
+        assert_eq!(
+            report.outcome,
+            crate::effects::task_registry::TaskOutcome::Completed
+        );
+        assert!(matches!(event, AppEvent::Tick));
+        assert_eq!(
+            *requests,
+            vec![(ReadOperation::TableRows { target }, context)]
+        );
+        assert_eq!(
+            requests[0].1.scope(),
+            &RequestScope::TableRows {
+                database: "inventory".into(),
+                table: "items".into(),
+                view: "browse".into(),
+            }
+        );
+        assert_eq!(requests[0].1.generation, 7);
+    }
+
+    #[tokio::test]
+    async fn runner_maps_catalog_schema_and_persist_session_without_string_dispatch() {
+        let api = RecordingApiTransport::default();
+        let mut channel = bounded_event_channel(4);
+        let sessions = Arc::new(RecordingSessionStore::default());
+        let mut runner = EffectRunner::new(
+            api,
+            NoopSubscriptionTransport,
+            NoopTerminalOps,
+            TaskRegistry::new(),
+            sessions.clone(),
+            channel.sender(),
+        );
+        let catalog_context =
+            RequestContext::new(RequestId::from_u64(2), RequestScope::DatabaseCatalog, 1);
+        let schema_context = RequestContext::new(
+            RequestId::from_u64(3),
+            RequestScope::Schema {
+                database: "inventory".into(),
+            },
+            4,
+        );
+
+        let catalog_task = runner
+            .dispatch(Effect::LoadCatalog {
+                context: catalog_context.clone(),
+            })
+            .unwrap();
+        let schema_task = runner
+            .dispatch(Effect::LoadSchema {
+                database: "inventory".into(),
+                context: schema_context.clone(),
+            })
+            .unwrap();
+        let snapshot = crate::user_config::SessionState {
+            last_database: Some("inventory".into()),
+            last_table: Some("items".into()),
+            last_tab: Some(0),
+        };
+        let persist_task = runner
+            .dispatch(Effect::PersistSession {
+                snapshot: snapshot.clone(),
+            })
+            .unwrap();
+        let first_event = channel.recv().await.unwrap();
+        let second_event = channel.recv().await.unwrap();
+        let third_event = channel.recv().await.unwrap();
+        let first_report = runner.tasks.join_next().await.unwrap();
+        let second_report = runner.tasks.join_next().await.unwrap();
+        let third_report = runner.tasks.join_next().await.unwrap();
+        for event in [first_event, second_event, third_event] {
+            assert!(matches!(event, AppEvent::Tick));
+        }
+        assert_eq!(
+            [
+                first_report.outcome,
+                second_report.outcome,
+                third_report.outcome
+            ],
+            [
+                crate::effects::task_registry::TaskOutcome::Completed,
+                crate::effects::task_registry::TaskOutcome::Completed,
+                crate::effects::task_registry::TaskOutcome::Completed,
+            ]
+        );
+        assert_ne!(catalog_task, schema_task);
+        assert_ne!(persist_task, catalog_task);
+        assert_eq!(sessions.snapshots.lock().unwrap().as_slice(), &[snapshot]);
+
+        let requests = runner.api.requests.lock().unwrap();
+        assert_eq!(
+            *requests,
+            vec![
+                (ReadOperation::Catalog, catalog_context),
+                (
+                    ReadOperation::Schema {
+                        database: "inventory".into()
+                    },
+                    schema_context
+                ),
+            ]
+        );
     }
 }

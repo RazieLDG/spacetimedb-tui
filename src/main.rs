@@ -11,21 +11,22 @@ mod app;
 mod config;
 mod effects;
 mod state;
+mod terminal;
 mod ui;
 mod user_config;
 
 use std::io;
 
 use anyhow::{Context, Result};
-use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use tracing::info;
 
-use crate::{api::SpacetimeClient, app::App, config::Config};
+use crate::{
+    api::SpacetimeClient,
+    app::App,
+    config::Config,
+    terminal::{CrosstermTerminalOps, TerminalGuard},
+};
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -64,16 +65,18 @@ async fn async_main(config: Config) -> Result<()> {
         app.state.select_database(0);
     }
 
-    // Set up the terminal.
+    // Acquire raw mode, alternate screen, mouse capture, and a hidden
+    // cursor. The guard owns these transitions and restores them exactly
+    // once on drop — on normal return, error return, or unwind alike.
+    let _terminal_guard =
+        TerminalGuard::enter(CrosstermTerminalOps::new()).context("Failed to set up terminal")?;
+
+    // Create the Ratatui terminal (the guard already prepared the tty).
     let mut terminal = setup_terminal().context("Failed to set up terminal")?;
 
-    // Run the event loop, ensuring terminal cleanup regardless of outcome.
-    let result = app.run(&mut terminal).await;
-
-    // Always restore the terminal before propagating any error.
-    restore_terminal(&mut terminal).context("Failed to restore terminal")?;
-
-    result
+    // Run the event loop. `_terminal_guard` stays alive until after this
+    // returns, then its `Drop` restores the terminal exactly once.
+    app.run(&mut terminal).await
 }
 
 // ── Terminal setup / teardown ─────────────────────────────────────────────────
@@ -81,24 +84,11 @@ async fn async_main(config: Config) -> Result<()> {
 type Term = Terminal<CrosstermBackend<io::Stdout>>;
 
 fn setup_terminal() -> Result<Term> {
-    enable_raw_mode().context("enable_raw_mode failed")?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-        .context("Failed to enter alternate screen")?;
+    let stdout = io::stdout();
     let backend = CrosstermBackend::new(stdout);
-    Terminal::new(backend).context("Failed to create ratatui Terminal")
-}
-
-fn restore_terminal(terminal: &mut Term) -> Result<()> {
-    disable_raw_mode().context("disable_raw_mode failed")?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )
-    .context("Failed to leave alternate screen")?;
-    terminal.show_cursor().context("Failed to show cursor")?;
-    Ok(())
+    let mut terminal = Terminal::new(backend).context("Failed to create ratatui Terminal")?;
+    terminal.clear().context("Failed to clear terminal")?;
+    Ok(terminal)
 }
 
 // ── Tracing ───────────────────────────────────────────────────────────────────

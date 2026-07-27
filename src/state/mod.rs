@@ -4,11 +4,15 @@
 //! truth for all TUI state.  Import from here rather than from the sub-module
 //! directly.
 
+pub mod activity;
 pub mod app_state;
 pub mod edit_mode;
 pub mod modal;
+pub mod navigation;
 pub mod palette;
+pub mod resources;
 pub mod safety;
+pub mod workbench;
 
 // Re-export the most commonly used items.
 pub use app_state::{

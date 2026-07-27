@@ -168,14 +168,8 @@ impl ConnectionInfo {
 /// Maximum number of SQL history entries retained.
 const SQL_HISTORY_LIMIT: usize = 200;
 
-/// One row in the Live tab's connected-client list.
-#[derive(Debug, Clone)]
-pub struct LiveClientEntry {
-    /// Hex identity or connection id (whichever the server returned).
-    pub identity: String,
-    /// When the client first connected (best-effort from `st_client`).
-    pub connected_at: Option<DateTime<Utc>>,
-}
+// Re-export moved types from resources module.
+pub use crate::state::resources::{LiveClientEntry, MetricsSnapshot};
 
 /// Result of advancing the SQL history cursor forward (↓).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,26 +199,7 @@ pub struct SqlHistoryEntry {
     pub error: Option<String>,
 }
 
-// ---------------------------------------------------------------------------
-// Metrics
-// ---------------------------------------------------------------------------
 
-/// A snapshot of server / module metrics.
-#[derive(Debug, Clone, Default)]
-pub struct MetricsSnapshot {
-    /// Total reducer calls processed.
-    pub total_reducer_calls: u64,
-    /// Total energy quanta consumed.
-    pub total_energy_used: u64,
-    /// Number of connected WebSocket clients.
-    pub connected_clients: u64,
-    /// Module memory usage in bytes.
-    pub memory_bytes: u64,
-    /// When this snapshot was taken.
-    pub sampled_at: Option<DateTime<Utc>>,
-    /// Raw key-value pairs for metrics not captured by the fields above.
-    pub extra: HashMap<String, serde_json::Value>,
-}
 
 // ---------------------------------------------------------------------------
 // Table data cache
@@ -261,6 +236,16 @@ const LOG_BUFFER_LIMIT: usize = 10_000;
 /// any point in time.
 #[derive(Debug)]
 pub struct AppState {
+    // ------------------------------------------------------------------
+    // Phase 2 state domains
+    // ------------------------------------------------------------------
+    pub navigation: crate::state::navigation::NavigationState,
+    pub resources: crate::state::resources::ResourceState,
+    pub workbench: crate::state::workbench::WorkbenchState,
+    pub activity: crate::state::activity::ActivityState,
+    pub safety: crate::state::safety::SafetyState,
+    pub requests: crate::state::resources::RequestTracker,
+
     // ------------------------------------------------------------------
     // Connection
     // ------------------------------------------------------------------
@@ -445,6 +430,12 @@ impl AppState {
     /// Create a fresh `AppState` with sensible defaults.
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
+            navigation: Default::default(),
+            resources: Default::default(),
+            workbench: Default::default(),
+            activity: Default::default(),
+            safety: Default::default(),
+            requests: Default::default(),
             connection: ConnectionInfo::new(base_url),
 
             databases: Vec::new(),
@@ -953,5 +944,49 @@ mod tests {
         // Simulate expiry by using a zero TTL.
         s.tick_notifications(Duration::ZERO);
         assert!(s.notification.is_none());
+    }
+}
+
+#[cfg(test)]
+mod phase2_state_tests {
+    use super::*;
+    use crate::effects::request::RequestScope;
+    use crate::state::workbench::{WorkbenchMode, WorkbenchPane, Workspace};
+
+    #[test]
+    fn app_state_has_one_owner_for_phase2_state_domains() {
+        let state = AppState::new("http://localhost:3000".to_string());
+
+        assert_eq!(state.navigation.active_database, None);
+        assert_eq!(state.navigation.active_resource, None);
+        assert_eq!(state.workbench.mode, WorkbenchMode::Data);
+        assert_eq!(state.workbench.workspace, Workspace::Tables);
+        assert_eq!(state.workbench.focused_pane, WorkbenchPane::Explorer);
+        assert_eq!(state.activity.active_task_count(), 0);
+        assert_eq!(state.safety.unresolved_mutation_count(), 0);
+    }
+
+    #[test]
+    fn request_tracker_generations_increment_per_scope_independently() {
+        let mut tracker = crate::state::resources::RequestTracker::default();
+        let table = RequestScope::TableRows {
+            database: "inventory".into(),
+            table: "items".into(),
+            view: "browse".into(),
+        };
+        let schema = RequestScope::Schema {
+            database: "inventory".into(),
+        };
+
+        let table_first = tracker.next_context(table.clone());
+        let table_second = tracker.next_context(table.clone());
+        let schema_first = tracker.next_context(schema.clone());
+
+        assert_eq!(table_first.generation, 1);
+        assert_eq!(table_second.generation, 2);
+        assert_eq!(schema_first.generation, 1);
+        assert!(tracker.is_current(&table_second));
+        assert!(!tracker.is_current(&table_first));
+        assert!(tracker.is_current(&schema_first));
     }
 }

@@ -116,6 +116,48 @@ pub enum MutationOutcome {
     Unknown { reason: String },
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2: SafetyState aggregate
+// ---------------------------------------------------------------------------
+
+/// An unresolved mutation whose outcome is unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutationUncertainty {
+    pub plan_id: WritePlanId,
+    pub table: QualifiedTable,
+    pub reason: String,
+}
+
+/// Aggregate safety state: pending write plans and unresolved mutations.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SafetyState {
+    pub pending_write_plans: Vec<WritePlan>,
+    pub unresolved_mutations: Vec<MutationUncertainty>,
+}
+
+impl SafetyState {
+    /// Record a mutation outcome. Only `Unknown` outcomes are tracked as
+    /// unresolved uncertainty; all other outcomes are terminal.
+    pub fn record_mutation_outcome(
+        &mut self,
+        plan_id: WritePlanId,
+        table: QualifiedTable,
+        outcome: MutationOutcome,
+    ) {
+        if let MutationOutcome::Unknown { reason } = outcome {
+            self.unresolved_mutations.push(MutationUncertainty {
+                plan_id,
+                table,
+                reason,
+            });
+        }
+    }
+
+    pub fn unresolved_mutation_count(&self) -> usize {
+        self.unresolved_mutations.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,5 +257,42 @@ mod tests {
                 reason: "invariant violated".into(),
             }
         );
+    }
+
+    #[test]
+    fn records_only_unknown_mutation_outcomes_as_uncertainty() {
+        let mut state = SafetyState::default();
+        let plan_id = WritePlanId(7);
+        let table = QualifiedTable {
+            database: "inventory".to_string(),
+            schema: None,
+            table: "items".to_string(),
+        };
+
+        state.record_mutation_outcome(
+            plan_id,
+            table.clone(),
+            MutationOutcome::DefinitelyNotSent {
+                reason: "client rejected before send".to_string(),
+            },
+        );
+        state.record_mutation_outcome(
+            plan_id,
+            table.clone(),
+            MutationOutcome::SentAndConfirmed {
+                affected_rows: Some(1),
+            },
+        );
+        state.record_mutation_outcome(
+            plan_id,
+            table.clone(),
+            MutationOutcome::Unknown {
+                reason: "connection dropped before acknowledgement".to_string(),
+            },
+        );
+
+        assert_eq!(state.unresolved_mutation_count(), 1);
+        assert_eq!(state.unresolved_mutations[0].plan_id, plan_id);
+        assert_eq!(state.unresolved_mutations[0].table, table);
     }
 }

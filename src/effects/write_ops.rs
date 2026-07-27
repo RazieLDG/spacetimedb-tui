@@ -239,6 +239,23 @@ pub enum SqlEncodingError {
     TypeMismatch { column_id: u32, expected: String },
 }
 
+impl std::fmt::Display for SqlEncodingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyIdentifier => write!(f, "empty identifier"),
+            Self::NulInIdentifier => write!(f, "NUL byte in identifier"),
+            Self::UnknownColumnId(id) => write!(f, "unknown column id {id}"),
+            Self::NullLiteralRejected => write!(f, "NULL literal rejected for primary key"),
+            Self::FloatNotFinite => write!(f, "float value is not finite"),
+            Self::WrongMutationKind => write!(f, "wrong mutation kind for operation"),
+            Self::NoChangedFields => write!(f, "no changed fields"),
+            Self::TypeMismatch { column_id, expected } => {
+                write!(f, "type mismatch on column {column_id}: expected {expected}")
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WritePlanBuildError {
     PrimaryKey(PrimaryKeyError),

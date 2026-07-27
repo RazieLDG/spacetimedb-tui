@@ -49,3 +49,41 @@ pub struct WorkbenchState {
     pub help_open: bool,
     pub modal_open: bool,
 }
+
+impl WorkbenchState {
+    pub fn set_sql_input(&mut self, sql: String) {
+        self.sql_input = sql;
+    }
+
+    pub fn set_grid_cursor(&mut self, row: usize, column: usize) {
+        self.table_grid_cursor = Some((row, column));
+    }
+
+    pub fn open_palette(&mut self) {
+        self.palette_open = true;
+    }
+
+    pub fn open_help(&mut self) {
+        self.help_open = true;
+    }
+}
+
+#[cfg(test)]
+mod workbench_state_tests {
+    use super::*;
+
+    #[test]
+    fn sql_input_grid_cursor_palette_and_help_are_owned_by_workbench_state() {
+        let mut state = WorkbenchState::default();
+
+        state.set_sql_input("select * from items".to_string());
+        state.set_grid_cursor(3, 2);
+        state.open_palette();
+        state.open_help();
+
+        assert_eq!(state.sql_input, "select * from items");
+        assert_eq!(state.table_grid_cursor, Some((3, 2)));
+        assert!(state.palette_open);
+        assert!(state.help_open);
+    }
+}

@@ -12,6 +12,13 @@ use crate::state::app_state::AppState;
 pub fn reduce(state: &mut AppState, event: AppEvent) -> Transition {
     match event {
         AppEvent::Action(Action::Invoke(command)) => invoke_command(state, command),
+        AppEvent::Action(Action::SelectDatabase { database }) => {
+            crate::app::navigation::select_database(state, database)
+        }
+        AppEvent::Action(Action::SelectResource { database, resource }) => {
+            crate::app::navigation::select_resource(state, database, resource)
+        }
+        AppEvent::Action(Action::NavigateUp) => crate::app::navigation::navigate_up(state),
         _ => Transition::none(),
     }
 }

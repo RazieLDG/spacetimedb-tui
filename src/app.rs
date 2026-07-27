@@ -11,6 +11,7 @@
 
 pub mod command;
 pub mod event;
+pub mod navigation;
 pub mod policy;
 pub mod reducer;
 

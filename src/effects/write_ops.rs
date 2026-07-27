@@ -277,6 +277,13 @@ fn declared_type_name(type_value: &serde_json::Value) -> Option<&str> {
     }
 }
 
+/// Encode a raw JSON value to a SQL literal for a declared column type.
+///
+/// Retained for the SQL-encoding test suite. The guided write path
+/// builds SQL from typed [`SqlValue`]s via `build_update_sql` /
+/// `build_delete_sql`, not from raw JSON, so this entry point is only
+/// exercised by tests.
+#[cfg(test)]
 pub fn json_to_sql_literal(
     raw_value: &serde_json::Value,
     declared_type: &TypeTag,
@@ -711,16 +718,18 @@ fn verification_report_from_update_lookup_rows(
         return verify_authoritative_mutation_result(&WriteVerificationRequest {
             plan,
             affected_rows: None,
-            postcondition: Some(PostconditionEvidence::Update {
-                table: table.clone(),
-                row_by_original_key: match row_by_original_key {
-                    LookupRows::One(row) => Some(row),
-                    LookupRows::Zero => None,
-                    LookupRows::Multiple(_) => None,
+            postcondition: Some(PostconditionEvidence::Update(Box::new(
+                PostconditionUpdate {
+                    table: table.clone(),
+                    row_by_original_key: match row_by_original_key {
+                        LookupRows::One(row) => Some(row),
+                        LookupRows::Zero => None,
+                        LookupRows::Multiple(_) => None,
+                    },
+                    row_by_new_key: None,
+                    old_key_still_present,
                 },
-                row_by_new_key: None,
-                old_key_still_present,
-            }),
+            ))),
         });
     }
 
@@ -733,20 +742,22 @@ fn verification_report_from_update_lookup_rows(
     verify_authoritative_mutation_result(&WriteVerificationRequest {
         plan,
         affected_rows: None,
-        postcondition: Some(PostconditionEvidence::Update {
-            table: table.clone(),
-            row_by_original_key: match row_by_original_key {
-                LookupRows::One(row) => Some(row),
-                LookupRows::Zero => None,
-                LookupRows::Multiple(_) => None,
+        postcondition: Some(PostconditionEvidence::Update(Box::new(
+            PostconditionUpdate {
+                table: table.clone(),
+                row_by_original_key: match row_by_original_key {
+                    LookupRows::One(row) => Some(row),
+                    LookupRows::Zero => None,
+                    LookupRows::Multiple(_) => None,
+                },
+                row_by_new_key: match row_by_new_key {
+                    LookupRows::One(row) => Some(row),
+                    LookupRows::Zero => None,
+                    LookupRows::Multiple(_) => None,
+                },
+                old_key_still_present,
             },
-            row_by_new_key: match row_by_new_key {
-                LookupRows::One(row) => Some(row),
-                LookupRows::Zero => None,
-                LookupRows::Multiple(_) => None,
-            },
-            old_key_still_present,
-        }),
+        ))),
     })
 }
 
@@ -757,6 +768,9 @@ fn verification_report_from_update_lookup_rows(
 /// `AfterTransportOwnership` failures leave the outcome unknown.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MutationDispatchStage {
+    /// Kept for exhaustive classification; production dispatch always
+    /// occurs after transport ownership is established.
+    #[allow(dead_code)]
     BeforeTransportOwnership,
     AfterTransportOwnership,
 }
@@ -769,6 +783,9 @@ pub enum TransportFailure {
     Disconnected,
     Cancelled,
     Http5xx(u16),
+    /// Kept for exhaustive classification; no production path currently
+    /// produces a proven-not-sent outcome after transport ownership.
+    #[allow(dead_code)]
     ProvenNotSent(String),
 }
 
@@ -793,15 +810,18 @@ impl fmt::Display for TransportFailure {
 /// actually took effect.
 #[derive(Clone, Debug)]
 pub enum PostconditionEvidence {
-    Update {
-        table: TableInfo,
-        row_by_original_key: Option<Vec<serde_json::Value>>,
-        row_by_new_key: Option<Vec<serde_json::Value>>,
-        old_key_still_present: Option<bool>,
-    },
-    Delete {
-        original_tuple_present: bool,
-    },
+    Update(Box<PostconditionUpdate>),
+    Delete { original_tuple_present: bool },
+}
+
+/// Payload for [`PostconditionEvidence::Update`], boxed to keep the enum
+/// compact (the `Delete` variant is a single bool).
+#[derive(Clone, Debug)]
+pub struct PostconditionUpdate {
+    pub table: TableInfo,
+    pub row_by_original_key: Option<Vec<serde_json::Value>>,
+    pub row_by_new_key: Option<Vec<serde_json::Value>>,
+    pub old_key_still_present: Option<bool>,
 }
 
 /// Input to authoritative mutation verification.
@@ -864,19 +884,14 @@ pub fn verify_authoritative_mutation_result(
     match (&request.plan.mutation, &request.postcondition) {
         (
             GuidedMutation::Update { changes },
-            Some(PostconditionEvidence::Update {
-                table,
-                row_by_original_key,
-                row_by_new_key,
-                old_key_still_present,
-            }),
+            Some(PostconditionEvidence::Update(update)),
         ) => verify_update_postcondition(
             &request.plan,
             changes,
-            table,
-            row_by_original_key.as_deref(),
-            row_by_new_key.as_deref(),
-            *old_key_still_present,
+            &update.table,
+            update.row_by_original_key.as_deref(),
+            update.row_by_new_key.as_deref(),
+            update.old_key_still_present,
         ),
         (GuidedMutation::Delete, Some(PostconditionEvidence::Delete { original_tuple_present: false })) => confirmed(None),
         (GuidedMutation::Delete, Some(PostconditionEvidence::Delete { original_tuple_present: true })) => conflict("deleted tuple is still present after verification"),
@@ -1213,6 +1228,7 @@ fn validate_float_bits_for_tag(
     Ok(())
 }
 
+#[cfg(test)]
 fn value_for_tag<'a>(
     raw_value: &'a serde_json::Value,
     tag: &str,
@@ -1244,6 +1260,7 @@ fn quote_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+#[cfg(test)]
 fn encode_signed_64_literal(
     value: &serde_json::Value,
     tag: &str,
@@ -1256,6 +1273,7 @@ fn encode_signed_64_literal(
     }
 }
 
+#[cfg(test)]
 fn encode_unsigned_64_literal(
     value: &serde_json::Value,
     tag: &str,
@@ -1290,6 +1308,7 @@ fn integer_fits_unsigned_tag(value: u64, tag: &str) -> bool {
     value <= max
 }
 
+#[cfg(test)]
 fn encode_float_literal(
     value: &serde_json::Value,
     tag: &str,
@@ -1321,6 +1340,7 @@ fn encode_float_literal(
     }
 }
 
+#[cfg(test)]
 fn encode_large_integer_literal(
     value: &serde_json::Value,
     tag: &str,
@@ -1347,6 +1367,7 @@ fn encode_large_integer_string(value: &str, tag: &str) -> Result<String, SqlEnco
     }
 }
 
+#[cfg(test)]
 fn encode_hex_literal(value: &serde_json::Value, tag: &str) -> Result<String, SqlEncodingError> {
     let value = value.as_str().ok_or_else(|| type_mismatch(tag))?;
     encode_hex_string(value, tag)
@@ -1361,6 +1382,7 @@ fn encode_hex_string(value: &str, tag: &str) -> Result<String, SqlEncodingError>
     }
 }
 
+#[cfg(test)]
 fn encode_bytes_literal(value: &serde_json::Value, tag: &str) -> Result<String, SqlEncodingError> {
     let bytes = bytes_from_json_value(value).ok_or_else(|| type_mismatch(tag))?;
     Ok(format!("0x{}", bytes_to_hex(&bytes)))
@@ -1385,11 +1407,13 @@ fn valid_decimal_integer(value: &str, signed: bool) -> bool {
     !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit())
 }
 
+#[cfg(test)]
 fn f32_bits_from_json(value: &serde_json::Value, tag: &str) -> Result<u32, SqlEncodingError> {
     let bits = value.as_u64().ok_or_else(|| type_mismatch(tag))?;
     u32::try_from(bits).map_err(|_| type_mismatch(tag))
 }
 
+#[cfg(test)]
 fn finite_f32_from_json_number(
     value: &serde_json::Value,
     tag: &str,
@@ -3587,16 +3611,18 @@ mod tests {
         let report = verify_authoritative_mutation_result(&WriteVerificationRequest {
             plan,
             affected_rows: None,
-            postcondition: Some(PostconditionEvidence::Update {
-                table: table_info,
-                row_by_original_key: Some(vec![
-                    serde_json::json!(42),
-                    serde_json::json!("eu"),
-                    serde_json::json!("Grace"),
-                ]),
-                row_by_new_key: None,
-                old_key_still_present: None,
-            }),
+            postcondition: Some(PostconditionEvidence::Update(Box::new(
+                PostconditionUpdate {
+                    table: table_info,
+                    row_by_original_key: Some(vec![
+                        serde_json::json!(42),
+                        serde_json::json!("eu"),
+                        serde_json::json!("Grace"),
+                    ]),
+                    row_by_new_key: None,
+                    old_key_still_present: None,
+                },
+            ))),
         });
 
         assert_eq!(
@@ -3640,16 +3666,18 @@ mod tests {
         let report = verify_authoritative_mutation_result(&WriteVerificationRequest {
             plan,
             affected_rows: None,
-            postcondition: Some(PostconditionEvidence::Update {
-                table: table_info,
-                row_by_original_key: None,
-                row_by_new_key: Some(vec![
-                    serde_json::json!(43),
-                    serde_json::json!("eu"),
-                    serde_json::json!("Ada"),
-                ]),
-                old_key_still_present: Some(false),
-            }),
+            postcondition: Some(PostconditionEvidence::Update(Box::new(
+                PostconditionUpdate {
+                    table: table_info,
+                    row_by_original_key: None,
+                    row_by_new_key: Some(vec![
+                        serde_json::json!(43),
+                        serde_json::json!("eu"),
+                        serde_json::json!("Ada"),
+                    ]),
+                    old_key_still_present: Some(false),
+                },
+            ))),
         });
 
         assert_eq!(
@@ -3734,12 +3762,14 @@ mod tests {
         let missing_changed = verify_authoritative_mutation_result(&WriteVerificationRequest {
             plan: plan.clone(),
             affected_rows: None,
-            postcondition: Some(PostconditionEvidence::Update {
-                table: table_info.clone(),
-                row_by_original_key: Some(vec![serde_json::json!(42)]),
-                row_by_new_key: None,
-                old_key_still_present: None,
-            }),
+            postcondition: Some(PostconditionEvidence::Update(Box::new(
+                PostconditionUpdate {
+                    table: table_info.clone(),
+                    row_by_original_key: Some(vec![serde_json::json!(42)]),
+                    row_by_new_key: None,
+                    old_key_still_present: None,
+                },
+            ))),
         });
         assert!(matches!(
             missing_changed.outcome,
@@ -3749,16 +3779,18 @@ mod tests {
         let mismatch = verify_authoritative_mutation_result(&WriteVerificationRequest {
             plan: plan.clone(),
             affected_rows: None,
-            postcondition: Some(PostconditionEvidence::Update {
-                table: table_info.clone(),
-                row_by_original_key: Some(vec![
-                    serde_json::json!(42),
-                    serde_json::json!("eu"),
-                    serde_json::json!("Ada"),
-                ]),
-                row_by_new_key: None,
-                old_key_still_present: None,
-            }),
+            postcondition: Some(PostconditionEvidence::Update(Box::new(
+                PostconditionUpdate {
+                    table: table_info.clone(),
+                    row_by_original_key: Some(vec![
+                        serde_json::json!(42),
+                        serde_json::json!("eu"),
+                        serde_json::json!("Ada"),
+                    ]),
+                    row_by_new_key: None,
+                    old_key_still_present: None,
+                },
+            ))),
         });
         assert_eq!(
             mismatch.outcome,
@@ -3770,12 +3802,14 @@ mod tests {
         let missing_row = verify_authoritative_mutation_result(&WriteVerificationRequest {
             plan: plan.clone(),
             affected_rows: None,
-            postcondition: Some(PostconditionEvidence::Update {
-                table: table_info.clone(),
-                row_by_original_key: None,
-                row_by_new_key: None,
-                old_key_still_present: None,
-            }),
+            postcondition: Some(PostconditionEvidence::Update(Box::new(
+                PostconditionUpdate {
+                    table: table_info.clone(),
+                    row_by_original_key: None,
+                    row_by_new_key: None,
+                    old_key_still_present: None,
+                },
+            ))),
         });
         assert_eq!(
             missing_row.outcome,
@@ -3813,16 +3847,18 @@ mod tests {
         let old_present = verify_authoritative_mutation_result(&WriteVerificationRequest {
             plan: pk_plan.clone(),
             affected_rows: None,
-            postcondition: Some(PostconditionEvidence::Update {
-                table: table_info.clone(),
-                row_by_original_key: None,
-                row_by_new_key: Some(vec![
-                    serde_json::json!(43),
-                    serde_json::json!("eu"),
-                    serde_json::json!("Ada"),
-                ]),
-                old_key_still_present: Some(true),
-            }),
+            postcondition: Some(PostconditionEvidence::Update(Box::new(
+                PostconditionUpdate {
+                    table: table_info.clone(),
+                    row_by_original_key: None,
+                    row_by_new_key: Some(vec![
+                        serde_json::json!(43),
+                        serde_json::json!("eu"),
+                        serde_json::json!("Ada"),
+                    ]),
+                    old_key_still_present: Some(true),
+                },
+            ))),
         });
         assert_eq!(
             old_present.outcome,
@@ -3833,16 +3869,18 @@ mod tests {
         let old_unchecked = verify_authoritative_mutation_result(&WriteVerificationRequest {
             plan: pk_plan,
             affected_rows: None,
-            postcondition: Some(PostconditionEvidence::Update {
-                table: table_info,
-                row_by_original_key: None,
-                row_by_new_key: Some(vec![
-                    serde_json::json!(43),
-                    serde_json::json!("eu"),
-                    serde_json::json!("Ada"),
-                ]),
-                old_key_still_present: None,
-            }),
+            postcondition: Some(PostconditionEvidence::Update(Box::new(
+                PostconditionUpdate {
+                    table: table_info,
+                    row_by_original_key: None,
+                    row_by_new_key: Some(vec![
+                        serde_json::json!(43),
+                        serde_json::json!("eu"),
+                        serde_json::json!("Ada"),
+                    ]),
+                    old_key_still_present: None,
+                },
+            ))),
         });
         assert!(matches!(
             old_unchecked.outcome,
@@ -3886,12 +3924,14 @@ mod tests {
         let mismatch = verify_authoritative_mutation_result(&WriteVerificationRequest {
             plan,
             affected_rows: None,
-            postcondition: Some(PostconditionEvidence::Update {
-                table: table_info,
-                row_by_original_key: None,
-                row_by_new_key: None,
-                old_key_still_present: None,
-            }),
+            postcondition: Some(PostconditionEvidence::Update(Box::new(
+                PostconditionUpdate {
+                    table: table_info,
+                    row_by_original_key: None,
+                    row_by_new_key: None,
+                    old_key_still_present: None,
+                },
+            ))),
         });
         assert!(matches!(mismatch.outcome, MutationOutcome::Unknown { .. }));
     }
@@ -3930,16 +3970,18 @@ mod tests {
         let report = verify_authoritative_mutation_result(&WriteVerificationRequest {
             plan,
             affected_rows: None,
-            postcondition: Some(PostconditionEvidence::Update {
-                table: table_info,
-                row_by_original_key: Some(vec![
-                    serde_json::json!(42),
-                    serde_json::json!("eu"),
-                    serde_json::json!("Grace"),
-                ]),
-                row_by_new_key: None,
-                old_key_still_present: None,
-            }),
+            postcondition: Some(PostconditionEvidence::Update(Box::new(
+                PostconditionUpdate {
+                    table: table_info,
+                    row_by_original_key: Some(vec![
+                        serde_json::json!(42),
+                        serde_json::json!("eu"),
+                        serde_json::json!("Grace"),
+                    ]),
+                    row_by_new_key: None,
+                    old_key_still_present: None,
+                },
+            ))),
         });
 
         assert_eq!(
@@ -4205,8 +4247,7 @@ mod tests {
         ) {
             Ok(plan) => plan,
             Err(error) => {
-                assert!(false, "expected valid guided update plan: {error:?}");
-                return;
+                panic!("expected valid guided update plan: {error:?}");
             }
         };
 
@@ -4308,12 +4349,14 @@ mod tests {
         let report = verify_authoritative_mutation_result(&WriteVerificationRequest {
             plan,
             affected_rows: None,
-            postcondition: Some(PostconditionEvidence::Update {
-                table: table_info,
-                row_by_original_key: None,
-                row_by_new_key: None,
-                old_key_still_present: None,
-            }),
+            postcondition: Some(PostconditionEvidence::Update(Box::new(
+                PostconditionUpdate {
+                    table: table_info,
+                    row_by_original_key: None,
+                    row_by_new_key: None,
+                    old_key_still_present: None,
+                },
+            ))),
         });
 
         assert!(matches!(report.outcome, MutationOutcome::Unknown { .. }));

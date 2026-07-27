@@ -3,6 +3,7 @@
 //! These helpers keep rendering from ever panicking on narrow terminals or
 //! on input containing wide / multi-byte characters.
 
+#[cfg(test)]
 use ratatui::layout::Rect;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -44,6 +45,11 @@ pub fn truncate_display_width(input: &str, max_width: usize) -> String {
 /// Unlike [`Rect::inner`] (which can underflow on tiny rectangles), this
 /// never wraps: a rectangle too small for the margin collapses to a
 /// zero-sized rect at the offset position instead of panicking.
+///
+/// Production layout code uses Ratatui's own [`Block::inner`], which is
+/// already safe; this helper is retained for tests that construct raw
+/// [`Rect`]s directly.
+#[cfg(test)]
 pub fn saturating_inner(area: Rect, margin: u16) -> Rect {
     let double = margin.saturating_mul(2);
     Rect {

@@ -16,9 +16,15 @@ impl RequestId {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum RequestScope {
     DatabaseCatalog,
+    /// Phase 2 schema-load scope; production uses legacy
+    /// `SchemaRequestContext` until the migration is complete.
+    #[allow(dead_code)]
     Schema {
         database: String,
     },
+    /// Phase 2 table-browse scope; production uses legacy
+    /// `TableBrowseRequestContext` until the migration is complete.
+    #[allow(dead_code)]
     TableRows {
         database: String,
         table: String,

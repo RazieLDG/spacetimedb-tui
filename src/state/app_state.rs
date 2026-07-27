@@ -168,38 +168,6 @@ impl ConnectionInfo {
 /// Maximum number of SQL history entries retained.
 const SQL_HISTORY_LIMIT: usize = 200;
 
-/// A single row pushed into the Live tab's transaction feed.
-///
-/// Derived from [`crate::api::types::WsServerMessage::TransactionUpdate`]
-/// when one arrives over the subscription WebSocket. Only the bits the
-/// UI actually needs are kept so the buffer stays small even under
-/// heavy activity.
-#[derive(Debug, Clone)]
-pub struct TxLogEntry {
-    /// When we observed the update (client clock).
-    pub observed_at: DateTime<Utc>,
-    /// Caller identity (may be an empty string for system-originated
-    /// transactions).
-    pub caller: String,
-    /// Per-table row counts affected by this transaction, in the
-    /// server's original order. `(table, inserts, deletes)`.
-    pub tables: Vec<(String, usize, usize)>,
-    /// Whether the transaction committed successfully. `None` when
-    /// the server didn't include a status field.
-    pub committed: Option<bool>,
-}
-
-impl TxLogEntry {
-    /// Sum of row inserts across every table touched by this tx.
-    pub fn total_inserts(&self) -> usize {
-        self.tables.iter().map(|(_, i, _)| *i).sum()
-    }
-    /// Sum of row deletes across every table touched by this tx.
-    pub fn total_deletes(&self) -> usize {
-        self.tables.iter().map(|(_, _, d)| *d).sum()
-    }
-}
-
 /// One row in the Live tab's connected-client list.
 #[derive(Debug, Clone)]
 pub struct LiveClientEntry {
@@ -337,10 +305,6 @@ pub struct AppState {
     /// pushed for that table since the most recent `InitialSubscription`.
     /// Used by the status bar / Tables view to surface live updates.
     pub live_table_data: HashMap<String, Vec<serde_json::Value>>,
-    /// Rolling buffer of transactions observed over the WebSocket
-    /// subscription. Used by the Live tab to show a real-time feed of
-    /// what's happening in the database.
-    pub tx_log: VecDeque<TxLogEntry>,
     /// Rolling list of connected clients, polled periodically from
     /// `st_client`. Populated by the Live tab's background refresh.
     pub live_clients: Vec<LiveClientEntry>,
@@ -496,7 +460,6 @@ impl AppState {
             query_result: None,
             table_browse_result: None,
             live_table_data: HashMap::new(),
-            tx_log: VecDeque::new(),
             live_clients: Vec::new(),
             ws_connected: false,
             ws_reconnect_deadline: None,

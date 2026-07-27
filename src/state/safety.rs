@@ -12,6 +12,9 @@ pub struct QualifiedTable {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SqlValue {
+    /// Null is rejected as a primary key value; kept for exhaustive
+    /// matching in validation code.
+    #[allow(dead_code)]
     Null,
     Bool(bool),
     I64(i64),

@@ -146,6 +146,10 @@ pub struct WsHandle {
 
 impl WsHandle {
     /// Send a subscription request to the server.
+    ///
+    /// Phase 4 scoped-subscription infrastructure; not yet called from
+    /// production code.
+    #[allow(dead_code)]
     pub async fn subscribe(&self, queries: Vec<String>, request_id: u32) -> Result<()> {
         self.cmd_tx
             .send(WsCommand::Subscribe {
@@ -167,6 +171,8 @@ impl WsHandle {
 /// Commands sent from the TUI to the WebSocket background task.
 #[derive(Debug)]
 enum WsCommand {
+    /// Phase 4 scoped-subscription command; not yet issued from production.
+    #[allow(dead_code)]
     Subscribe {
         queries: Vec<String>,
         request_id: u32,

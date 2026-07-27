@@ -34,7 +34,8 @@ use crate::{
         plan_postcondition_queries, revalidate_before_dispatch, typed_sql_value_from_json,
         verify_authoritative_mutation_result, ConfirmationSnapshot, Generations, GuidedFormValue,
         LookupRows, MutationDispatchStage, PostconditionEvidence, PostconditionQueries,
-        TransportFailure, WritePlanBuildError, WriteVerificationReport, WriteVerificationRequest,
+        PostconditionUpdate, TransportFailure, WritePlanBuildError, WriteVerificationReport,
+        WriteVerificationRequest,
     },
     state::{
         edit_mode::{
@@ -943,6 +944,13 @@ impl App {
             scope,
             generation,
         );
+        tracing::debug!(
+            "request #{} scope {:?} db={:?} gen={}",
+            context.id.get(),
+            context.scope(),
+            context.scope().database(),
+            context.generation
+        );
         self.latest_requests
             .insert(context.scope().clone(), context.clone());
         context
@@ -1222,6 +1230,10 @@ impl App {
                 break;
             }
         }
+
+        // Abort all pending background tasks and drain their reports so
+        // panics are logged before shutdown completes.
+        self.shutdown_tasks().await;
 
         // Persist last-known UI state for the next launch.
         if self.user_config.restore_session {
@@ -4819,6 +4831,28 @@ impl App {
         }
     }
 
+    /// Abort all pending background tasks and drain every remaining report.
+    /// Called once at shutdown so panics are logged and no task is silently
+    /// detached.
+    async fn shutdown_tasks(&mut self) {
+        let pending = self.task_registry.pending_count();
+        if pending > 0 {
+            tracing::debug!("aborting {pending} pending background task(s) at shutdown");
+        }
+        self.task_registry.abort_all();
+        while let Some(report) = self.task_registry.join_next().await {
+            if let crate::effects::task_registry::TaskOutcome::Panicked { ref message } =
+                report.outcome
+            {
+                tracing::error!(
+                    "background task '{}' panicked during shutdown: {message}",
+                    report.name
+                );
+            }
+        }
+        tracing::debug!("all background tasks joined at shutdown");
+    }
+
     /// Drain terminal reports from the background-task registry.
     ///
     /// Panicked tasks are surfaced into the Activity log and as an error
@@ -4908,16 +4942,6 @@ impl App {
         }
     }
 
-    /// Push a transaction entry onto the Live-tab feed, capping the
-    /// buffer so a chatty module can't grow it without bound.
-    fn push_tx_log_entry(&mut self, entry: crate::state::TxLogEntry) {
-        const MAX: usize = 500;
-        if self.state.tx_log.len() >= MAX {
-            self.state.tx_log.pop_front();
-        }
-        self.state.tx_log.push_back(entry);
-    }
-
     /// Apply a decoded WebSocket server message to the application state.
     fn handle_ws_server_message(&mut self, msg: crate::api::types::WsServerMessage) {
         use crate::api::types::WsServerMessage;
@@ -4944,13 +4968,10 @@ impl App {
                 // (the server's row identity model isn't exposed in the JSON
                 // protocol, so this is a best-effort match).
                 let mut total_changes = 0usize;
-                let mut per_table: Vec<(String, usize, usize)> = Vec::new();
                 for table_update in payload.database_update.tables {
                     let inserts_n = table_update.inserts.len();
                     let deletes_n = table_update.deletes.len();
                     total_changes += inserts_n + deletes_n;
-                    per_table.push((table_update.table_name.clone(), inserts_n, deletes_n));
-
                     let entry = self
                         .state
                         .live_table_data
@@ -4964,27 +4985,6 @@ impl App {
                 if total_changes > 0 {
                     tracing::debug!("Transaction update: {total_changes} row changes");
                 }
-
-                // Push a summary row into the Live tab's transaction feed.
-                // Extract caller identity + status from the payload's
-                // free-form `extra` map (which preserves fields the
-                // server added after we wrote this code).
-                let caller = payload
-                    .extra
-                    .get("caller_identity")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_default();
-                let committed = payload
-                    .status
-                    .as_ref()
-                    .map(|s| matches!(s, crate::api::types::TransactionStatus::Committed));
-                self.push_tx_log_entry(crate::state::TxLogEntry {
-                    observed_at: chrono::Utc::now(),
-                    caller,
-                    tables: per_table,
-                    committed,
-                });
             }
             WsServerMessage::IdentityToken(payload) => {
                 tracing::info!("WebSocket identity confirmed: {:?}", payload.identity);
@@ -5473,12 +5473,14 @@ async fn build_postcondition_evidence(
                     )));
                 }
             };
-            Ok(PostconditionEvidence::Update {
-                table: table.clone(),
-                row_by_original_key,
-                row_by_new_key: None,
-                old_key_still_present: None,
-            })
+            Ok(PostconditionEvidence::Update(Box::new(
+                PostconditionUpdate {
+                    table: table.clone(),
+                    row_by_original_key,
+                    row_by_new_key: None,
+                    old_key_still_present: None,
+                },
+            )))
         }
         PostconditionQueries::Update {
             original_key_lookup,
@@ -5488,12 +5490,14 @@ async fn build_postcondition_evidence(
             let old_key_still_present = match old_rows {
                 LookupRows::Zero => false,
                 LookupRows::One(row) => {
-                    return Ok(PostconditionEvidence::Update {
-                        table: table.clone(),
-                        row_by_original_key: Some(row),
-                        row_by_new_key: None,
-                        old_key_still_present: Some(true),
-                    });
+                    return Ok(PostconditionEvidence::Update(Box::new(
+                        PostconditionUpdate {
+                            table: table.clone(),
+                            row_by_original_key: Some(row),
+                            row_by_new_key: None,
+                            old_key_still_present: Some(true),
+                        },
+                    )));
                 }
                 LookupRows::Multiple(count) => {
                     return Err(PostconditionFetchError::critical(format!(
@@ -5511,12 +5515,14 @@ async fn build_postcondition_evidence(
                     )));
                 }
             };
-            Ok(PostconditionEvidence::Update {
-                table: table.clone(),
-                row_by_original_key: None,
-                row_by_new_key,
-                old_key_still_present: Some(old_key_still_present),
-            })
+            Ok(PostconditionEvidence::Update(Box::new(
+                PostconditionUpdate {
+                    table: table.clone(),
+                    row_by_original_key: None,
+                    row_by_new_key,
+                    old_key_still_present: Some(old_key_still_present),
+                },
+            )))
         }
     }
 }
@@ -8966,7 +8972,7 @@ mod modal_helper_tests {
         {
             editor.set("Adele".to_string());
         } else {
-            assert!(false, "expected open cell editor");
+            panic!("expected open cell editor");
         }
         app.commit_cell_edit();
         block_users_guided_writes(&mut app, 0);
@@ -9003,13 +9009,12 @@ mod modal_helper_tests {
         {
             editor.set("Adele".to_string());
         } else {
-            assert!(false, "expected open cell editor");
+            panic!("expected open cell editor");
         }
         app.commit_cell_edit();
         app.save_pending_edits().await;
         let Some(plan_id) = app.spreadsheet_lifecycle_plan_id() else {
-            assert!(false, "expected spreadsheet save plan");
-            return;
+            panic!("expected spreadsheet save plan");
         };
         block_users_guided_writes(&mut app, 0);
 
@@ -9529,6 +9534,22 @@ mod modal_helper_tests {
         app.nav_down().await;
         assert!(app.state.table_browse_result.is_none());
         assert_eq!(app.tables_grid.selected_row, 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_tasks_aborts_pending_tasks_and_joins_all_reports() {
+        let mut app = test_app();
+
+        // Spawn a task that would never finish on its own.
+        app.task_registry.spawn("never finishes", async {
+            tokio::time::sleep(Duration::from_secs(3600)).await
+        });
+        assert_eq!(app.task_registry.pending_count(), 1);
+
+        app.shutdown_tasks().await;
+
+        assert_eq!(app.task_registry.pending_count(), 0);
+        assert!(app.task_registry.try_join_next().is_none());
     }
 
     #[test]

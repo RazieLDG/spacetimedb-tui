@@ -54,6 +54,8 @@ Browse databases, run SQL, edit rows in a spreadsheet, call reducers, and manage
 
 Live updates are temporarily unavailable while safety controls are tightened. Use manual refresh for table data. Bounded scoped Live will return later; broad automatic subscriptions are currently unavailable. Spreadsheet editing supports one-row spreadsheet Save: multiple changed cells in one row are saved as one guided write, while moving to another row prompts Save, Discard, or Stay. Guided update/delete require declared primary keys and matching generations, with no unsafe override. Raw SQL is a separately labeled expert path; Raw SQL does not receive the guided CRUD guarantee and is never automatically retried. Unknown mutation outcomes are not automatically retried; refresh the affected scope before another guided attempt.
 
+Phase 1 release validation requires formatting, warning-denied Clippy, all tests with the 127-test baseline plus Phase 1 additions, and a release build before the phase is called complete.
+
 ### Admin
 
 | Feature | Description |

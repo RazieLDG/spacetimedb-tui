@@ -4,9 +4,9 @@
 //! as `Effect` values in the returned `Transition`.
 
 use crate::app::command::CommandId;
-use crate::app::event::{Action, AppEvent, Effect, TableTarget, Transition};
+use crate::app::event::{Action, AppEvent, Effect, ReadResult, TableTarget, Transition};
 use crate::app::policy::{command_availability, command_context_from_state};
-use crate::effects::request::RequestScope;
+use crate::effects::request::{RequestContext, RequestScope};
 use crate::state::app_state::AppState;
 
 pub fn reduce(state: &mut AppState, event: AppEvent) -> Transition {
@@ -19,6 +19,24 @@ pub fn reduce(state: &mut AppState, event: AppEvent) -> Transition {
             crate::app::navigation::select_resource(state, database, resource)
         }
         AppEvent::Action(Action::NavigateUp) => crate::app::navigation::navigate_up(state),
+        AppEvent::ScopedReadCompleted { context, result } => {
+            if state.requests.is_current(&context) {
+                apply_scoped_read_completion(state, context, result);
+            }
+            Transition::none()
+        }
+        AppEvent::ScopedReadFailed {
+            context,
+            failure,
+            retry: _,
+        } => {
+            if state.requests.is_current(&context) {
+                apply_scoped_read_failure(state, context, failure);
+            }
+            // Phase 2 retains the typed retry identity on the event but does
+            // not schedule retries until Phase 4 installs retry policy.
+            Transition::none()
+        }
         _ => Transition::none(),
     }
 }
@@ -51,6 +69,78 @@ fn invoke_command(state: &mut AppState, command: CommandId) -> Transition {
             }
         }
         _ => Transition::none(),
+    }
+}
+
+fn apply_scoped_read_completion(state: &mut AppState, context: RequestContext, result: ReadResult) {
+    use std::time::Instant;
+
+    let now = Instant::now();
+    let scope = context.scope.clone();
+    match (scope, result) {
+        (RequestScope::DatabaseCatalog, ReadResult::Catalog(databases)) => {
+            state.resources.catalog = std::mem::take(&mut state.resources.catalog)
+                .apply_success(&context, databases, now);
+        }
+        (RequestScope::Schema { .. }, ReadResult::Schema(schema)) => {
+            state.resources.schema = std::mem::take(&mut state.resources.schema)
+                .apply_success(&context, schema, now);
+        }
+        (RequestScope::TableRows { .. }, ReadResult::TableRows(rows))
+        | (RequestScope::SqlWorkspace { .. }, ReadResult::TableRows(rows)) => {
+            state.resources.table_rows = std::mem::take(&mut state.resources.table_rows)
+                .apply_success(&context, rows, now);
+        }
+        (RequestScope::Logs { .. }, ReadResult::Logs(logs)) => {
+            state.resources.logs =
+                std::mem::take(&mut state.resources.logs).apply_success(&context, logs, now);
+        }
+        (RequestScope::Metrics, ReadResult::Metrics(metrics)) => {
+            state.resources.metrics = std::mem::take(&mut state.resources.metrics)
+                .apply_success(&context, metrics, now);
+        }
+        _ => {}
+    }
+}
+
+fn apply_scoped_read_failure(
+    state: &mut AppState,
+    context: RequestContext,
+    failure: crate::app::event::ReadFailure,
+) {
+    use crate::state::resources::AppError;
+
+    let scope = context.scope.clone();
+    let error = AppError {
+        message: match failure {
+            crate::app::event::ReadFailure::Transport(message) => message,
+        },
+    };
+    match scope {
+        RequestScope::DatabaseCatalog => {
+            state.resources.catalog = std::mem::take(&mut state.resources.catalog)
+                .apply_error(&context, error);
+        }
+        RequestScope::Schema { .. } => {
+            state.resources.schema =
+                std::mem::take(&mut state.resources.schema).apply_error(&context, error);
+        }
+        RequestScope::TableRows { .. } | RequestScope::SqlWorkspace { .. } => {
+            state.resources.table_rows = std::mem::take(&mut state.resources.table_rows)
+                .apply_error(&context, error);
+        }
+        RequestScope::Logs { .. } => {
+            state.resources.logs =
+                std::mem::take(&mut state.resources.logs).apply_error(&context, error);
+        }
+        RequestScope::Metrics => {
+            state.resources.metrics =
+                std::mem::take(&mut state.resources.metrics).apply_error(&context, error);
+        }
+        RequestScope::LiveClients { .. } => {
+            state.resources.live_clients = std::mem::take(&mut state.resources.live_clients)
+                .apply_error(&context, error);
+        }
     }
 }
 

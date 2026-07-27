@@ -90,6 +90,64 @@ impl<T> Default for LoadState<T> {
     }
 }
 
+impl<T: Clone> LoadState<T> {
+    /// Transition to a loading/refreshing state for a new request.
+    /// Existing data remains visible during refresh.
+    pub fn begin_read(self, request: RequestContext) -> Self {
+        match self {
+            LoadState::Ready { data, .. }
+            | LoadState::Refreshing { data, .. }
+            | LoadState::Stale { data, .. } => LoadState::Refreshing { data, request },
+            LoadState::Error {
+                previous: Some(data), ..
+            } => LoadState::Refreshing { data, request },
+            _ => LoadState::Loading { request },
+        }
+    }
+
+    /// Apply a successful read result. Only accepted if `completed` matches
+    /// the currently loading/refreshing request context.
+    pub fn apply_success(self, completed: &RequestContext, data: T, refreshed_at: Instant) -> Self {
+        match &self {
+            LoadState::Loading { request } | LoadState::Refreshing { request, .. }
+                if request == completed =>
+            {
+                LoadState::Ready { data, refreshed_at }
+            }
+            _ => self,
+        }
+    }
+
+    /// Apply an empty result (zero rows). Same staleness guard as `apply_success`.
+    pub fn apply_empty(self, completed: &RequestContext, refreshed_at: Instant) -> Self {
+        match &self {
+            LoadState::Loading { request } | LoadState::Refreshing { request, .. }
+                if request == completed =>
+            {
+                LoadState::Empty { refreshed_at }
+            }
+            _ => self,
+        }
+    }
+
+    /// Apply an error. Preserves previous data if we were refreshing.
+    pub fn apply_error(self, completed: &RequestContext, error: AppError) -> Self {
+        match self {
+            LoadState::Loading { request } if &request == completed => LoadState::Error {
+                previous: None,
+                error,
+            },
+            LoadState::Refreshing { data, request } if &request == completed => {
+                LoadState::Error {
+                    previous: Some(data),
+                    error,
+                }
+            }
+            other => other,
+        }
+    }
+}
+
 /// Why data became stale.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StaleReason {
@@ -167,19 +225,15 @@ mod load_state_tests {
             refreshed_at: Instant::now(),
         };
 
-        // Simulate transition to Refreshing: data must remain accessible.
         let scope = RequestScope::DatabaseCatalog;
         let ctx = RequestContext::new(RequestId::from_u64(1), scope, 1);
-        let refreshing = match ready {
-            LoadState::Ready { data, .. } => LoadState::Refreshing {
-                data,
-                request: ctx,
-            },
-            other => other,
-        };
+        let refreshing = ready.begin_read(ctx.clone());
 
         match &refreshing {
-            LoadState::Refreshing { data, .. } => assert_eq!(data, &vec!["row1".to_string()]),
+            LoadState::Refreshing { data, request } => {
+                assert_eq!(data, &vec!["row1".to_string()]);
+                assert_eq!(request, &ctx);
+            }
             _ => panic!("expected Refreshing"),
         }
     }
@@ -196,5 +250,67 @@ mod load_state_tests {
         assert!(tracker.is_current(&second));
         assert_eq!(first.generation, 1);
         assert_eq!(second.generation, 2);
+    }
+
+    #[test]
+    fn refresh_keeps_existing_typed_query_result_visible() {
+        let request = RequestContext::new(
+            RequestId::from_u64(1),
+            RequestScope::TableRows {
+                database: "inventory".into(),
+                table: "items".into(),
+                view: "browse".into(),
+            },
+            1,
+        );
+        let state = LoadState::Ready {
+            data: crate::api::types::QueryResult {
+                schema: vec![],
+                rows: vec![],
+                total_duration_micros: 0,
+            },
+            refreshed_at: Instant::now(),
+        };
+
+        let next = state.begin_read(request.clone());
+
+        assert!(matches!(next, LoadState::Refreshing { request: actual, .. } if actual == request));
+    }
+
+    #[test]
+    fn stale_completion_does_not_replace_newer_request_context() {
+        let current = RequestContext::new(
+            RequestId::from_u64(8),
+            RequestScope::TableRows {
+                database: "inventory".into(),
+                table: "items".into(),
+                view: "browse".into(),
+            },
+            3,
+        );
+        let stale = RequestContext::new(
+            RequestId::from_u64(7),
+            RequestScope::TableRows {
+                database: "inventory".into(),
+                table: "items".into(),
+                view: "browse".into(),
+            },
+            2,
+        );
+        let state = LoadState::<TableRows>::Loading {
+            request: current.clone(),
+        };
+
+        let next = state.apply_success(
+            &stale,
+            crate::api::types::QueryResult {
+                schema: vec![],
+                rows: vec![],
+                total_duration_micros: 0,
+            },
+            Instant::now(),
+        );
+
+        assert!(matches!(next, LoadState::Loading { request } if request == current));
     }
 }

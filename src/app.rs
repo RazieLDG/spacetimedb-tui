@@ -398,6 +398,10 @@ pub struct App {
     /// Count of stale results that were silently dropped. Useful for debugging
     /// and observability.
     ignored_stale_results: u64,
+    /// Owns all background tasks so their completion, panic, and cancellation
+    /// are joined and reported instead of silently detached. Panics are
+    /// surfaced into the Activity log by the event loop.
+    task_registry: crate::effects::task_registry::TaskRegistry,
 }
 
 /// How often the Metrics tab automatically refreshes server-side metrics.
@@ -453,6 +457,7 @@ impl App {
             next_request_id: 0,
             latest_requests: HashMap::new(),
             ignored_stale_results: 0,
+            task_registry: crate::effects::task_registry::TaskRegistry::new(),
             user_config: config.user_config.clone(),
             pending_session: if config.user_config.restore_session {
                 Some(crate::user_config::SessionState::load())
@@ -1125,7 +1130,7 @@ impl App {
         let context =
             self.next_request_context(crate::effects::request::RequestScope::DatabaseCatalog);
 
-        tokio::spawn(async move {
+        self.task_registry.spawn("bootstrap ping", async move {
             let ping_ok = matches!(
                 tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.ping()).await,
                 Ok(true)
@@ -1199,6 +1204,10 @@ impl App {
             // Drain WebSocket events (non-blocking)
             self.drain_ws_events().await;
 
+            // Drain background-task reports (non-blocking). Panics are
+            // surfaced into the Activity log instead of being silently lost.
+            self.drain_task_reports();
+
             // Throttled background refresh of server metrics while the
             // Metrics tab is visible.
             self.maybe_refresh_metrics();
@@ -1253,7 +1262,7 @@ impl App {
             self.next_request_context(crate::effects::request::RequestScope::LiveClients {
                 database: db.clone(),
             });
-        tokio::spawn(async move {
+        self.task_registry.spawn("live clients poll", async move {
             // `st_client` is a system table; we cap the result so a
             // huge production deployment doesn't hang the UI.
             let sql = "SELECT * FROM st_client LIMIT 200";
@@ -1307,7 +1316,7 @@ impl App {
         let client = self.client.clone();
         let tx = self.event_tx.clone();
         let context = self.next_request_context(crate::effects::request::RequestScope::Metrics);
-        tokio::spawn(async move {
+        self.task_registry.spawn("metrics refresh", async move {
             if let Ok(Ok(text)) =
                 tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.get_metrics()).await
             {
@@ -2233,7 +2242,7 @@ impl App {
         let client = self.client.clone();
         let tx = self.event_tx.clone();
         let context = self.current_schema_request_context(db.clone());
-        tokio::spawn(async move {
+        self.task_registry.spawn("load schema", async move {
             match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.get_schema(&db)).await {
                 Ok(Ok(schema)) => send_event(
                     &tx,
@@ -2279,7 +2288,7 @@ impl App {
         let tx = self.event_tx.clone();
         let context = self.current_table_browse_request_context(db.clone(), table.clone(), origin);
 
-        tokio::spawn(async move {
+        self.task_registry.spawn("browse table", async move {
             match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.query_sql(&db, &sql)).await {
                 Ok(Ok(result)) => send_event(
                     &tx,
@@ -4255,7 +4264,7 @@ impl App {
         let tx = self.event_tx.clone();
         let context =
             self.next_request_context(crate::effects::request::RequestScope::DatabaseCatalog);
-        tokio::spawn(async move {
+        self.task_registry.spawn("add alias", async move {
             match tokio::time::timeout(
                 HTTP_REQUEST_TIMEOUT,
                 client.add_database_alias(&database, &alias),
@@ -4320,7 +4329,7 @@ impl App {
         let tx = self.event_tx.clone();
         let context =
             self.next_request_context(crate::effects::request::RequestScope::DatabaseCatalog);
-        tokio::spawn(async move {
+        self.task_registry.spawn("delete database", async move {
             match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.delete_database(&database))
                 .await
             {
@@ -4369,7 +4378,7 @@ impl App {
     /// Run `client.call_reducer` on a background task and route the
     /// outcome through `AppEvent::WriteOp{Success,Error}`.
     fn spawn_call_reducer(
-        &self,
+        &mut self,
         db: String,
         reducer: String,
         args: Vec<serde_json::Value>,
@@ -4377,7 +4386,7 @@ impl App {
     ) {
         let client = self.client.clone();
         let tx = self.event_tx.clone();
-        tokio::spawn(async move {
+        self.task_registry.spawn("call reducer", async move {
             match tokio::time::timeout(
                 HTTP_REQUEST_TIMEOUT,
                 client.call_reducer(&db, &reducer, &args),
@@ -4412,10 +4421,10 @@ impl App {
     /// Run a write SQL statement (INSERT/UPDATE/DELETE) on a
     /// background task and route the outcome the same way reducer
     /// calls are.
-    fn spawn_write_sql(&self, db: String, sql: String, op_label: String) {
+    fn spawn_write_sql(&mut self, db: String, sql: String, op_label: String) {
         let client = self.client.clone();
         let tx = self.event_tx.clone();
-        tokio::spawn(async move {
+        self.task_registry.spawn("write sql", async move {
             match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.query_sql(&db, &sql)).await {
                 Ok(Ok(_result)) => send_event(
                     &tx,
@@ -4445,7 +4454,7 @@ impl App {
     /// Run a guided row write and carry the plan id back so the exact
     /// in-flight row lock can be released on either success or failure.
     fn spawn_guided_write_sql(
-        &self,
+        &mut self,
         plan: WritePlan,
         table_info: TableInfo,
         postcondition_queries: PostconditionQueries,
@@ -4456,7 +4465,7 @@ impl App {
         let client = self.client.clone();
         let tx = self.event_tx.clone();
         let plan_id = plan.id;
-        tokio::spawn(async move {
+        self.task_registry.spawn("guided write", async move {
             match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.query_sql(&db, &sql)).await {
                 Ok(Ok(dml_result)) => {
                     let report = match build_postcondition_evidence(
@@ -4645,7 +4654,7 @@ impl App {
                 workspace: "main".to_string(),
             });
 
-        tokio::spawn(async move {
+        self.task_registry.spawn("execute sql", async move {
             let outcome =
                 tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.query_sql(&db, &sql_clone)).await;
             match outcome {
@@ -4706,19 +4715,20 @@ impl App {
                 let tx = self.event_tx.clone();
                 let context =
                     self.next_request_context(crate::effects::request::RequestScope::Metrics);
-                tokio::spawn(async move {
-                    if let Ok(Ok(text)) =
-                        tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.get_metrics()).await
-                    {
-                        let snapshot = parse_prometheus_metrics(&text);
-                        send_event(&tx, AppEvent::MetricsLoaded { context, snapshot });
-                    }
-                    let ok = matches!(
-                        tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.ping()).await,
-                        Ok(true)
-                    );
-                    send_event(&tx, AppEvent::PingResult(ok));
-                });
+                self.task_registry
+                    .spawn("refresh view metrics", async move {
+                        if let Ok(Ok(text)) =
+                            tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.get_metrics()).await
+                        {
+                            let snapshot = parse_prometheus_metrics(&text);
+                            send_event(&tx, AppEvent::MetricsLoaded { context, snapshot });
+                        }
+                        let ok = matches!(
+                            tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.ping()).await,
+                            Ok(true)
+                        );
+                        send_event(&tx, AppEvent::PingResult(ok));
+                    });
             }
             Tab::Module => {
                 self.load_schema().await;
@@ -4742,7 +4752,7 @@ impl App {
         let context = self.next_request_context(crate::effects::request::RequestScope::Logs {
             database: db.clone(),
         });
-        tokio::spawn(async move {
+        self.task_registry.spawn("load logs", async move {
             match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.get_logs(&db, 500, false)).await
             {
                 Ok(Ok(logs)) => send_event(&tx, AppEvent::LogsLoaded { context, logs }),
@@ -4806,6 +4816,42 @@ impl App {
         }
         for ev in events {
             self.handle_ws_event(ev).await;
+        }
+    }
+
+    /// Drain terminal reports from the background-task registry.
+    ///
+    /// Panicked tasks are surfaced into the Activity log and as an error
+    /// notification so a background panic is never silently lost. Completed
+    /// and cancelled tasks are recorded at debug level only.
+    fn drain_task_reports(&mut self) {
+        while let Some(report) = self.task_registry.try_join_next() {
+            match report.outcome {
+                crate::effects::task_registry::TaskOutcome::Panicked { ref message } => {
+                    tracing::error!("background task '{}' panicked: {message}", report.name);
+                    self.state.push_log(crate::api::types::LogEntry {
+                        ts: Some(chrono::Utc::now()),
+                        level: crate::api::types::LogLevel::Panic,
+                        message: format!("background task '{}' panicked: {message}", report.name),
+                        target: Some("spacetimedb-tui::task_registry".to_string()),
+                        filename: None,
+                        line_number: None,
+                    });
+                    send_event(
+                        &self.event_tx,
+                        AppEvent::Error(format!(
+                            "Background task '{}' crashed: {message}",
+                            report.name
+                        )),
+                    );
+                }
+                crate::effects::task_registry::TaskOutcome::Cancelled => {
+                    tracing::debug!("background task '{}' cancelled", report.name);
+                }
+                crate::effects::task_registry::TaskOutcome::Completed => {
+                    tracing::debug!("background task '{}' completed", report.name);
+                }
+            }
         }
     }
 

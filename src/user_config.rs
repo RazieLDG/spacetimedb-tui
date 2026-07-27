@@ -231,7 +231,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod phase2_user_config_tests {
+mod user_config_defaults_tests {
     use super::*;
     use crate::state::app_state::AppState;
     use crate::state::workbench::{WorkbenchMode, Workspace};

@@ -1,13 +1,13 @@
-// Phase 2/3 foundation: wired into production event loop in Phase 3.
+// Foundation: wired into production event loop in a future milestone.
 #![allow(dead_code)]
 
 //! Workbench state: mode, workspace, focused pane, and widget-level UI state.
 //!
-//! This is the single owner for Phase 2/3 workbench concepts. Navigation and
+//! This is the single owner for workbench concepts. Navigation and
 //! resource data live in sibling modules; this module owns only interaction
 //! state.
 
-/// Top-level workbench mode (Phase 3 navigation shell).
+/// Top-level workbench mode (navigation shell).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum WorkbenchMode {
     #[default]

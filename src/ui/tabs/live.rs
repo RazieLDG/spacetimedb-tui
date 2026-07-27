@@ -2,7 +2,7 @@
 //!
 //! Splits the content area into two panes:
 //! - **Disabled notice** (top): explains that automatic Live
-//!   subscriptions are temporarily unavailable in Phase 1.
+//!   subscriptions are temporarily unavailable.
 //! - **Connected clients** (bottom): a periodically-refreshed list of
 //!   identities pulled from `st_client` via a background SQL query
 //!   (metadata polling, not row-level Live).
@@ -23,7 +23,7 @@ use crate::state::{AppState, FocusPanel};
 
 /// Whether automatic Live subscriptions are available in this build.
 ///
-/// Phase 1 disables unbounded all-table subscriptions while the safety
+/// Unbounded all-table subscriptions while the safety
 /// controls are tightened. Bounded, scoped Live will return later.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LiveAvailability {
@@ -37,7 +37,7 @@ pub fn live_subscription_availability() -> LiveAvailability {
 
 /// User-facing explanation shown in place of the Live feed while
 /// automatic subscriptions are disabled.
-pub fn phase_one_live_disabled_message() -> &'static str {
+pub fn live_disabled_message() -> &'static str {
     "Live updates are temporarily unavailable while safety controls are tightened. Use manual refresh for table data. Bounded scoped Live will return later; broad automatic subscriptions are currently unavailable."
 }
 
@@ -49,7 +49,7 @@ fn rgb((r, g, b): (u8, u8, u8)) -> Color {
 ///
 /// The top pane branches on [`live_subscription_availability`]: while
 /// subscriptions are [`LiveAvailability::TemporarilyUnavailable`] it draws
-/// the Phase 1 disabled notice; a future `Available` variant would restore
+/// the disabled notice; a future `Available` variant would restore
 /// the transaction feed.
 pub fn render_live(area: Rect, buf: &mut Buffer, app: &AppState) {
     let theme = &app.theme;
@@ -114,7 +114,7 @@ fn render_disabled_notice(area: Rect, buf: &mut Buffer, app: &AppState) {
         return;
     }
 
-    let msg = phase_one_live_disabled_message();
+    let msg = live_disabled_message();
     let y = inner.y + inner.height / 2;
     let line = Line::from(Span::styled(
         format!("  {msg}"),
@@ -192,12 +192,12 @@ fn render_client_list(area: Rect, buf: &mut Buffer, app: &AppState) {
 }
 
 #[cfg(test)]
-mod phase_one_live_tests {
+mod live_tab_tests {
     use super::*;
 
     #[test]
-    fn phase_one_live_surface_explains_disabled_state() {
-        let text = phase_one_live_disabled_message();
+    fn live_surface_explains_disabled_state() {
+        let text = live_disabled_message();
 
         assert!(text.contains("Live updates are temporarily unavailable"));
         assert!(text.contains("manual refresh"));

@@ -117,7 +117,7 @@ pub enum MutationOutcome {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2: SafetyState aggregate
+// SafetyState aggregate
 // ---------------------------------------------------------------------------
 
 /// An unresolved mutation whose outcome is unknown.

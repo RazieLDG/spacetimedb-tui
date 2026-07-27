@@ -1,4 +1,4 @@
-// Phase 2/3 foundation: wired into production event loop in Phase 3.
+// Foundation: wired into production event loop in a future milestone.
 #![allow(dead_code)]
 
 //! Effect runner: bounded AppEvent channel, production transport adapters,
@@ -122,10 +122,10 @@ impl ApiTransport for SpacetimeApiTransport {
     }
 }
 
-/// Phase 2 subscription transport: Live is disabled until Phase 4.
-pub struct Phase2SubscriptionTransport;
+/// Subscription transport: Live is disabled until scoped subscriptions are available.
+pub struct DisabledSubscriptionTransport;
 
-impl SubscriptionTransport for Phase2SubscriptionTransport {
+impl SubscriptionTransport for DisabledSubscriptionTransport {
     type Request = std::convert::Infallible;
 
     fn connect(
@@ -156,7 +156,7 @@ impl SessionStore for LocalSessionStore {
 // ---------------------------------------------------------------------------
 
 pub type AppEffectRunner =
-    EffectRunner<SpacetimeApiTransport, Phase2SubscriptionTransport, CrosstermTerminalOps>;
+    EffectRunner<SpacetimeApiTransport, DisabledSubscriptionTransport, CrosstermTerminalOps>;
 
 pub struct EffectRunner<A, S, T> {
     pub api: A,

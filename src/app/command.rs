@@ -1,4 +1,4 @@
-// Phase 2/3 foundation: wired into production event loop in Phase 3.
+// Foundation: wired into production event loop in a future milestone.
 #![allow(dead_code)]
 
 //! Typed command registry: stable command IDs, key bindings, palette search,
@@ -307,7 +307,7 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec { id: CommandId::SelectResource, label: "Select resource", description: "Select a table, reducer, or module resource.", bindings: NO_BINDINGS, modes: ALL_MODES, focus: ALL_FOCUS, availability: AvailabilityRule::RequiresActiveDatabase },
     CommandSpec { id: CommandId::RefreshActiveResource, label: "Refresh active resource", description: "Reload the current database resource.", bindings: REFRESH_BINDINGS, modes: ALL_MODES, focus: WORKBENCH_FOCUS, availability: AvailabilityRule::RequiresActiveResource },
     CommandSpec { id: CommandId::ToggleLive, label: "Toggle live updates", description: "Toggle live updates for the scoped active resource only; do not enable all-table Live behavior.", bindings: TOGGLE_LIVE_BINDINGS, modes: ALL_MODES, focus: WORKBENCH_FOCUS, availability: AvailabilityRule::RequiresLiveAvailable },
-    CommandSpec { id: CommandId::ConfirmWritePlan, label: "Confirm write plan", description: "Confirm the reviewed Phase 1 WritePlan for an explicit mutation with unresolved mutation uncertainty preserved.", bindings: CONFIRM_WRITE_PLAN_BINDINGS, modes: ALL_MODES, focus: MODAL_OR_INSPECTOR_FOCUS, availability: AvailabilityRule::RequiresWritePlan },
+    CommandSpec { id: CommandId::ConfirmWritePlan, label: "Confirm write plan", description: "Confirm the reviewed WritePlan for an explicit mutation with unresolved mutation uncertainty preserved.", bindings: CONFIRM_WRITE_PLAN_BINDINGS, modes: ALL_MODES, focus: MODAL_OR_INSPECTOR_FOCUS, availability: AvailabilityRule::RequiresWritePlan },
     CommandSpec { id: CommandId::RestoreSession, label: "Restore session", description: "Restore the configured previous database session.", bindings: NO_BINDINGS, modes: ALL_MODES, focus: ALL_FOCUS, availability: AvailabilityRule::Always },
     CommandSpec { id: CommandId::GotoTables, label: "Go to tables", description: "Show table resources.", bindings: NO_BINDINGS, modes: ALL_MODES, focus: ALL_FOCUS, availability: AvailabilityRule::RequiresActiveDatabase },
     CommandSpec { id: CommandId::GotoSql, label: "Go to SQL", description: "Show the SQL workspace.", bindings: NO_BINDINGS, modes: ALL_MODES, focus: ALL_FOCUS, availability: AvailabilityRule::RequiresActiveDatabase },
@@ -739,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    fn phase2_command_descriptions_do_not_claim_new_layout() {
+    fn command_descriptions_do_not_claim_new_layout() {
         let registry = CommandRegistry;
         let forbidden = [
             "Explorer",

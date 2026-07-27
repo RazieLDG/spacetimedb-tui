@@ -235,7 +235,7 @@ const LOG_BUFFER_LIMIT: usize = 10_000;
 #[derive(Debug)]
 pub struct AppState {
     // ------------------------------------------------------------------
-    // Phase 2 state domains
+    // State domains
     // ------------------------------------------------------------------
     pub navigation: crate::state::navigation::NavigationState,
     pub resources: crate::state::resources::ResourceState,
@@ -991,13 +991,13 @@ mod tests {
 }
 
 #[cfg(test)]
-mod phase2_state_tests {
+mod state_domain_tests {
     use super::*;
     use crate::effects::request::RequestScope;
     use crate::state::workbench::{WorkbenchMode, WorkbenchPane, Workspace};
 
     #[test]
-    fn app_state_has_one_owner_for_phase2_state_domains() {
+    fn app_state_has_one_owner_for_state_domains() {
         let state = AppState::new("http://localhost:3000".to_string());
 
         assert_eq!(state.navigation.active_database, None);

@@ -2,7 +2,7 @@
 
 > **A blazing-fast, keyboard-driven terminal UI for managing, querying, editing, and monitoring SpacetimeDB 2.0 — right from your shell.**
 
-Browse databases, run SQL, edit rows in a spreadsheet, call reducers, and manage aliases — all with Vim-style key bindings and a command palette. (Live transaction streaming is temporarily disabled while Phase 1 safety controls are tightened; see [Phase 1 safety behavior](#phase-1-safety-behavior).)
+Browse databases, run SQL, edit rows in a spreadsheet, call reducers, and manage aliases — all with Vim-style key bindings and a command palette. (Live transaction streaming is temporarily disabled while safety controls are tightened; see [Safety behavior](#safety-behavior).)
 
 [![CI](https://github.com/RazieLDG/spacetimedb-tui/actions/workflows/ci.yml/badge.svg)](https://github.com/RazieLDG/spacetimedb-tui/actions/workflows/ci.yml)
 [![Release](https://github.com/RazieLDG/spacetimedb-tui/actions/workflows/release.yml/badge.svg)](https://github.com/RazieLDG/spacetimedb-tui/actions/workflows/release.yml)
@@ -50,15 +50,9 @@ Browse databases, run SQL, edit rows in a spreadsheet, call reducers, and manage
 | 📝 **Spreadsheet Edit Mode** | `Ctrl+E` enters a cell-by-cell editor on the Tables tab. Move with `h`/`j`/`k`/`l`, `Enter` to open an inline input, `Enter` to stage edits for one typed dirty row, `s` to save that row through one guided WritePlan/update confirmation, `u` to revert, `Esc` to exit (with a discard prompt if pending > 0). Edits on a different row ask Save / Discard / Stay; multi-row Save All is unavailable. |
 | 💾 **Clipboard + Export** | `y` copies the cell, `Y` copies the row as TSV (via OSC 52, no external dep). `e` exports to CSV, `E` exports to JSON under `./exports/`. |
 
-### Phase 1 safety behavior
+### Safety behavior
 
 Live updates are temporarily unavailable while safety controls are tightened. Use manual refresh for table data. Bounded scoped Live will return later; broad automatic subscriptions are currently unavailable. Spreadsheet editing supports one-row spreadsheet Save: multiple changed cells in one row are saved as one guided write, while moving to another row prompts Save, Discard, or Stay. Guided update/delete require declared primary keys and matching generations, with no unsafe override. Raw SQL is a separately labeled expert path; Raw SQL does not receive the guided CRUD guarantee and is never automatically retried. Unknown mutation outcomes are not automatically retried; refresh the affected scope before another guided attempt.
-
-Phase 1 release validation requires formatting, warning-denied Clippy, all tests with the 127-test baseline plus Phase 1 additions, and a release build before the phase is called complete.
-
-### Phase 2 foundation
-
-The Phase 2 foundation adds a typed command registry, shared command availability policy, normalized reducer/effect boundaries, bounded AppEvent delivery, source-preserving configuration resolution, and central ownership for navigation, resource, workbench, activity, and safety state. The visible layout is unchanged in Phase 2. DATA, OBSERVE, OPERATE workbench surfaces are prepared in state and command metadata, but the full contextual workbench layout ships in a later phase.
 
 ### Admin
 
@@ -396,7 +390,7 @@ Built and tested against **SpacetimeDB 2.0** HTTP + WebSocket APIs.
 | Add alias | `POST /v1/database/{db}/names` |
 | Delete database | `DELETE /v1/database/{db}` |
 | Log streaming | `GET /v1/database/{db}/logs` |
-| Live subscription | `GET /v1/database/{db}/subscribe` (WebSocket) — **temporarily disabled in Phase 1**; manual refresh is used instead |
+| Live subscription | `GET /v1/database/{db}/subscribe` (WebSocket) — **temporarily disabled**; manual refresh is used instead |
 | Metrics | `GET /metrics` (Prometheus format) |
 
 ### WebSocket Subprotocol

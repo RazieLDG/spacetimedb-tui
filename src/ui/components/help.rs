@@ -183,7 +183,7 @@ impl HelpOverlay {
     /// to recover.
     ///
     /// The binding sections have a fixed, width-independent line count.
-    /// The Phase 1 notice is word-wrapped to the popup width at render
+    /// The safety notice is word-wrapped to the popup width at render
     /// time, so its exact line count is not known here; we count one
     /// line per word (plus the header and trailing blank line) as a
     /// strict upper bound. The render path clamps the *displayed* scroll
@@ -194,10 +194,10 @@ impl HelpOverlay {
     pub fn total_lines() -> usize {
         let mut n = 0usize;
 
-        // Phase 1 safety notice: header + one line per word (upper
+        // Safety notice: header + one line per word (upper
         // bound on the wrapped line count) + trailing blank line.
         n += 1;
-        n += phase_one_safety_help_text().split_whitespace().count();
+        n += safety_help_text().split_whitespace().count();
         n += 1;
 
         for section in SECTIONS {
@@ -242,16 +242,16 @@ impl Widget for HelpOverlay {
         // Build all lines
         let mut lines: Vec<Line> = Vec::new();
 
-        // Phase 1 safety notice — kept truthful with README/CHANGELOG by
-        // `phase_one_truth_gate_tests`.
+        // Safety notice — kept truthful with README/CHANGELOG by
+        // `safety_truth_gate_tests`.
         let notice_width = inner.width.saturating_sub(2) as usize;
         lines.push(Line::from(Span::styled(
-            "  Phase 1 safety ",
+            "  Safety ",
             Style::default()
                 .fg(SECTION_FG)
                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         )));
-        for wrapped in wrap_notice(phase_one_safety_help_text(), notice_width) {
+        for wrapped in wrap_notice(safety_help_text(), notice_width) {
             lines.push(Line::from(Span::styled(
                 format!("  {wrapped}"),
                 Style::default().fg(FG_MUTED),
@@ -310,17 +310,17 @@ impl Widget for HelpOverlay {
     }
 }
 
-/// Phase 1 safety behavior summary shown in help/docs.
+/// Safety behavior summary shown in help/docs.
 ///
 /// Kept in sync with README.md and CHANGELOG.md by
-/// `phase_one_truth_gate_tests`.
-pub fn phase_one_safety_help_text() -> &'static str {
-    "Phase 1 safety: Live updates are temporarily unavailable while safety controls are tightened. Use manual refresh for table data. Bounded scoped Live will return later; broad automatic subscriptions are currently unavailable. Spreadsheet editing supports one-row spreadsheet Save only: changed cells in one row are saved as one guided WritePlan, and changing rows prompts Save, Discard, or Stay. Guided update/delete require declared primary keys and matching generations, with no unsafe override. Raw SQL is a separately labeled expert path; Raw SQL does not receive the guided CRUD guarantee and is never automatically retried. Unknown mutation outcomes are not automatically retried; refresh the affected scope before another guided attempt."
+/// `safety_truth_gate_tests`.
+pub fn safety_help_text() -> &'static str {
+    "Safety: Live updates are temporarily unavailable while safety controls are tightened. Use manual refresh for table data. Bounded scoped Live will return later; broad automatic subscriptions are currently unavailable. Spreadsheet editing supports one-row spreadsheet Save only: changed cells in one row are saved as one guided WritePlan, and changing rows prompts Save, Discard, or Stay. Guided update/delete require declared primary keys and matching generations, with no unsafe override. Raw SQL is a separately labeled expert path; Raw SQL does not receive the guided CRUD guarantee and is never automatically retried. Unknown mutation outcomes are not automatically retried; refresh the affected scope before another guided attempt."
 }
 
-/// Phase 2 help note: shortcuts, palette, and help share one command registry.
+/// Registry note: shortcuts, palette, and help share one command registry.
 #[allow(dead_code)]
-pub const PHASE2_HELP_NOTE: &str = "Phase 2: shortcuts, palette, and help share one command registry. The layout is unchanged until the workbench UX phase.";
+pub const REGISTRY_HELP_NOTE: &str = "Registry: shortcuts, palette, and help share one command registry. The layout is unchanged until future workbench UX work.";
 
 /// Word-wrap `text` to at most `width` columns, breaking on spaces.
 ///
@@ -351,12 +351,12 @@ fn wrap_notice(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-// ── Phase 2: registry-driven contextual help ─────────────────────────────────
+// ── Registry-driven contextual help ─────────────────────────────────
 
 use crate::app::command::{CommandContext, CommandRegistry, ContextualHelpLine};
 
 /// Generate contextual help lines from the command registry for the given
-/// context. Phase 3 UI will call this instead of the static binding list.
+/// context. Future UI will call this instead of the static binding list.
 #[allow(dead_code)]
 pub fn contextual_help_lines(context: &CommandContext) -> Vec<ContextualHelpLine> {
     CommandRegistry.contextual_help(context)
@@ -367,7 +367,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn total_lines_counts_the_phase_one_notice_section() {
+    fn total_lines_counts_the_safety_notice_section() {
         // Binding sections alone: header + bindings + trailing blank
         // per section.
         let bindings_only: usize = SECTIONS
@@ -375,20 +375,20 @@ mod tests {
             .map(|section| 1 + section.bindings.len() + 1)
             .sum();
 
-        // The overlay also renders the Phase 1 safety notice (header +
+        // The overlay also renders the Safety notice (header +
         // wrapped body + trailing blank line). total_lines() must count
         // it, otherwise app.rs clamps the scroll offset too low and the
         // last bindings become unreachable.
         assert!(
             HelpOverlay::total_lines() > bindings_only,
-            "total_lines() {} must exceed bindings-only {} to include the Phase 1 notice",
+            "total_lines() {} must exceed bindings-only {} to include the safety notice",
             HelpOverlay::total_lines(),
             bindings_only
         );
 
         // Upper-bound accounting: notice header + one line per word +
         // trailing blank, then the binding sections.
-        let notice_words = phase_one_safety_help_text().split_whitespace().count();
+        let notice_words = safety_help_text().split_whitespace().count();
         assert_eq!(HelpOverlay::total_lines(), bindings_only + notice_words + 2);
     }
 
@@ -426,15 +426,15 @@ mod tests {
 }
 
 #[cfg(test)]
-mod phase_one_truth_gate_tests {
+mod safety_truth_gate_tests {
     use super::*;
     use std::fs;
 
     #[test]
-    fn phase_one_behavior_claims_are_truthful_in_docs_and_help() {
+    fn safety_behavior_claims_are_truthful_in_docs_and_help() {
         let readme = fs::read_to_string("README.md").unwrap();
         let changelog = fs::read_to_string("CHANGELOG.md").unwrap();
-        let help = phase_one_safety_help_text();
+        let help = safety_help_text();
 
         for text in [&readme, &changelog, help] {
             assert!(text.contains("Live updates are temporarily unavailable"));

@@ -1,10 +1,10 @@
-// Phase 2/3 foundation: wired into production event loop in Phase 3.
+// Foundation: wired into production event loop in a future milestone.
 #![allow(dead_code)]
 
 //! Resource state: scoped resource data, `LoadState<T>`, and request tracking.
 //!
 //! This module owns typed resource payloads and the per-scope generation
-//! tracker. It reuses Phase 1 request types from
+//! tracker. It reuses request types from
 //! [`crate::effects::request`] and never redefines them.
 
 use std::collections::HashMap;

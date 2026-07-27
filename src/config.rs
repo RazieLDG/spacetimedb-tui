@@ -7,7 +7,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use clap::Parser;
 use serde::Deserialize;
 
@@ -523,7 +523,7 @@ impl Config {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2: source-preserving configuration resolution
+// Source-preserving configuration resolution
 // ---------------------------------------------------------------------------
 
 use clap::parser::ValueSource;
@@ -970,7 +970,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod phase2_config_tests {
+mod config_resolution_tests {
     use super::*;
     use clap::parser::ValueSource;
 

@@ -1,4 +1,4 @@
-// Phase 2/3 foundation: wired into production event loop in Phase 3.
+// Foundation: wired into production event loop in a future milestone.
 #![allow(dead_code)]
 
 //! Pure reducer: `reduce(&mut AppState, AppEvent) -> Transition`.
@@ -36,8 +36,8 @@ pub fn reduce(state: &mut AppState, event: AppEvent) -> Transition {
             if state.requests.is_current(&context) {
                 apply_scoped_read_failure(state, context, failure);
             }
-            // Phase 2 retains the typed retry identity on the event but does
-            // not schedule retries until Phase 4 installs retry policy.
+            // The typed retry identity is retained on the event but does
+            // but retries are not scheduled until retry policy is installed.
             Transition::none()
         }
         _ => Transition::none(),

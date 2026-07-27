@@ -1,4 +1,4 @@
-// Phase 2/3 foundation: wired into production event loop in Phase 3.
+// Foundation: wired into production event loop in a future milestone.
 #![allow(dead_code)]
 
 //! Shared command availability and safety policy helpers.
@@ -10,7 +10,7 @@
 use crate::app::command::{Availability, CommandContext, CommandId, CommandRegistry, FocusContext};
 use crate::state::app_state::AppState;
 
-/// Phase 2 does not change the visible layout.
+/// The current milestone does not change the visible layout.
 pub const PHASE2_LAYOUT_CHANGE_ALLOWED: bool = false;
 
 pub fn focus_context_from_pane(pane: crate::state::workbench::WorkbenchPane) -> FocusContext {
@@ -53,7 +53,7 @@ mod tests {
     use crate::app::command::DisabledReason;
 
     #[test]
-    fn command_context_maps_from_single_phase2_state_owners() {
+    fn command_context_maps_from_single_state_owners() {
         let mut state = AppState::new("http://localhost:3000".to_string());
         state.navigation.active_database = Some("inventory".to_string());
         state.workbench.focused_pane = crate::state::workbench::WorkbenchPane::Workspace;
@@ -67,7 +67,7 @@ mod tests {
     }
 
     #[test]
-    fn toggle_live_remains_disabled_until_phase4_capability_probe() {
+    fn toggle_live_remains_disabled_until_capability_probe() {
         let mut state = AppState::new("http://localhost:3000".to_string());
         state.navigation.active_database = Some("inventory".to_string());
         state.navigation.active_resource = Some("items".to_string());

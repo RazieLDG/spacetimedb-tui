@@ -981,7 +981,7 @@ impl App {
     /// Note: `SchemaLoaded`/`SchemaError` and `TableBrowseResult`/`TableBrowseError`
     /// still use their own `SchemaRequestContext`/`TableBrowseRequestContext` with
     /// generation-snapshot matching. Unifying them under this `RequestContext`
-    /// system is tracked as Phase 2 tech debt.
+    /// system is tracked as tech debt.
     fn apply_result_if_current(
         &mut self,
         delivered: &crate::effects::request::RequestContext,
@@ -4752,7 +4752,7 @@ impl App {
                 self.load_schema().await;
             }
             Tab::Live => {
-                // Phase 1: Live subscriptions are disabled. Manual refresh
+                // Live subscriptions are disabled. Manual refresh
                 // forces an immediate metadata poll of `st_client`.
                 self.last_live_clients_fetch = None;
                 self.maybe_refresh_live_clients();
@@ -4903,7 +4903,7 @@ impl App {
                 self.state.ws_connected = true;
                 self.state.ws_reconnect_deadline = None;
                 self.state.ws_reconnect_attempt = 0;
-                // Phase 1: no automatic all-table subscription. The Live
+                // No automatic all-table subscription. The Live
                 // tab shows a disabled notice; bounded scoped Live will
                 // return later.
             }

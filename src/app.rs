@@ -62,7 +62,10 @@ const TICK_RATE: Duration = Duration::from_millis(200);
 #[derive(Debug)]
 pub enum AppEvent {
     /// Databases list fetched.
-    DatabasesLoaded(Vec<String>),
+    DatabasesLoaded {
+        context: crate::effects::request::RequestContext,
+        databases: Vec<String>,
+    },
     /// Tables / schema fetched for the selected database.
     SchemaLoaded {
         context: SchemaRequestContext,
@@ -77,6 +80,7 @@ pub enum AppEvent {
     },
     /// SQL query result arrived (user-typed SQL in the SQL console tab).
     QueryResult {
+        context: crate::effects::request::RequestContext,
         result: crate::api::types::QueryResult,
         duration: Duration,
         sql: String,
@@ -94,13 +98,26 @@ pub enum AppEvent {
         error: String,
     },
     /// SQL query failed.
-    QueryError { sql: String, error: String },
+    QueryError {
+        context: crate::effects::request::RequestContext,
+        sql: String,
+        error: String,
+    },
     /// Log lines fetched.
-    LogsLoaded(Vec<crate::api::types::LogEntry>),
+    LogsLoaded {
+        context: crate::effects::request::RequestContext,
+        logs: Vec<crate::api::types::LogEntry>,
+    },
     /// Metrics fetched.
-    MetricsLoaded(crate::state::MetricsSnapshot),
+    MetricsLoaded {
+        context: crate::effects::request::RequestContext,
+        snapshot: crate::state::MetricsSnapshot,
+    },
     /// Live tab's periodic `st_client` poll returned.
-    LiveClientsLoaded(Vec<crate::state::app_state::LiveClientEntry>),
+    LiveClientsLoaded {
+        context: crate::effects::request::RequestContext,
+        clients: Vec<crate::state::app_state::LiveClientEntry>,
+    },
     /// A reducer call (or write-SQL exec) finished successfully.
     /// `op` is a short human label like `call insert_user` or
     /// `delete row from users` so we can surface it in the status bar
@@ -372,6 +389,15 @@ pub struct App {
     table_generation: u64,
     server_context_generation: u64,
     database_generation: u64,
+    /// Monotonically increasing request identifier for async read results.
+    next_request_id: u64,
+    /// The most recent `RequestContext` issued for each scope. A delivered
+    /// result is applied only if it matches the latest context for its scope.
+    latest_requests:
+        HashMap<crate::effects::request::RequestScope, crate::effects::request::RequestContext>,
+    /// Count of stale results that were silently dropped. Useful for debugging
+    /// and observability.
+    ignored_stale_results: u64,
 }
 
 /// How often the Metrics tab automatically refreshes server-side metrics.
@@ -424,6 +450,9 @@ impl App {
             table_generation: 0,
             server_context_generation: 0,
             database_generation: 0,
+            next_request_id: 0,
+            latest_requests: HashMap::new(),
+            ignored_stale_results: 0,
             user_config: config.user_config.clone(),
             pending_session: if config.user_config.restore_session {
                 Some(crate::user_config::SessionState::load())
@@ -888,6 +917,63 @@ impl App {
         }
     }
 
+    /// Issue a fresh `RequestContext` for the given scope.
+    ///
+    /// Each call bumps both the global request id and the per-scope generation,
+    /// then records the context as the latest for that scope. A later call with
+    /// the same scope supersedes the previous one, so any response carrying the
+    /// old context will be rejected by [`Self::apply_result_if_current`].
+    fn next_request_context(
+        &mut self,
+        scope: crate::effects::request::RequestScope,
+    ) -> crate::effects::request::RequestContext {
+        self.next_request_id = self.next_request_id.saturating_add(1);
+        let generation = self
+            .latest_requests
+            .get(&scope)
+            .map(|current| current.generation.saturating_add(1))
+            .unwrap_or(1);
+        let context = crate::effects::request::RequestContext::new(
+            crate::effects::request::RequestId::from_u64(self.next_request_id),
+            scope,
+            generation,
+        );
+        self.latest_requests
+            .insert(context.scope().clone(), context.clone());
+        context
+    }
+
+    /// Return `true` if `delivered` is still the latest context for its scope.
+    fn should_apply_result(
+        latest: &HashMap<
+            crate::effects::request::RequestScope,
+            crate::effects::request::RequestContext,
+        >,
+        delivered: &crate::effects::request::RequestContext,
+    ) -> bool {
+        latest
+            .get(delivered.scope())
+            .is_some_and(|current| current.accepts(delivered))
+    }
+
+    /// Apply a delivered result only if it matches the latest issued context
+    /// for its scope. Stale results are silently counted and dropped.
+    ///
+    /// Note: `SchemaLoaded`/`SchemaError` and `TableBrowseResult`/`TableBrowseError`
+    /// still use their own `SchemaRequestContext`/`TableBrowseRequestContext` with
+    /// generation-snapshot matching. Unifying them under this `RequestContext`
+    /// system is tracked as Phase 2 tech debt.
+    fn apply_result_if_current(
+        &mut self,
+        delivered: &crate::effects::request::RequestContext,
+    ) -> bool {
+        let should_apply = Self::should_apply_result(&self.latest_requests, delivered);
+        if !should_apply {
+            self.ignored_stale_results = self.ignored_stale_results.saturating_add(1);
+        }
+        should_apply
+    }
+
     fn current_table_browse_request_context(
         &self,
         database: String,
@@ -1036,6 +1122,8 @@ impl App {
         self.state.connection.status = ConnectionStatus::Connecting;
         let client = self.client.clone();
         let tx = self.event_tx.clone();
+        let context =
+            self.next_request_context(crate::effects::request::RequestScope::DatabaseCatalog);
 
         tokio::spawn(async move {
             let ping_ok = matches!(
@@ -1047,7 +1135,13 @@ impl App {
                 return;
             }
             match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.list_databases()).await {
-                Ok(Ok(dbs)) => send_event(&tx, AppEvent::DatabasesLoaded(dbs)),
+                Ok(Ok(dbs)) => send_event(
+                    &tx,
+                    AppEvent::DatabasesLoaded {
+                        context,
+                        databases: dbs,
+                    },
+                ),
                 Ok(Err(e)) => send_event(&tx, AppEvent::Error(format!("list_databases: {e:#}"))),
                 Err(_) => send_event(
                     &tx,
@@ -1155,6 +1249,10 @@ impl App {
 
         let client = self.client.clone();
         let tx = self.event_tx.clone();
+        let context =
+            self.next_request_context(crate::effects::request::RequestScope::LiveClients {
+                database: db.clone(),
+            });
         tokio::spawn(async move {
             // `st_client` is a system table; we cap the result so a
             // huge production deployment doesn't hang the UI.
@@ -1186,7 +1284,7 @@ impl App {
                     }
                 })
                 .collect();
-            send_event(&tx, AppEvent::LiveClientsLoaded(clients));
+            send_event(&tx, AppEvent::LiveClientsLoaded { context, clients });
         });
     }
 
@@ -1208,12 +1306,13 @@ impl App {
 
         let client = self.client.clone();
         let tx = self.event_tx.clone();
+        let context = self.next_request_context(crate::effects::request::RequestScope::Metrics);
         tokio::spawn(async move {
             if let Ok(Ok(text)) =
                 tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.get_metrics()).await
             {
                 let snapshot = parse_prometheus_metrics(&text);
-                send_event(&tx, AppEvent::MetricsLoaded(snapshot));
+                send_event(&tx, AppEvent::MetricsLoaded { context, snapshot });
             }
         });
     }
@@ -4144,9 +4243,18 @@ impl App {
     /// success we re-fetch the database list so any new alias
     /// shows up in the sidebar immediately, and re-pull the name
     /// list for the currently selected DB.
-    fn spawn_add_alias(&self, database: String, alias: String, op_label: String) {
+    ///
+    /// The `DatabaseCatalog` context is issued eagerly so that any
+    /// earlier in-flight catalog fetch is superseded. If the alias
+    /// operation fails, no `DatabasesLoaded` event is sent and the
+    /// consumed context acts as an intentional cancellation: the
+    /// previous in-flight result is dropped rather than applied
+    /// against potentially changed state.
+    fn spawn_add_alias(&mut self, database: String, alias: String, op_label: String) {
         let client = self.client.clone();
         let tx = self.event_tx.clone();
+        let context =
+            self.next_request_context(crate::effects::request::RequestScope::DatabaseCatalog);
         tokio::spawn(async move {
             match tokio::time::timeout(
                 HTTP_REQUEST_TIMEOUT,
@@ -4170,7 +4278,13 @@ impl App {
                     if let Ok(Ok(dbs)) =
                         tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.list_databases()).await
                     {
-                        send_event(&tx, AppEvent::DatabasesLoaded(dbs));
+                        send_event(
+                            &tx,
+                            AppEvent::DatabasesLoaded {
+                                context,
+                                databases: dbs,
+                            },
+                        );
                     }
                 }
                 Ok(Err(e)) => send_event(
@@ -4194,9 +4308,18 @@ impl App {
     /// Run `client.delete_database` on a background task. On success
     /// re-bootstraps the database list so the now-deleted entry
     /// disappears from the sidebar without a manual refresh.
-    fn spawn_delete_database(&self, database: String, op_label: String) {
+    ///
+    /// The `DatabaseCatalog` context is issued eagerly so that any
+    /// earlier in-flight catalog fetch is superseded. If the delete
+    /// operation fails, no `DatabasesLoaded` event is sent and the
+    /// consumed context acts as an intentional cancellation: the
+    /// previous in-flight result is dropped rather than applied
+    /// against potentially changed state.
+    fn spawn_delete_database(&mut self, database: String, op_label: String) {
         let client = self.client.clone();
         let tx = self.event_tx.clone();
+        let context =
+            self.next_request_context(crate::effects::request::RequestScope::DatabaseCatalog);
         tokio::spawn(async move {
             match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.delete_database(&database))
                 .await
@@ -4216,7 +4339,13 @@ impl App {
                     if let Ok(Ok(dbs)) =
                         tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.list_databases()).await
                     {
-                        send_event(&tx, AppEvent::DatabasesLoaded(dbs))
+                        send_event(
+                            &tx,
+                            AppEvent::DatabasesLoaded {
+                                context,
+                                databases: dbs,
+                            },
+                        )
                     }
                 }
                 Ok(Err(e)) => send_event(
@@ -4510,6 +4639,11 @@ impl App {
         let tx = self.event_tx.clone();
         let start = Instant::now();
         let sql_clone = sql.clone();
+        let context =
+            self.next_request_context(crate::effects::request::RequestScope::SqlWorkspace {
+                database: db.clone(),
+                workspace: "main".to_string(),
+            });
 
         tokio::spawn(async move {
             let outcome =
@@ -4518,6 +4652,7 @@ impl App {
                 Ok(Ok(result)) => send_event(
                     &tx,
                     AppEvent::QueryResult {
+                        context,
                         result,
                         duration: start.elapsed(),
                         sql: sql_clone,
@@ -4526,6 +4661,7 @@ impl App {
                 Ok(Err(e)) => send_event(
                     &tx,
                     AppEvent::QueryError {
+                        context,
                         sql: sql_clone,
                         error: format!("{e:#}"),
                     },
@@ -4533,6 +4669,7 @@ impl App {
                 Err(_) => send_event(
                     &tx,
                     AppEvent::QueryError {
+                        context,
                         sql: sql_clone,
                         error: "SQL query timed out".to_string(),
                     },
@@ -4567,12 +4704,14 @@ impl App {
             Tab::Metrics => {
                 let client = self.client.clone();
                 let tx = self.event_tx.clone();
+                let context =
+                    self.next_request_context(crate::effects::request::RequestScope::Metrics);
                 tokio::spawn(async move {
                     if let Ok(Ok(text)) =
                         tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.get_metrics()).await
                     {
                         let snapshot = parse_prometheus_metrics(&text);
-                        send_event(&tx, AppEvent::MetricsLoaded(snapshot));
+                        send_event(&tx, AppEvent::MetricsLoaded { context, snapshot });
                     }
                     let ok = matches!(
                         tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.ping()).await,
@@ -4600,10 +4739,13 @@ impl App {
         };
         let client = self.client.clone();
         let tx = self.event_tx.clone();
+        let context = self.next_request_context(crate::effects::request::RequestScope::Logs {
+            database: db.clone(),
+        });
         tokio::spawn(async move {
             match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, client.get_logs(&db, 500, false)).await
             {
-                Ok(Ok(logs)) => send_event(&tx, AppEvent::LogsLoaded(logs)),
+                Ok(Ok(logs)) => send_event(&tx, AppEvent::LogsLoaded { context, logs }),
                 Ok(Err(e)) => send_event(&tx, AppEvent::Error(format!("Logs fetch failed: {e:#}"))),
                 Err(_) => send_event(&tx, AppEvent::Error("Logs fetch timed out".to_string())),
             }
@@ -4837,7 +4979,13 @@ impl App {
                 }
             }
 
-            AppEvent::DatabasesLoaded(dbs) => {
+            AppEvent::DatabasesLoaded {
+                context,
+                databases: dbs,
+            } => {
+                if !self.apply_result_if_current(&context) {
+                    return;
+                }
                 self.state.connection.status = ConnectionStatus::Connected;
                 // Preserve any pre-selected DB
                 let existing: Vec<_> = self.state.databases.drain(..).collect();
@@ -4931,10 +5079,14 @@ impl App {
             }
 
             AppEvent::QueryResult {
+                context,
                 result,
                 duration,
                 sql,
             } => {
+                if !self.apply_result_if_current(&context) {
+                    return;
+                }
                 self.state.query_loading = false;
                 let row_count = result.row_count();
                 self.state.query_result = Some(result);
@@ -4955,7 +5107,14 @@ impl App {
                 self.flush_deferred_guided_refresh_if_unowned().await;
             }
 
-            AppEvent::QueryError { sql, error } => {
+            AppEvent::QueryError {
+                context,
+                sql,
+                error,
+            } => {
+                if !self.apply_result_if_current(&context) {
+                    return;
+                }
                 self.state.query_loading = false;
                 self.state.push_sql_history(SqlHistoryEntry {
                     sql,
@@ -4992,16 +5151,25 @@ impl App {
                 self.flush_deferred_guided_refresh_if_unowned().await;
             }
 
-            AppEvent::LogsLoaded(logs) => {
+            AppEvent::LogsLoaded { context, logs } => {
+                if !self.apply_result_if_current(&context) {
+                    return;
+                }
                 self.state.extend_logs(logs);
                 self.state.set_notification("Logs refreshed".to_string());
             }
 
-            AppEvent::MetricsLoaded(snapshot) => {
+            AppEvent::MetricsLoaded { context, snapshot } => {
+                if !self.apply_result_if_current(&context) {
+                    return;
+                }
                 self.state.update_metrics(snapshot);
             }
 
-            AppEvent::LiveClientsLoaded(clients) => {
+            AppEvent::LiveClientsLoaded { context, clients } => {
+                if !self.apply_result_if_current(&context) {
+                    return;
+                }
                 self.state.live_clients = clients;
             }
 
@@ -6738,6 +6906,214 @@ mod modal_helper_tests {
         ));
     }
 
+    /// Issue a context for `scope`, then immediately supersede it by issuing
+    /// another context for the same scope. Returns the now-stale first context.
+    fn stale_context_for(
+        app: &mut App,
+        scope: crate::effects::request::RequestScope,
+    ) -> crate::effects::request::RequestContext {
+        let stale = app.next_request_context(scope.clone());
+        let _current = app.next_request_context(scope);
+        stale
+    }
+
+    #[tokio::test]
+    async fn stale_query_result_from_superseded_request_is_rejected() {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        app.state.query_loading = true;
+
+        let stale = stale_context_for(
+            &mut app,
+            crate::effects::request::RequestScope::SqlWorkspace {
+                database: "db".to_string(),
+                workspace: "main".to_string(),
+            },
+        );
+
+        app.handle_app_event(AppEvent::QueryResult {
+            context: stale,
+            result: query_result("from old request"),
+            duration: Duration::from_millis(5),
+            sql: "SELECT * FROM secrets".to_string(),
+        })
+        .await;
+
+        assert!(
+            app.state.query_result.is_none(),
+            "a superseded query result must not replace current state"
+        );
+        assert!(
+            app.state.query_loading,
+            "a superseded query result must not clear the loading flag"
+        );
+        assert_eq!(app.ignored_stale_results, 1);
+    }
+
+    #[tokio::test]
+    async fn stale_query_error_does_not_clear_newer_query_loading() {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        app.state.query_loading = true;
+
+        let stale = stale_context_for(
+            &mut app,
+            crate::effects::request::RequestScope::SqlWorkspace {
+                database: "db".to_string(),
+                workspace: "main".to_string(),
+            },
+        );
+
+        app.handle_app_event(AppEvent::QueryError {
+            context: stale,
+            sql: "SELECT 1".to_string(),
+            error: "old query failed".to_string(),
+        })
+        .await;
+
+        assert!(
+            app.state.query_loading,
+            "a superseded query error must not clear the newer query's loading flag"
+        );
+        assert!(
+            app.state.error_message.is_none(),
+            "a superseded query error must not raise a misleading error"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_logs_from_superseded_request_are_rejected() {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+
+        let stale = stale_context_for(
+            &mut app,
+            crate::effects::request::RequestScope::Logs {
+                database: "db".to_string(),
+            },
+        );
+
+        app.handle_app_event(AppEvent::LogsLoaded {
+            context: stale,
+            logs: vec![crate::api::types::LogEntry {
+                ts: None,
+                level: crate::api::types::LogLevel::Info,
+                message: "secret log from old request".to_string(),
+                target: Some("old".to_string()),
+                filename: None,
+                line_number: None,
+            }],
+        })
+        .await;
+
+        assert!(
+            app.state.log_buffer.is_empty(),
+            "logs from a superseded request must not be shown"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_live_clients_from_superseded_request_are_rejected() {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+
+        let stale = stale_context_for(
+            &mut app,
+            crate::effects::request::RequestScope::LiveClients {
+                database: "db".to_string(),
+            },
+        );
+
+        app.handle_app_event(AppEvent::LiveClientsLoaded {
+            context: stale,
+            clients: vec![crate::state::app_state::LiveClientEntry {
+                identity: "ghost-client".to_string(),
+                connected_at: None,
+            }],
+        })
+        .await;
+
+        assert!(
+            app.state.live_clients.is_empty(),
+            "live clients from a superseded request must not be shown"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_metrics_from_superseded_request_are_rejected() {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+
+        let stale = stale_context_for(&mut app, crate::effects::request::RequestScope::Metrics);
+
+        app.handle_app_event(AppEvent::MetricsLoaded {
+            context: stale,
+            snapshot: crate::state::MetricsSnapshot::default(),
+        })
+        .await;
+
+        assert!(
+            app.state.metrics_history.is_empty(),
+            "metrics from a superseded request must not be applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_databases_loaded_from_superseded_request_is_rejected() {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        app.state.databases = vec!["db".to_string()];
+        app.state.selected_database_idx = Some(0);
+
+        let stale = stale_context_for(
+            &mut app,
+            crate::effects::request::RequestScope::DatabaseCatalog,
+        );
+
+        app.handle_app_event(AppEvent::DatabasesLoaded {
+            context: stale,
+            databases: vec!["db".to_string(), "ghost".to_string()],
+        })
+        .await;
+
+        assert_eq!(
+            app.state.databases,
+            vec!["db".to_string()],
+            "a superseded database list must not replace the current one"
+        );
+    }
+
+    #[tokio::test]
+    async fn matching_context_query_result_is_accepted() {
+        let mut app = spreadsheet_app();
+        app.state.edit_mode = None;
+        app.state.query_loading = true;
+
+        let context =
+            app.next_request_context(crate::effects::request::RequestScope::SqlWorkspace {
+                database: "db".to_string(),
+                workspace: "main".to_string(),
+            });
+
+        app.handle_app_event(AppEvent::QueryResult {
+            context,
+            result: query_result("current"),
+            duration: Duration::from_millis(3),
+            sql: "SELECT 1".to_string(),
+        })
+        .await;
+
+        assert!(
+            app.state.query_result.is_some(),
+            "a matching query result must be accepted"
+        );
+        assert!(
+            !app.state.query_loading,
+            "a matching query result must clear the loading flag"
+        );
+        assert_eq!(app.ignored_stale_results, 0);
+    }
+
     #[tokio::test]
     async fn stale_barrier_retires_with_its_generation_so_a_dropped_reload_cannot_trap_the_user() {
         let mut app = spreadsheet_app();
@@ -7393,8 +7769,14 @@ mod modal_helper_tests {
         app.state.query_loading = true;
         queue_users_refresh(&mut app);
         let generation_before = app.table_generation;
+        let context =
+            app.next_request_context(crate::effects::request::RequestScope::SqlWorkspace {
+                database: "db".to_string(),
+                workspace: "main".to_string(),
+            });
 
         app.handle_app_event(AppEvent::QueryResult {
+            context: context.clone(),
             result: query_result("sql"),
             duration: Duration::from_millis(3),
             sql: "SELECT 1".to_string(),
@@ -7410,6 +7792,7 @@ mod modal_helper_tests {
         assert_no_extra_table_refresh(&mut app);
 
         app.handle_app_event(AppEvent::QueryResult {
+            context,
             result: query_result("duplicate"),
             duration: Duration::from_millis(1),
             sql: "SELECT 2".to_string(),
@@ -7426,8 +7809,14 @@ mod modal_helper_tests {
         app.state.query_loading = true;
         queue_users_refresh(&mut app);
         let generation_before = app.table_generation;
+        let context =
+            app.next_request_context(crate::effects::request::RequestScope::SqlWorkspace {
+                database: "db".to_string(),
+                workspace: "main".to_string(),
+            });
 
         app.handle_app_event(AppEvent::QueryError {
+            context: context.clone(),
             sql: "SELECT bad".to_string(),
             error: "boom".to_string(),
         })
@@ -7442,6 +7831,7 @@ mod modal_helper_tests {
         assert_no_extra_table_refresh(&mut app);
 
         app.handle_app_event(AppEvent::QueryError {
+            context,
             sql: "SELECT bad again".to_string(),
             error: "boom again".to_string(),
         })

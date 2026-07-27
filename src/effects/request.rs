@@ -31,12 +31,26 @@ pub enum RequestScope {
     Logs {
         database: String,
     },
-    Metrics {
-        database: String,
-    },
+    Metrics,
     LiveClients {
         database: String,
     },
+}
+
+impl RequestScope {
+    /// The database this scope is bound to, if any.
+    ///
+    /// `DatabaseCatalog` is server-global and has no database binding.
+    pub fn database(&self) -> Option<&str> {
+        match self {
+            Self::DatabaseCatalog | Self::Metrics => None,
+            Self::Schema { database }
+            | Self::TableRows { database, .. }
+            | Self::SqlWorkspace { database, .. }
+            | Self::Logs { database }
+            | Self::LiveClients { database } => Some(database),
+        }
+    }
 }
 
 impl fmt::Display for RequestScope {
@@ -47,7 +61,7 @@ impl fmt::Display for RequestScope {
             Self::TableRows { .. } => "table rows",
             Self::SqlWorkspace { .. } => "SQL workspace",
             Self::Logs { .. } => "logs",
-            Self::Metrics { .. } => "metrics",
+            Self::Metrics => "metrics",
             Self::LiveClients { .. } => "live clients",
         };
         f.write_str(label)
@@ -74,6 +88,12 @@ impl RequestContext {
         &self.scope
     }
 
+    /// Return `true` if `delivered` is the exact context that was issued.
+    ///
+    /// All three fields are checked jointly: `id` is globally unique under
+    /// normal operation (monotonic counter), while `scope` and `generation`
+    /// provide defense-in-depth against counter overflow (`saturating_add`
+    /// at `u64::MAX`) and make the invariant self-documenting at call sites.
     pub fn accepts(&self, delivered: &RequestContext) -> bool {
         self.id == delivered.id
             && self.scope == delivered.scope
@@ -138,9 +158,7 @@ mod tests {
             RequestScope::Logs {
                 database: "db".into(),
             },
-            RequestScope::Metrics {
-                database: "db".into(),
-            },
+            RequestScope::Metrics,
             RequestScope::LiveClients {
                 database: "db".into(),
             },
@@ -208,13 +226,7 @@ mod tests {
             .to_string(),
             "logs"
         );
-        assert_eq!(
-            RequestScope::Metrics {
-                database: "secret-db".into()
-            }
-            .to_string(),
-            "metrics"
-        );
+        assert_eq!(RequestScope::Metrics.to_string(), "metrics");
         assert_eq!(
             RequestScope::LiveClients {
                 database: "secret-db".into()

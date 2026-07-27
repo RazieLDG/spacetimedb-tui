@@ -104,7 +104,7 @@ impl UserConfig {
 
 /// Snapshot of the last UI state, written on quit and reloaded on
 /// next launch (when `UserConfig.restore_session` is enabled).
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct SessionState {
     /// Last selected database (name or hex identity).
     #[serde(default)]

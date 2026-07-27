@@ -10,6 +10,9 @@
 /// 4. Loops until `app_state.should_quit` is set.
 
 pub mod command;
+pub mod event;
+pub mod policy;
+pub mod reducer;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -17,7 +20,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self as ct_event, Event, KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::mpsc;
 
 use ratatui::widgets::Widget;
@@ -1191,8 +1194,8 @@ impl App {
                 .context("Terminal draw failed")?;
 
             // Poll for crossterm events (non-blocking, timeout = TICK_RATE)
-            if event::poll(TICK_RATE).context("event::poll failed")? {
-                match event::read().context("event::read failed")? {
+            if ct_event::poll(TICK_RATE).context("ct_event::poll failed")? {
+                match ct_event::read().context("ct_event::read failed")? {
                     Event::Key(key) => {
                         self.handle_key(key).await;
                     }

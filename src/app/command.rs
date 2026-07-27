@@ -504,6 +504,16 @@ impl CommandRegistry {
 }
 
 // ---------------------------------------------------------------------------
+// Shared action bridge
+// ---------------------------------------------------------------------------
+
+/// Create the shared `Action::Invoke` for a command. Keyboard, palette, help,
+/// and mouse adapters all call this or produce the identical value.
+pub fn invoke(id: CommandId) -> crate::app::event::Action {
+    crate::app::event::Action::Invoke(id)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

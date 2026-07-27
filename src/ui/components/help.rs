@@ -318,6 +318,9 @@ pub fn phase_one_safety_help_text() -> &'static str {
     "Phase 1 safety: Live updates are temporarily unavailable while safety controls are tightened. Use manual refresh for table data. Bounded scoped Live will return later; broad automatic subscriptions are currently unavailable. Spreadsheet editing supports one-row spreadsheet Save only: changed cells in one row are saved as one guided WritePlan, and changing rows prompts Save, Discard, or Stay. Guided update/delete require declared primary keys and matching generations, with no unsafe override. Raw SQL is a separately labeled expert path; Raw SQL does not receive the guided CRUD guarantee and is never automatically retried. Unknown mutation outcomes are not automatically retried; refresh the affected scope before another guided attempt."
 }
 
+/// Phase 2 help note: shortcuts, palette, and help share one command registry.
+pub const PHASE2_HELP_NOTE: &str = "Phase 2: shortcuts, palette, and help share one command registry. The layout is unchanged until the workbench UX phase.";
+
 /// Word-wrap `text` to at most `width` columns, breaking on spaces.
 ///
 /// A `width` of 0 yields a single line containing the whole text (the

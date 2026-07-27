@@ -56,6 +56,10 @@ Live updates are temporarily unavailable while safety controls are tightened. Us
 
 Phase 1 release validation requires formatting, warning-denied Clippy, all tests with the 127-test baseline plus Phase 1 additions, and a release build before the phase is called complete.
 
+### Phase 2 foundation
+
+The Phase 2 foundation adds a typed command registry, shared command availability policy, normalized reducer/effect boundaries, bounded AppEvent delivery, source-preserving configuration resolution, and central ownership for navigation, resource, workbench, activity, and safety state. The visible layout is unchanged in Phase 2. DATA, OBSERVE, OPERATE workbench surfaces are prepared in state and command metadata, but the full contextual workbench layout ships in a later phase.
+
 ### Admin
 
 | Feature | Description |

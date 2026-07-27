@@ -732,4 +732,24 @@ mod tests {
                 && line.disabled_reason == Some(DisabledReason::NoActiveResource)
         }));
     }
+
+    #[test]
+    fn phase2_command_descriptions_do_not_claim_new_layout() {
+        let registry = CommandRegistry::default();
+        let forbidden = [
+            "Explorer",
+            "Inspector drawer",
+            "DATA OBSERVE OPERATE layout is live",
+        ];
+
+        for line in registry.help_lines() {
+            for phrase in forbidden {
+                assert!(
+                    !line.description.contains(phrase),
+                    "{phrase} appeared in {:?}",
+                    line
+                );
+            }
+        }
+    }
 }

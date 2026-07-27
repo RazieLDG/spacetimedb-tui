@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Phase 2 foundation
+
+- Added the typed command registry used by keyboard shortcuts, palette entries, contextual help, and future mouse actions.
+- Added reducer and effect boundaries with deterministic runtime ports for tests.
+- Centralized navigation, resource, workbench, activity, and safety state under one `AppState` owner with no second mutable state owner.
+- Normalized configuration provenance so explicit CLI values win over environment and lower sources, including `--no-tls` and custom theme strings.
+- restore_session defaults to true for missing and partial user configuration.
+- The layout is unchanged in Phase 2. Full contextual workbench panes remain a later phase.
+
 ### Changed
 
 - Live updates are temporarily unavailable while safety controls are tightened. Use manual refresh for table data. Bounded scoped Live will return later; broad automatic subscriptions are currently unavailable.

@@ -2,7 +2,7 @@
 
 > **A blazing-fast, keyboard-driven terminal UI for managing, querying, editing, and monitoring SpacetimeDB 2.0 — right from your shell.**
 
-Browse databases, run SQL, stream live transactions, edit rows in a spreadsheet, call reducers, and manage aliases — all with Vim-style key bindings and a command palette.
+Browse databases, run SQL, edit rows in a spreadsheet, call reducers, and manage aliases — all with Vim-style key bindings and a command palette. (Live transaction streaming is temporarily disabled while Phase 1 safety controls are tightened; see [Phase 1 safety behavior](#phase-1-safety-behavior).)
 
 [![CI](https://github.com/RazieLDG/spacetimedb-tui/actions/workflows/ci.yml/badge.svg)](https://github.com/RazieLDG/spacetimedb-tui/actions/workflows/ci.yml)
 [![Release](https://github.com/RazieLDG/spacetimedb-tui/actions/workflows/release.yml/badge.svg)](https://github.com/RazieLDG/spacetimedb-tui/actions/workflows/release.yml)
@@ -37,7 +37,7 @@ Browse databases, run SQL, stream live transactions, edit rows in a spreadsheet,
 | 📜 **Log Viewer** | Tail structured logs with level filtering (`f` cycles `Trace` → `Panic`), pause/resume (`Space`), and a live `visible / total` counter. Tolerates both RFC 3339 and u64-microsecond timestamps. |
 | 📈 **Metrics Dashboard** | Per-tick **delta sparklines** (not cumulative ramps) for reducer calls and energy use, plus stat cards for clients / tables / reducer count / memory. Auto-refresh every 10s while visible. |
 | 🔬 **Module Inspector** | Browse reducers with full parameter signatures, user tables, system tables, and columns. |
-| ⚡ **Live Tab** | Real-time transaction feed driven by the WebSocket subscription, split 2/3 : 1/3 with a connected-client list polled from `st_client` every 10s. Status bar shows `● LIVE` / `◌ reconnect in Ns`. |
+| ⚡ **Live Tab** | Live updates are temporarily unavailable while safety controls are tightened. The tab shows a disabled notice and a connected-client list polled from `st_client` every 10s; use manual refresh for table data. Bounded scoped Live will return later. |
 
 ### Write
 
@@ -49,6 +49,10 @@ Browse databases, run SQL, stream live transactions, edit rows in a spreadsheet,
 | 🗑️ **Row Delete** | `d` opens a y/n confirm showing the exact `DELETE FROM … WHERE pk = …` statement that will run. |
 | 📝 **Spreadsheet Edit Mode** | `Ctrl+E` enters a cell-by-cell editor on the Tables tab. Move with `h`/`j`/`k`/`l`, `Enter` to open an inline input, `Enter` to stage edits for one typed dirty row, `s` to save that row through one guided WritePlan/update confirmation, `u` to revert, `Esc` to exit (with a discard prompt if pending > 0). Edits on a different row ask Save / Discard / Stay; multi-row Save All is unavailable. |
 | 💾 **Clipboard + Export** | `y` copies the cell, `Y` copies the row as TSV (via OSC 52, no external dep). `e` exports to CSV, `E` exports to JSON under `./exports/`. |
+
+### Phase 1 safety behavior
+
+Live updates are temporarily unavailable while safety controls are tightened. Use manual refresh for table data. Bounded scoped Live will return later; broad automatic subscriptions are currently unavailable. Spreadsheet editing supports one-row spreadsheet Save: multiple changed cells in one row are saved as one guided write, while moving to another row prompts Save, Discard, or Stay. Guided update/delete require declared primary keys and matching generations, with no unsafe override. Raw SQL is a separately labeled expert path; Raw SQL does not receive the guided CRUD guarantee and is never automatically retried. Unknown mutation outcomes are not automatically retried; refresh the affected scope before another guided attempt.
 
 ### Admin
 
@@ -386,7 +390,7 @@ Built and tested against **SpacetimeDB 2.0** HTTP + WebSocket APIs.
 | Add alias | `POST /v1/database/{db}/names` |
 | Delete database | `DELETE /v1/database/{db}` |
 | Log streaming | `GET /v1/database/{db}/logs` |
-| Live subscription | `GET /v1/database/{db}/subscribe` (WebSocket) |
+| Live subscription | `GET /v1/database/{db}/subscribe` (WebSocket) — **temporarily disabled in Phase 1**; manual refresh is used instead |
 | Metrics | `GET /metrics` (Prometheus format) |
 
 ### WebSocket Subprotocol

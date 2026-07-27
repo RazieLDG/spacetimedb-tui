@@ -20,6 +20,7 @@ use crate::state::{AppState, FocusPanel};
 use crate::ui::components::input::{InputState, InputWidget};
 use crate::ui::components::table_grid::{render_empty, TableGrid, TableGridState};
 use crate::ui::tabs::tables::value_to_display;
+use crate::ui::text::truncate_display_width;
 
 fn rgb((r, g, b): (u8, u8, u8)) -> Color {
     Color::Rgb(r, g, b)
@@ -177,7 +178,7 @@ fn render_history(area: Rect, buf: &mut Buffer, app: &AppState) {
         );
         let dur_span = Span::styled(format!("[{dur}] "), Style::default().fg(fg_muted).bg(bg));
         let sql_span = Span::styled(
-            truncate_str(&entry.sql, inner.width as usize - 20),
+            truncate_display_width(&entry.sql, inner.width.saturating_sub(20) as usize),
             Style::default()
                 .fg(fg_primary)
                 .bg(bg)
@@ -263,13 +264,5 @@ fn format_micros(us: u64) -> String {
         format!("{:.1}ms", us as f64 / 1_000.0)
     } else {
         format!("{us}µs")
-    }
-}
-
-fn truncate_str(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max.saturating_sub(1)])
     }
 }

@@ -1,3 +1,6 @@
+// Phase 2/3 foundation: wired into production event loop in Phase 3.
+#![allow(dead_code)]
+
 //! Effect runner: bounded AppEvent channel, production transport adapters,
 //! and the owned effect dispatch boundary.
 //!
@@ -39,6 +42,7 @@ impl BoundedEventChannel {
         (self.sender, self.receiver)
     }
 
+    #[allow(clippy::result_large_err)]
     pub fn try_send(&self, event: AppEvent) -> Result<(), mpsc::error::TrySendError<AppEvent>> {
         self.sender.try_send(event)
     }
@@ -205,7 +209,9 @@ where
                 self.api
                     .execute_read(ReadOperation::TableRows { target }, context),
             ),
-            Effect::PersistSession { snapshot } => ("persist session", self.sessions.save(snapshot)),
+            Effect::PersistSession { snapshot } => {
+                ("persist session", self.sessions.save(snapshot))
+            }
         };
         let sender = self.event_sender.clone();
         Some(self.tasks.spawn(name, async move {

@@ -8,7 +8,6 @@
 ///    event arriving on the mpsc channel.
 /// 3. Dispatches the event to the appropriate handler.
 /// 4. Loops until `app_state.should_quit` is set.
-
 pub mod command;
 pub mod event;
 pub mod navigation;

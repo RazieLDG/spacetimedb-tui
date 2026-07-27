@@ -1,3 +1,6 @@
+// Phase 2/3 foundation: wired into production event loop in Phase 3.
+#![allow(dead_code)]
+
 //! Navigation state: active database, resource, and selection identity.
 //!
 //! This module owns only navigation references. Mode, workspace, and focused

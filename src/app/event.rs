@@ -1,3 +1,6 @@
+// Phase 2/3 foundation: wired into production event loop in Phase 3.
+#![allow(dead_code)]
+
 //! Normalized actions, events, effects, and transition types.
 //!
 //! `AppEvent` is the single inbound event type for the reducer. `Effect` is
@@ -16,10 +19,17 @@ use crate::state::resources::MetricsSnapshot;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Invoke(CommandId),
-    SelectDatabase { database: String },
-    SelectResource { database: String, resource: String },
+    SelectDatabase {
+        database: String,
+    },
+    SelectResource {
+        database: String,
+        resource: String,
+    },
     NavigateUp,
-    ConfirmWritePlan { plan_id: crate::state::safety::WritePlanId },
+    ConfirmWritePlan {
+        plan_id: crate::state::safety::WritePlanId,
+    },
     RestoreSession,
 }
 

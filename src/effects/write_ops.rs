@@ -249,8 +249,14 @@ impl std::fmt::Display for SqlEncodingError {
             Self::FloatNotFinite => write!(f, "float value is not finite"),
             Self::WrongMutationKind => write!(f, "wrong mutation kind for operation"),
             Self::NoChangedFields => write!(f, "no changed fields"),
-            Self::TypeMismatch { column_id, expected } => {
-                write!(f, "type mismatch on column {column_id}: expected {expected}")
+            Self::TypeMismatch {
+                column_id,
+                expected,
+            } => {
+                write!(
+                    f,
+                    "type mismatch on column {column_id}: expected {expected}"
+                )
             }
         }
     }

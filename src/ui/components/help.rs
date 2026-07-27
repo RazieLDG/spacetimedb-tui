@@ -319,6 +319,7 @@ pub fn phase_one_safety_help_text() -> &'static str {
 }
 
 /// Phase 2 help note: shortcuts, palette, and help share one command registry.
+#[allow(dead_code)]
 pub const PHASE2_HELP_NOTE: &str = "Phase 2: shortcuts, palette, and help share one command registry. The layout is unchanged until the workbench UX phase.";
 
 /// Word-wrap `text` to at most `width` columns, breaking on spaces.
@@ -356,8 +357,9 @@ use crate::app::command::{CommandContext, CommandRegistry, ContextualHelpLine};
 
 /// Generate contextual help lines from the command registry for the given
 /// context. Phase 3 UI will call this instead of the static binding list.
+#[allow(dead_code)]
 pub fn contextual_help_lines(context: &CommandContext) -> Vec<ContextualHelpLine> {
-    CommandRegistry::default().contextual_help(context)
+    CommandRegistry.contextual_help(context)
 }
 
 #[cfg(test)]

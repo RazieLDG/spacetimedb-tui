@@ -533,6 +533,7 @@ use clap::parser::ValueSource;
 
 /// Where a configuration value came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum ConfigSource {
     CommandLine,
     Environment,
@@ -544,11 +545,13 @@ pub enum ConfigSource {
 
 /// A resolved value paired with its provenance.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct Resolved<T> {
     pub value: T,
     pub source: ConfigSource,
 }
 
+#[allow(dead_code)]
 impl<T> Resolved<T> {
     pub fn new(value: T, source: ConfigSource) -> Self {
         Self { value, source }
@@ -557,6 +560,7 @@ impl<T> Resolved<T> {
 
 /// Fully resolved startup configuration with provenance.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct ResolvedConfig {
     pub host: Resolved<String>,
     pub port: Resolved<u16>,
@@ -568,6 +572,7 @@ pub struct ResolvedConfig {
 
 /// All inputs to configuration resolution, layered by source.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct ConfigResolutionInput {
     pub cli_host: Option<Resolved<String>>,
     pub cli_port: Option<Resolved<u16>>,
@@ -591,6 +596,7 @@ pub struct ConfigResolutionInput {
     pub restore_session: bool,
 }
 
+#[allow(dead_code)]
 impl ConfigResolutionInput {
     pub fn empty() -> Self {
         Self {
@@ -618,6 +624,7 @@ impl ConfigResolutionInput {
     }
 }
 
+#[allow(dead_code)]
 pub fn config_source_from_clap(source: ValueSource) -> ConfigSource {
     match source {
         ValueSource::CommandLine => ConfigSource::CommandLine,
@@ -629,6 +636,7 @@ pub fn config_source_from_clap(source: ValueSource) -> ConfigSource {
 
 /// Resolve configuration with CLI > env > restored session > user config >
 /// detected > built-in precedence.
+#[allow(dead_code)]
 pub fn resolve_config(input: ConfigResolutionInput) -> ResolvedConfig {
     let host = input
         .cli_host
@@ -696,11 +704,14 @@ pub fn resolve_config(input: ConfigResolutionInput) -> ResolvedConfig {
                 .map(|value| Resolved::new(Some(value), ConfigSource::Environment))
         })
         .or_else(|| {
-            input.restore_session.then(|| {
-                input
-                    .restored_database
-                    .map(|value| Resolved::new(Some(value), ConfigSource::RestoredSession))
-            }).flatten()
+            input
+                .restore_session
+                .then(|| {
+                    input
+                        .restored_database
+                        .map(|value| Resolved::new(Some(value), ConfigSource::RestoredSession))
+                })
+                .flatten()
         })
         .or_else(|| {
             input
@@ -848,7 +859,10 @@ mod phase2_config_tests {
     #[test]
     fn explicit_cli_default_looking_values_win_over_environment_and_detected_config() {
         let input = ConfigResolutionInput {
-            cli_host: Some(Resolved::new("localhost".to_string(), ConfigSource::CommandLine)),
+            cli_host: Some(Resolved::new(
+                "localhost".to_string(),
+                ConfigSource::CommandLine,
+            )),
             cli_port: Some(Resolved::new(3000, ConfigSource::CommandLine)),
             cli_tls: Some(Resolved::new(false, ConfigSource::CommandLine)),
             cli_token: None,
@@ -876,8 +890,14 @@ mod phase2_config_tests {
             resolved.host,
             Resolved::new("localhost".to_string(), ConfigSource::CommandLine)
         );
-        assert_eq!(resolved.port, Resolved::new(3000, ConfigSource::CommandLine));
-        assert_eq!(resolved.tls, Resolved::new(false, ConfigSource::CommandLine));
+        assert_eq!(
+            resolved.port,
+            Resolved::new(3000, ConfigSource::CommandLine)
+        );
+        assert_eq!(
+            resolved.tls,
+            Resolved::new(false, ConfigSource::CommandLine)
+        );
         assert_eq!(
             resolved.token,
             Resolved::new(Some("env-token".to_string()), ConfigSource::Environment)

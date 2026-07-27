@@ -163,6 +163,7 @@ use crate::app::command::{CommandContext, CommandRegistry, PaletteEntry};
 
 /// Generate palette entries from the command registry for the given context.
 /// Phase 3 palette UI will call this instead of the legacy `Command::ALL`.
+#[allow(dead_code)]
 pub fn palette_entries_for_context(context: &CommandContext) -> Vec<PaletteEntry> {
-    CommandRegistry::default().palette_entries(context)
+    CommandRegistry.palette_entries(context)
 }

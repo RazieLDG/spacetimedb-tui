@@ -248,7 +248,10 @@ mod phase2_user_config_tests {
 
         let state = AppState::from_session_state("http://localhost:3000".to_string(), &session);
 
-        assert_eq!(state.navigation.active_database.as_deref(), Some("inventory"));
+        assert_eq!(
+            state.navigation.active_database.as_deref(),
+            Some("inventory")
+        );
         assert_eq!(state.workbench.mode, WorkbenchMode::Data);
         assert_eq!(state.workbench.workspace, Workspace::Sql);
     }
@@ -263,7 +266,10 @@ mod phase2_user_config_tests {
 
         let state = AppState::from_session_state("http://localhost:3000".to_string(), &session);
 
-        assert_eq!(state.navigation.active_database.as_deref(), Some("inventory"));
+        assert_eq!(
+            state.navigation.active_database.as_deref(),
+            Some("inventory")
+        );
         assert_eq!(state.workbench.mode, WorkbenchMode::Data);
         assert_eq!(state.workbench.workspace, Workspace::Tables);
     }

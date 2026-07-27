@@ -199,8 +199,6 @@ pub struct SqlHistoryEntry {
     pub error: Option<String>,
 }
 
-
-
 // ---------------------------------------------------------------------------
 // Table data cache
 // ---------------------------------------------------------------------------
@@ -495,6 +493,7 @@ impl AppState {
     }
 
     /// Create an `AppState` restored from a saved session snapshot.
+    #[allow(dead_code)]
     pub fn from_session_state(
         base_url: impl Into<String>,
         session: &crate::user_config::SessionState,

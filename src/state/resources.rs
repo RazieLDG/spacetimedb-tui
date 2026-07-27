@@ -1,3 +1,6 @@
+// Phase 2/3 foundation: wired into production event loop in Phase 3.
+#![allow(dead_code)]
+
 //! Resource state: scoped resource data, `LoadState<T>`, and request tracking.
 //!
 //! This module owns typed resource payloads and the per-scope generation
@@ -85,6 +88,7 @@ pub enum LoadState<T> {
 }
 
 impl<T> Default for LoadState<T> {
+    #[allow(clippy::derivable_impls)]
     fn default() -> Self {
         Self::Idle
     }
@@ -99,7 +103,8 @@ impl<T: Clone> LoadState<T> {
             | LoadState::Refreshing { data, .. }
             | LoadState::Stale { data, .. } => LoadState::Refreshing { data, request },
             LoadState::Error {
-                previous: Some(data), ..
+                previous: Some(data),
+                ..
             } => LoadState::Refreshing { data, request },
             _ => LoadState::Loading { request },
         }
@@ -137,12 +142,10 @@ impl<T: Clone> LoadState<T> {
                 previous: None,
                 error,
             },
-            LoadState::Refreshing { data, request } if &request == completed => {
-                LoadState::Error {
-                    previous: Some(data),
-                    error,
-                }
-            }
+            LoadState::Refreshing { data, request } if &request == completed => LoadState::Error {
+                previous: Some(data),
+                error,
+            },
             other => other,
         }
     }
@@ -195,9 +198,16 @@ impl RequestTracker {
     /// global id counter and the per-scope generation counter.
     pub fn next_context(&mut self, scope: RequestScope) -> RequestContext {
         self.next_id += 1;
-        let generation = self.next_generation_by_scope.entry(scope.clone()).or_insert(0);
+        let generation = self
+            .next_generation_by_scope
+            .entry(scope.clone())
+            .or_insert(0);
         *generation += 1;
-        let context = RequestContext::new(RequestId::from_u64(self.next_id), scope.clone(), *generation);
+        let context = RequestContext::new(
+            RequestId::from_u64(self.next_id),
+            scope.clone(),
+            *generation,
+        );
         self.latest_by_scope.insert(scope, context.clone());
         context
     }

@@ -1,3 +1,6 @@
+// Phase 2/3 foundation: wired into production event loop in Phase 3.
+#![allow(dead_code)]
+
 //! Typed command registry: stable command IDs, key bindings, palette search,
 //! availability policy, and help line generation.
 //!
@@ -208,8 +211,7 @@ const WORKBENCH_FOCUS: &[FocusContext] = &[
     FocusContext::Activity,
 ];
 
-const MODAL_OR_INSPECTOR_FOCUS: &[FocusContext] =
-    &[FocusContext::Modal, FocusContext::Inspector];
+const MODAL_OR_INSPECTOR_FOCUS: &[FocusContext] = &[FocusContext::Modal, FocusContext::Inspector];
 
 const NO_BINDINGS: &[Binding] = &[];
 
@@ -444,7 +446,10 @@ impl CommandRegistry {
                 command_id: spec.id,
                 label: spec.label,
                 description: spec.description,
-                primary_binding: spec.bindings.first().map(|binding| binding.display.to_string()),
+                primary_binding: spec
+                    .bindings
+                    .first()
+                    .map(|binding| binding.display.to_string()),
             })
             .collect()
     }
@@ -552,7 +557,7 @@ mod tests {
 
     #[test]
     fn ctrl_p_keyboard_palette_and_help_resolve_same_command() {
-        let registry = CommandRegistry::default();
+        let registry = CommandRegistry;
         let command = registry.by_id(CommandId::OpenCommandPalette).unwrap();
 
         assert_eq!(command.id, CommandId::OpenCommandPalette);
@@ -572,7 +577,7 @@ mod tests {
 
     #[test]
     fn disabled_commands_report_stable_reason() {
-        let registry = CommandRegistry::default();
+        let registry = CommandRegistry;
         let context = CommandContext {
             mode: WorkbenchMode::Data,
             focus: FocusContext::Workspace,
@@ -638,7 +643,7 @@ mod tests {
 
     #[test]
     fn palette_search_preserves_fuzzy_subsequence_contract() {
-        let registry = CommandRegistry::default();
+        let registry = CommandRegistry;
         let all = registry.iter().map(|spec| spec.id).collect::<Vec<_>>();
 
         assert_eq!(registry.search_palette(""), all);
@@ -652,7 +657,7 @@ mod tests {
 
     #[test]
     fn palette_search_is_deterministic_by_score_then_registry_order() {
-        let registry = CommandRegistry::default();
+        let registry = CommandRegistry;
         let first = registry.search_palette("go");
         let second = registry.search_palette("go");
 
@@ -664,7 +669,7 @@ mod tests {
 
     #[test]
     fn every_command_has_one_spec_and_one_typed_availability_rule() {
-        let registry = CommandRegistry::default();
+        let registry = CommandRegistry;
 
         for id in MIGRATED_COMMAND_INVENTORY {
             let specs = COMMAND_SPECS
@@ -694,7 +699,7 @@ mod tests {
 
     #[test]
     fn palette_entries_are_generated_from_registered_commands() {
-        let registry = CommandRegistry::default();
+        let registry = CommandRegistry;
         let entries = registry.palette_entries(&CommandContext {
             mode: WorkbenchMode::Data,
             focus: FocusContext::Workspace,
@@ -715,7 +720,7 @@ mod tests {
 
     #[test]
     fn help_marks_disabled_commands_with_registry_reason() {
-        let registry = CommandRegistry::default();
+        let registry = CommandRegistry;
         let lines = registry.contextual_help(&CommandContext {
             mode: WorkbenchMode::Data,
             focus: FocusContext::Workspace,
@@ -735,7 +740,7 @@ mod tests {
 
     #[test]
     fn phase2_command_descriptions_do_not_claim_new_layout() {
-        let registry = CommandRegistry::default();
+        let registry = CommandRegistry;
         let forbidden = [
             "Explorer",
             "Inspector drawer",

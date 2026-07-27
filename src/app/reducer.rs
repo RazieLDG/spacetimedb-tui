@@ -1,3 +1,6 @@
+// Phase 2/3 foundation: wired into production event loop in Phase 3.
+#![allow(dead_code)]
+
 //! Pure reducer: `reduce(&mut AppState, AppEvent) -> Transition`.
 //!
 //! No network, terminal, or time side effects. All side effects are expressed
@@ -52,8 +55,8 @@ fn invoke_command(state: &mut AppState, command: CommandId) -> Transition {
                 &state.navigation.active_database,
                 &state.navigation.active_resource,
             ) {
-                (Some(database), Some(resource)) => Transition::effects(vec![
-                    Effect::LoadTableRows {
+                (Some(database), Some(resource)) => {
+                    Transition::effects(vec![Effect::LoadTableRows {
                         target: TableTarget {
                             database: database.clone(),
                             table: resource.clone(),
@@ -63,8 +66,8 @@ fn invoke_command(state: &mut AppState, command: CommandId) -> Transition {
                             table: resource.clone(),
                             view: "browse".into(),
                         }),
-                    },
-                ]),
+                    }])
+                }
                 _ => Transition::none(),
             }
         }
@@ -83,21 +86,21 @@ fn apply_scoped_read_completion(state: &mut AppState, context: RequestContext, r
                 .apply_success(&context, databases, now);
         }
         (RequestScope::Schema { .. }, ReadResult::Schema(schema)) => {
-            state.resources.schema = std::mem::take(&mut state.resources.schema)
-                .apply_success(&context, schema, now);
+            state.resources.schema =
+                std::mem::take(&mut state.resources.schema).apply_success(&context, schema, now);
         }
         (RequestScope::TableRows { .. }, ReadResult::TableRows(rows))
         | (RequestScope::SqlWorkspace { .. }, ReadResult::TableRows(rows)) => {
-            state.resources.table_rows = std::mem::take(&mut state.resources.table_rows)
-                .apply_success(&context, rows, now);
+            state.resources.table_rows =
+                std::mem::take(&mut state.resources.table_rows).apply_success(&context, rows, now);
         }
         (RequestScope::Logs { .. }, ReadResult::Logs(logs)) => {
             state.resources.logs =
                 std::mem::take(&mut state.resources.logs).apply_success(&context, logs, now);
         }
         (RequestScope::Metrics, ReadResult::Metrics(metrics)) => {
-            state.resources.metrics = std::mem::take(&mut state.resources.metrics)
-                .apply_success(&context, metrics, now);
+            state.resources.metrics =
+                std::mem::take(&mut state.resources.metrics).apply_success(&context, metrics, now);
         }
         _ => {}
     }
@@ -118,16 +121,16 @@ fn apply_scoped_read_failure(
     };
     match scope {
         RequestScope::DatabaseCatalog => {
-            state.resources.catalog = std::mem::take(&mut state.resources.catalog)
-                .apply_error(&context, error);
+            state.resources.catalog =
+                std::mem::take(&mut state.resources.catalog).apply_error(&context, error);
         }
         RequestScope::Schema { .. } => {
             state.resources.schema =
                 std::mem::take(&mut state.resources.schema).apply_error(&context, error);
         }
         RequestScope::TableRows { .. } | RequestScope::SqlWorkspace { .. } => {
-            state.resources.table_rows = std::mem::take(&mut state.resources.table_rows)
-                .apply_error(&context, error);
+            state.resources.table_rows =
+                std::mem::take(&mut state.resources.table_rows).apply_error(&context, error);
         }
         RequestScope::Logs { .. } => {
             state.resources.logs =
@@ -138,8 +141,8 @@ fn apply_scoped_read_failure(
                 std::mem::take(&mut state.resources.metrics).apply_error(&context, error);
         }
         RequestScope::LiveClients { .. } => {
-            state.resources.live_clients = std::mem::take(&mut state.resources.live_clients)
-                .apply_error(&context, error);
+            state.resources.live_clients =
+                std::mem::take(&mut state.resources.live_clients).apply_error(&context, error);
         }
     }
 }

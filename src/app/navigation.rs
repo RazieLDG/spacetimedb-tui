@@ -1,3 +1,6 @@
+// Phase 2/3 foundation: wired into production event loop in Phase 3.
+#![allow(dead_code)]
+
 //! Semantic navigation helpers that update `NavigationState` and emit
 //! required load effects.
 //!
@@ -79,9 +82,7 @@ pub fn navigate_up(state: &mut AppState) -> Transition {
     state.navigation.active_database = None;
     Transition::effects(vec![
         Effect::LoadCatalog {
-            context: state
-                .requests
-                .next_context(RequestScope::DatabaseCatalog),
+            context: state.requests.next_context(RequestScope::DatabaseCatalog),
         },
         Effect::PersistSession {
             snapshot: session_snapshot(state),
@@ -100,8 +101,7 @@ mod tests {
     fn select_resource_updates_navigation_and_emits_scoped_load_once() {
         let mut state = AppState::new("http://localhost:3000".to_string());
 
-        let transition =
-            select_resource(&mut state, "inventory".to_string(), "items".to_string());
+        let transition = select_resource(&mut state, "inventory".to_string(), "items".to_string());
 
         assert_eq!(
             state.navigation.active_database.as_deref(),

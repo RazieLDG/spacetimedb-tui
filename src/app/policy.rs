@@ -1,3 +1,6 @@
+// Phase 2/3 foundation: wired into production event loop in Phase 3.
+#![allow(dead_code)]
+
 //! Shared command availability and safety policy helpers.
 //!
 //! The reducer and all input adapters evaluate command availability through
@@ -41,7 +44,7 @@ pub fn command_context_from_state(state: &AppState) -> CommandContext {
 }
 
 pub fn command_availability(id: CommandId, context: &CommandContext) -> Availability {
-    CommandRegistry::default().availability(id, context)
+    CommandRegistry.availability(id, context)
 }
 
 #[cfg(test)]

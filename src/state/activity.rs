@@ -1,3 +1,6 @@
+// Phase 2/3 foundation: wired into production event loop in Phase 3.
+#![allow(dead_code)]
+
 //! Activity state: active work, notices, connection lifecycle, retry.
 
 use crate::effects::request::RequestId;

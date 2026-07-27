@@ -135,6 +135,7 @@ pub struct SafetyState {
     pub unresolved_mutations: Vec<MutationUncertainty>,
 }
 
+#[allow(dead_code)]
 impl SafetyState {
     /// Record a mutation outcome. Only `Unknown` outcomes are tracked as
     /// unresolved uncertainty; all other outcomes are terminal.

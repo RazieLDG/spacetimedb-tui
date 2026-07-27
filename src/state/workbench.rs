@@ -1,3 +1,6 @@
+// Phase 2/3 foundation: wired into production event loop in Phase 3.
+#![allow(dead_code)]
+
 //! Workbench state: mode, workspace, focused pane, and widget-level UI state.
 //!
 //! This is the single owner for Phase 2/3 workbench concepts. Navigation and

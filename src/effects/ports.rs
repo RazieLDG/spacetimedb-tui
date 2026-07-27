@@ -1,3 +1,6 @@
+// Phase 2/3 foundation: wired into production event loop in Phase 3.
+#![allow(dead_code)]
+
 //! Deterministic runtime ports for the effect runner.
 //!
 //! These traits allow the runner to be driven in tests without real time,

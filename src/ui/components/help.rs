@@ -147,8 +147,8 @@ const SECTIONS: &[Section] = &[
     Section {
         title: "Live",
         bindings: &[
-            Binding { key: "6",               desc: "Jump to the Live tab (tx feed + clients)" },
-            Binding { key: "r",               desc: "Force re-subscribe to the WebSocket feed" },
+            Binding { key: "6",               desc: "Jump to the Live tab (disabled notice + clients)" },
+            Binding { key: "r",               desc: "Force refresh of the connected-clients metadata poll" },
         ],
     },
     Section {

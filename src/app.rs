@@ -4734,10 +4734,10 @@ impl App {
                 self.load_schema().await;
             }
             Tab::Live => {
-                // The Live tab is driven entirely by the WebSocket
-                // subscription + the client-list polling task, so a
-                // manual refresh just re-subscribes.
-                self.connect_ws().await;
+                // Phase 1: Live subscriptions are disabled. Manual refresh
+                // forces an immediate metadata poll of `st_client`.
+                self.last_live_clients_fetch = None;
+                self.maybe_refresh_live_clients();
             }
         }
     }
@@ -4863,8 +4863,9 @@ impl App {
                 self.state.ws_connected = true;
                 self.state.ws_reconnect_deadline = None;
                 self.state.ws_reconnect_attempt = 0;
-                // Subscribe to all user tables after connection
-                self.ws_subscribe_all_tables().await;
+                // Phase 1: no automatic all-table subscription. The Live
+                // tab shows a disabled notice; bounded scoped Live will
+                // return later.
             }
             WsEvent::ServerMessage(msg) => {
                 self.handle_ws_server_message(msg);
@@ -4903,27 +4904,6 @@ impl App {
             WsEvent::RawText(text) => {
                 // Raw frames we can't decode as structured messages — log for diagnostics
                 tracing::debug!("WebSocket raw text frame ({} bytes)", text.len());
-            }
-        }
-    }
-
-    /// Send subscription queries for all user tables in the current schema.
-    async fn ws_subscribe_all_tables(&mut self) {
-        let queries: Vec<String> = self
-            .state
-            .tables
-            .iter()
-            .filter(|t| t.table_type != "system")
-            .map(|t| format!("SELECT * FROM {}", t.table_name))
-            .collect();
-
-        if queries.is_empty() {
-            return;
-        }
-
-        if let Some(ref handle) = self.ws_handle {
-            if let Err(e) = handle.subscribe(queries, 1).await {
-                tracing::warn!("WS subscribe failed: {e}");
             }
         }
     }

@@ -1,12 +1,11 @@
-//! Live tab — real-time view of the database.
+//! Live tab — database activity overview.
 //!
 //! Splits the content area into two panes:
-//! - **Transaction feed** (top, scrollable): the most recent
-//!   [`TxLogEntry`]s from the WebSocket subscription, one line per
-//!   transaction with caller identity, inserts/deletes counts, and
-//!   affected-table names.
+//! - **Disabled notice** (top): explains that automatic Live
+//!   subscriptions are temporarily unavailable in Phase 1.
 //! - **Connected clients** (bottom): a periodically-refreshed list of
-//!   identities pulled from `st_client` via a background SQL query.
+//!   identities pulled from `st_client` via a background SQL query
+//!   (metadata polling, not row-level Live).
 //!
 //! Both panels read from `AppState` and therefore need no local state
 //! of their own — hitting `1`..`6` to switch tabs always returns to
@@ -20,13 +19,38 @@ use ratatui::{
     widgets::{Block, Borders, Widget},
 };
 
-use crate::state::{AppState, FocusPanel, TxLogEntry};
+use crate::state::{AppState, FocusPanel};
+
+/// Whether automatic Live subscriptions are available in this build.
+///
+/// Phase 1 disables unbounded all-table subscriptions while the safety
+/// controls are tightened. Bounded, scoped Live will return later.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LiveAvailability {
+    TemporarilyUnavailable,
+}
+
+/// Report the current availability of automatic Live subscriptions.
+pub fn live_subscription_availability() -> LiveAvailability {
+    LiveAvailability::TemporarilyUnavailable
+}
+
+/// User-facing explanation shown in place of the Live feed while
+/// automatic subscriptions are disabled.
+pub fn phase_one_live_disabled_message() -> &'static str {
+    "Live updates are temporarily unavailable while safety controls are tightened. Use manual refresh for table data. Bounded scoped Live will return later; broad automatic subscriptions are currently unavailable."
+}
 
 fn rgb((r, g, b): (u8, u8, u8)) -> Color {
     Color::Rgb(r, g, b)
 }
 
-/// Render the Live tab — transaction feed on top, clients below.
+/// Render the Live tab — disabled notice on top, clients below.
+///
+/// The top pane branches on [`live_subscription_availability`]: while
+/// subscriptions are [`LiveAvailability::TemporarilyUnavailable`] it draws
+/// the Phase 1 disabled notice; a future `Available` variant would restore
+/// the transaction feed.
 pub fn render_live(area: Rect, buf: &mut Buffer, app: &AppState) {
     let theme = &app.theme;
     let accent = rgb(theme.accent);
@@ -54,32 +78,33 @@ pub fn render_live(area: Rect, buf: &mut Buffer, app: &AppState) {
         return;
     }
 
-    // Split: transactions get 2/3 of the height, clients get the rest.
+    // Split: the top pane (notice or feed) gets 2/3, clients get the rest.
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Ratio(2, 3), Constraint::Ratio(1, 3)])
         .split(inner);
 
-    render_tx_feed(sections[0], buf, app);
+    match live_subscription_availability() {
+        LiveAvailability::TemporarilyUnavailable => {
+            render_disabled_notice(sections[0], buf, app);
+        }
+    }
     render_client_list(sections[1], buf, app);
 }
 
-// ── Transaction feed ──────────────────────────────────────────────────────────
+// ── Disabled notice ──────────────────────────────────────────────────────────
 
-fn render_tx_feed(area: Rect, buf: &mut Buffer, app: &AppState) {
+fn render_disabled_notice(area: Rect, buf: &mut Buffer, app: &AppState) {
     let theme = &app.theme;
     let accent = rgb(theme.accent);
-    let fg_primary = rgb(theme.fg_primary);
     let fg_muted = rgb(theme.fg_muted);
-    let success = rgb(theme.success);
-    let error_fg = rgb(theme.error);
     let border_normal = rgb(theme.border_normal);
 
     let block = Block::default()
         .borders(Borders::BOTTOM)
         .border_style(Style::default().fg(border_normal))
         .title(Span::styled(
-            format!(" 🔁 Transactions ({})  ", app.tx_log.len()),
+            " 🔁 Transactions  ",
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
@@ -89,71 +114,13 @@ fn render_tx_feed(area: Rect, buf: &mut Buffer, app: &AppState) {
         return;
     }
 
-    if app.tx_log.is_empty() {
-        let msg = if app.ws_connected {
-            "  (waiting for transaction updates…)"
-        } else {
-            "  (no WebSocket subscription yet — select a database to connect)"
-        };
-        let line = Line::from(Span::styled(msg, Style::default().fg(fg_muted)));
-        let y = inner.y + inner.height / 2;
-        buf.set_line(inner.x, y, &line, inner.width);
-        return;
-    }
-
-    // Newest-last ordering, so the freshest transaction sits at the
-    // bottom of the pane (same convention as the Logs tab).
-    let visible = inner.height as usize;
-    let total = app.tx_log.len();
-    let skip = total.saturating_sub(visible);
-
-    for (i, entry) in app.tx_log.iter().skip(skip).enumerate() {
-        let y = inner.y + i as u16;
-        if y >= inner.y + inner.height {
-            break;
-        }
-
-        let ts = entry.observed_at.format("%H:%M:%S%.3f").to_string();
-        let status_span = match entry.committed {
-            Some(true) => Span::styled(" ✓ ", Style::default().fg(success)),
-            Some(false) => Span::styled(" ✗ ", Style::default().fg(error_fg)),
-            None => Span::styled(" • ", Style::default().fg(fg_muted)),
-        };
-        let ts_span = Span::styled(format!("{ts} "), Style::default().fg(fg_muted));
-        let caller_preview: String = if entry.caller.is_empty() {
-            "(system)".to_string()
-        } else {
-            entry.caller.chars().take(12).collect()
-        };
-        let caller_span = Span::styled(
-            format!("{caller_preview:<12} "),
-            Style::default().fg(accent),
-        );
-        let inserts = entry.total_inserts();
-        let deletes = entry.total_deletes();
-        let counts_span = Span::styled(
-            format!("+{inserts} −{deletes}  "),
-            Style::default().fg(fg_primary).add_modifier(Modifier::BOLD),
-        );
-        let tables: Vec<String> = entry
-            .tables
-            .iter()
-            .map(|(t, i, d)| format!("{t}(+{i}/−{d})"))
-            .collect();
-        let tables_span = Span::styled(
-            truncate(&tables.join(", "), inner.width as usize - 40),
-            Style::default().fg(fg_muted),
-        );
-
-        let line = Line::from(vec![
-            status_span,
-            ts_span,
-            caller_span,
-            counts_span,
-            tables_span,
-        ]);
-        buf.set_line(inner.x, y, &line, inner.width);
-    }
+    let msg = phase_one_live_disabled_message();
+    let y = inner.y + inner.height / 2;
+    let line = Line::from(Span::styled(
+        format!("  {msg}"),
+        Style::default().fg(fg_muted),
+    ));
+    buf.set_line(inner.x, y, &line, inner.width);
 }
 
 // ── Client list ───────────────────────────────────────────────────────────────
@@ -224,16 +191,24 @@ fn render_client_list(area: Rect, buf: &mut Buffer, app: &AppState) {
     }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod phase_one_live_tests {
+    use super::*;
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let cut: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{cut}…")
+    #[test]
+    fn phase_one_live_surface_explains_disabled_state() {
+        let text = phase_one_live_disabled_message();
+
+        assert!(text.contains("Live updates are temporarily unavailable"));
+        assert!(text.contains("manual refresh"));
+        assert!(text.contains("Bounded scoped Live will return later"));
+    }
+
+    #[test]
+    fn all_table_subscribe_command_is_not_available() {
+        assert_eq!(
+            live_subscription_availability(),
+            LiveAvailability::TemporarilyUnavailable
+        );
     }
 }
-
-#[allow(dead_code)]
-fn _assert_tx_entry_type(_e: &TxLogEntry) {}

@@ -62,11 +62,8 @@ fn render_confirm(area: Rect, buf: &mut Buffer, prompt: &str) {
     }
     // Wrap the prompt across the available width, line by line.
     let max_w = area.width as usize;
-    let mut y = area.y;
-    for line in prompt.lines() {
-        if y >= area.y + area.height.saturating_sub(2) {
-            break;
-        }
+    let last_y = area.y + area.height.saturating_sub(2);
+    for (y, line) in (area.y..last_y).zip(prompt.lines()) {
         let truncated: String = line.chars().take(max_w).collect();
         buf.set_line(
             area.x,
@@ -77,7 +74,6 @@ fn render_confirm(area: Rect, buf: &mut Buffer, prompt: &str) {
             )),
             area.width,
         );
-        y += 1;
     }
 
     // Footer hint

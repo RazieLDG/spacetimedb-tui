@@ -81,8 +81,10 @@ impl<'a> Widget for StatusBar<'a> {
         //   ● LIVE              — subscribed, receiving updates
         //   ◌ reconnect in Ns   — waiting to reconnect after a drop
         //   ○ live              — idle (no connection)
-        let (live_text, live_color) = if app.ws_connected {
+        let (live_text, live_color) = if app.live_enabled && app.ws_connected {
             (" ● LIVE ".to_string(), success)
+        } else if !app.live_enabled {
+            (" ○ live off ".to_string(), fg_muted)
         } else if let Some(deadline) = app.ws_reconnect_deadline {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             let secs = remaining.as_secs().max(1);

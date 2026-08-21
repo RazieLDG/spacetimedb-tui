@@ -171,6 +171,18 @@ const SQL_HISTORY_LIMIT: usize = 200;
 // Re-export moved types from resources module.
 pub use crate::state::resources::{LiveClientEntry, MetricsSnapshot};
 
+/// One scoped live-subscription event shown on the Live tab.
+#[derive(Debug, Clone)]
+pub struct LiveEvent {
+    pub at: DateTime<Utc>,
+    pub table_name: String,
+    pub inserts: usize,
+    pub deletes: usize,
+    pub snapshot: bool,
+}
+
+const LIVE_EVENT_LIMIT: usize = 200;
+
 /// Result of advancing the SQL history cursor forward (↓).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryAdvance {
@@ -291,6 +303,12 @@ pub struct AppState {
     /// Rolling list of connected clients, polled periodically from
     /// `st_client`. Populated by the Live tab's background refresh.
     pub live_clients: Vec<LiveClientEntry>,
+    /// Bounded transaction feed for the Live tab (scoped to the
+    /// currently subscribed table).
+    pub live_events: VecDeque<LiveEvent>,
+    /// When `true`, the TUI keeps a WebSocket subscription for the
+    /// selected table only. Toggle with Ctrl+L.
+    pub live_enabled: bool,
     /// Whether the live-subscription WebSocket is currently connected.
     pub ws_connected: bool,
     /// If the WS task is waiting to reconnect, the instant at which the
@@ -450,6 +468,8 @@ impl AppState {
             table_browse_result: None,
             live_table_data: HashMap::new(),
             live_clients: Vec::new(),
+            live_events: VecDeque::new(),
+            live_enabled: true,
             ws_connected: false,
             ws_reconnect_deadline: None,
             ws_reconnect_attempt: 0,
@@ -566,6 +586,7 @@ impl AppState {
     }
 
     /// Move the database cursor down by one.
+    #[allow(dead_code)]
     pub fn database_next(&mut self) {
         if self.databases.is_empty() {
             return;
@@ -578,6 +599,7 @@ impl AppState {
     }
 
     /// Move the database cursor up by one.
+    #[allow(dead_code)]
     pub fn database_prev(&mut self) {
         if self.databases.is_empty() {
             return;
@@ -598,7 +620,32 @@ impl AppState {
         self.selected_table_idx.and_then(|i| self.tables.get(i))
     }
 
+    /// First user table, or `0` when the schema is all system tables.
+    pub fn preferred_table_index(&self, restored_name: Option<&str>) -> Option<usize> {
+        if self.tables.is_empty() {
+            return None;
+        }
+        if let Some(name) = restored_name {
+            if let Some(idx) = self.tables.iter().position(|t| t.table_name == name) {
+                return Some(idx);
+            }
+        }
+        self.tables
+            .iter()
+            .position(|t| t.table_type != "system")
+            .or(Some(0))
+    }
+
+    /// Append a live event, dropping the oldest when the feed is full.
+    pub fn push_live_event(&mut self, event: LiveEvent) {
+        self.live_events.push_back(event);
+        while self.live_events.len() > LIVE_EVENT_LIMIT {
+            self.live_events.pop_front();
+        }
+    }
+
     /// Move the table cursor down by one.
+    #[allow(dead_code)]
     pub fn table_next(&mut self) {
         if self.tables.is_empty() {
             return;
@@ -610,6 +657,7 @@ impl AppState {
     }
 
     /// Move the table cursor up by one.
+    #[allow(dead_code)]
     pub fn table_prev(&mut self) {
         if self.tables.is_empty() {
             return;
@@ -944,6 +992,48 @@ mod tests {
         assert_eq!(s.selected_database(), Some("beta"));
         s.database_prev();
         assert_eq!(s.selected_database(), Some("alpha"));
+    }
+
+    #[test]
+    fn test_table_navigation_helpers() {
+        let mut s = make_state();
+        s.tables = vec![
+            TableInfo {
+                table_name: "one".into(),
+                product_type_ref: 0,
+                table_type: "user".into(),
+                table_access: "public".into(),
+                columns: vec![],
+                primary_key_cols: vec![],
+                indexes: vec![],
+                constraints: vec![],
+            },
+            TableInfo {
+                table_name: "two".into(),
+                product_type_ref: 0,
+                table_type: "user".into(),
+                table_access: "public".into(),
+                columns: vec![],
+                primary_key_cols: vec![],
+                indexes: vec![],
+                constraints: vec![],
+            },
+        ];
+        s.table_next();
+        assert_eq!(
+            s.selected_table().map(|t| t.table_name.as_str()),
+            Some("one")
+        );
+        s.table_next();
+        assert_eq!(
+            s.selected_table().map(|t| t.table_name.as_str()),
+            Some("two")
+        );
+        s.table_prev();
+        assert_eq!(
+            s.selected_table().map(|t| t.table_name.as_str()),
+            Some("one")
+        );
     }
 
     #[test]

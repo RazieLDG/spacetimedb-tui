@@ -6,6 +6,7 @@
 //! - [`ws`] — WebSocket client for real-time subscriptions and log streaming.
 
 pub mod client;
+pub mod live_subscribe;
 pub mod types;
 pub mod ws;
 

@@ -14,7 +14,9 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
-- Live updates are temporarily unavailable while safety controls are tightened. Use manual refresh for table data. Bounded scoped Live will return later; broad automatic subscriptions are currently unavailable.
+- Live updates are scoped to the selected table only; broad automatic all-table subscriptions are unavailable. Toggle with Ctrl+L. Use manual refresh if live is off.
+- Sidebar `j`/`k` walks the visible database/table tree so any nested table can be selected, not just the first one.
+- Table browse SQL quotes identifiers. The Live tab decodes current `v1.json.spacetimedb` `updates[]` / `TransactionUpdateLight` payloads.
 - Spreadsheet editing now uses one-row spreadsheet Save: multiple changed cells in one row form one guided `WritePlan`; moving to another row prompts Save, Discard, or Stay.
 - Guided update/delete require declared primary keys and matching generations, with no unsafe override.
 - Raw SQL is a separately labeled expert path; Raw SQL does not receive the guided CRUD guarantee and is never automatically retried.
@@ -26,4 +28,4 @@ All notable changes to this project will be documented in this file.
 - `cargo clippy --all-targets --all-features --locked -- -D warnings` passes.
 - `cargo test --all-features --locked` passes.
 - `cargo build --release --locked` passes.
-- README, in-app help, and CHANGELOG all state that Live updates are temporarily unavailable, one-row spreadsheet Save is the supported spreadsheet contract, guided update/delete require declared primary keys and matching generations with no unsafe override, Raw SQL is a separately labeled expert path without the guided CRUD guarantee, and Unknown mutation outcomes are not automatically retried.
+- README, in-app help, and CHANGELOG all state that Live updates are scoped to the selected table only, one-row spreadsheet Save is the supported spreadsheet contract, guided update/delete require declared primary keys and matching generations with no unsafe override, Raw SQL is a separately labeled expert path without the guided CRUD guarantee, and Unknown mutation outcomes are not automatically retried.

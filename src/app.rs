@@ -20,7 +20,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use crossterm::event::{self as ct_event, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self as ct_event, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc;
 
 use ratatui::widgets::Widget;
@@ -34,14 +34,14 @@ use crate::{
     config::Config,
     effects::write_ops::{
         build_delete_sql, build_guided_delete_plan, build_guided_update_plan, build_update_sql,
-        complete_primary_key_from_table_row, format_guided_delete_confirmation,
+        complete_primary_key_from_table_row, encode_identifier, format_guided_delete_confirmation,
         format_guided_update_confirmation, guided_form_sql_value_from_user_input,
         guided_form_value_changed, guided_form_value_from_raw, normalize_lookup_result,
         plan_postcondition_queries, revalidate_before_dispatch, typed_sql_value_from_json,
         verify_authoritative_mutation_result, ConfirmationSnapshot, Generations, GuidedFormValue,
         LookupRows, MutationDispatchStage, PostconditionEvidence, PostconditionQueries,
-        PostconditionUpdate, TransportFailure, WritePlanBuildError, WriteVerificationReport,
-        WriteVerificationRequest,
+        PostconditionUpdate, SqlEncodingError, TransportFailure, WritePlanBuildError,
+        WriteVerificationReport, WriteVerificationRequest,
     },
     state::{
         edit_mode::{
@@ -56,6 +56,7 @@ use crate::{
     },
     ui::components::input::InputState,
     ui::components::table_grid::TableGridState,
+    ui::sidebar::{current_nav_index, nav_items, SidebarNavItem},
 };
 
 // ── Tick rate ─────────────────────────────────────────────────────────────────
@@ -341,6 +342,7 @@ impl GuidedWriteLocks {
     }
 }
 
+#[cfg(test)]
 fn database_nav_up_transition_requires_schema_reload(state: &mut AppState) -> bool {
     let old = state.selected_database_idx;
     state.database_prev();
@@ -382,6 +384,16 @@ pub struct App {
     /// Last time the Live tab polled `st_client` for the connected-client
     /// list. Throttled the same way metrics are.
     last_live_clients_fetch: Option<Instant>,
+    /// `request_id` of the most recent scoped `Subscribe` message. Used to
+    /// ignore snapshots that arrive after the user has switched tables.
+    live_request_id: u32,
+    /// Active `SubscribeSingle` query ids for the current table.
+    live_query_ids: Vec<u32>,
+    next_live_query_id: u32,
+    /// Timestamp window (microseconds) used to bound Live snapshots.
+    live_time_window_us: i64,
+    /// Table + window currently subscribed, to avoid duplicate SubscribeSingle.
+    live_subscribed: Option<(String, i64)>,
     next_write_plan_id: WritePlanId,
     write_plans: HashMap<WritePlanId, WritePlan>,
     pending_update_draft: Option<PendingGuidedUpdateDraft>,
@@ -428,6 +440,36 @@ fn send_event(tx: &mpsc::UnboundedSender<AppEvent>, event: AppEvent) {
     }
 }
 
+/// SQL used to browse a table. Identifiers are quoted so reserved names
+/// and mixed-case tables round-trip.
+fn table_browse_sql(table: &str) -> Result<String, SqlEncodingError> {
+    Ok(format!(
+        "SELECT * FROM {} LIMIT 200",
+        encode_identifier(table)?
+    ))
+}
+
+const LIVE_BROWSE_ROW_LIMIT: usize = 200;
+const LIVE_TABLE_ROW_LIMIT: usize = 2_000;
+
+/// Compare a cached live row with a delete payload.
+///
+/// Snapshots arrive as named JSON objects; incremental deletes often
+/// arrive as positional arrays. Treat those as equal when the object
+/// values match the array in order.
+fn live_rows_match(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    if left == right {
+        return true;
+    }
+    match (left, right) {
+        (serde_json::Value::Object(object), serde_json::Value::Array(array))
+        | (serde_json::Value::Array(array), serde_json::Value::Object(object)) => {
+            object.values().eq(array.iter())
+        }
+        _ => false,
+    }
+}
+
 impl App {
     /// Create a new [`App`] from config and a pre-built client.
     pub fn new(config: &Config, client: SpacetimeClient) -> Self {
@@ -447,6 +489,11 @@ impl App {
             auth_token: config.auth_token.clone(),
             last_metrics_fetch: None,
             last_live_clients_fetch: None,
+            live_request_id: 0,
+            live_query_ids: Vec::new(),
+            next_live_query_id: 0,
+            live_time_window_us: crate::api::live_subscribe::DEFAULT_LIVE_WINDOW_US,
+            live_subscribed: None,
             next_write_plan_id: WritePlanId(1),
             write_plans: HashMap::new(),
             pending_update_draft: None,
@@ -1351,6 +1398,13 @@ impl App {
     /// Uses explicit `return` statements to make early-exit control flow clear.
     #[allow(clippy::needless_return)]
     async fn handle_key(&mut self, key: KeyEvent) {
+        // Windows emits Press + Repeat + Release for every key. Handling
+        // Release (and treating it like Press) made j/k and arrows skip
+        // two or three sidebar rows per tap.
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return;
+        }
+
         // ── Command palette intercept ─────────────────────────────────────
         // The palette owns every key while it's open. Ctrl+C still quits.
         if self.state.palette.is_some() {
@@ -1453,6 +1507,10 @@ impl App {
                 KeyCode::Char('l') if self.state.focus == FocusPanel::SqlInput => {
                     self.sql_input.clear();
                     self.state.history_cursor = None;
+                    return;
+                }
+                KeyCode::Char('l') => {
+                    self.toggle_live().await;
                     return;
                 }
                 KeyCode::Char('f')
@@ -1563,11 +1621,9 @@ impl App {
                 KeyCode::Tab => {
                     self.complete_sql_input();
                 }
-                KeyCode::Up => {
-                    if self.state.history_prev() {
-                        if let Some(sql) = self.state.current_history_sql() {
-                            self.sql_input.set(sql.to_string());
-                        }
+                KeyCode::Up if self.state.history_prev() => {
+                    if let Some(sql) = self.state.current_history_sql() {
+                        self.sql_input.set(sql.to_string());
                     }
                 }
                 KeyCode::Down => match self.state.history_next() {
@@ -1657,8 +1713,8 @@ impl App {
                 return;
             }
 
-            // Sidebar focus: h/← steps up Tables → Databases; l/→ moves
-            // focus over into the main pane.
+            // Sidebar focus: h/← steps up Tables → Databases; l/→ opens the
+            // highlighted item (database → its tables, table → load + main).
             KeyCode::Left | KeyCode::Char('h') if self.state.focus == FocusPanel::Sidebar => {
                 if self.state.sidebar_focus == SidebarFocus::Tables {
                     self.state.sidebar_focus = SidebarFocus::Databases;
@@ -1666,7 +1722,7 @@ impl App {
                 return;
             }
             KeyCode::Right | KeyCode::Char('l') if self.state.focus == FocusPanel::Sidebar => {
-                self.state.focus = FocusPanel::Main;
+                self.nav_enter().await;
                 return;
             }
 
@@ -1744,11 +1800,11 @@ impl App {
                 return;
             }
             KeyCode::Char('g') | KeyCode::Home => {
-                self.nav_home();
+                self.nav_home().await;
                 return;
             }
             KeyCode::Char('G') | KeyCode::End => {
-                self.nav_end();
+                self.nav_end().await;
                 return;
             }
 
@@ -2039,26 +2095,58 @@ impl App {
 
     // ── Navigation helpers ────────────────────────────────────────────────
 
+    async fn nav_sidebar_delta(&mut self, delta: i32) {
+        let items = nav_items(&self.state);
+        if items.is_empty() {
+            return;
+        }
+        let current = current_nav_index(&self.state, &items).unwrap_or(0);
+        let next = if delta > 0 {
+            current.saturating_add(1).min(items.len() - 1)
+        } else {
+            current.saturating_sub(1)
+        };
+        if current_nav_index(&self.state, &items) == Some(next) {
+            return;
+        }
+        self.apply_sidebar_nav_item(items[next]).await;
+    }
+
+    async fn apply_sidebar_nav_item(&mut self, item: SidebarNavItem) {
+        match item {
+            SidebarNavItem::Database(idx) => {
+                let changed = self.state.selected_database_idx != Some(idx);
+                self.state.sidebar_focus = SidebarFocus::Databases;
+                if changed {
+                    self.state.select_database(idx);
+                    self.bump_database_generation();
+                    self.load_schema().await;
+                }
+            }
+            SidebarNavItem::Table(idx) => {
+                if idx >= self.state.tables.len() {
+                    return;
+                }
+                let changed = self.state.selected_table_idx != Some(idx);
+                self.state.sidebar_focus = SidebarFocus::Tables;
+                if changed {
+                    self.state.selected_table_idx = Some(idx);
+                    self.bump_table_generation();
+                    self.clear_table_browse_for_selection_change();
+                }
+                if changed || self.state.table_browse_result.is_none() {
+                    self.load_table_data(TableBrowseOrigin::Navigation).await;
+                    self.ensure_live_subscription().await;
+                }
+            }
+        }
+    }
+
     async fn nav_down(&mut self) {
         match self.state.focus {
-            FocusPanel::Sidebar => match self.state.sidebar_focus {
-                SidebarFocus::Databases => {
-                    let old = self.state.selected_database_idx;
-                    self.state.database_next();
-                    if self.state.selected_database_idx != old {
-                        self.bump_database_generation();
-                        self.load_schema().await;
-                    }
-                }
-                SidebarFocus::Tables => {
-                    let old = self.state.selected_table_idx;
-                    self.state.table_next();
-                    if self.state.selected_table_idx != old {
-                        self.bump_table_generation();
-                        self.clear_table_browse_for_selection_change();
-                    }
-                }
-            },
+            FocusPanel::Sidebar => {
+                self.nav_sidebar_delta(1).await;
+            }
             FocusPanel::Main => match self.state.current_tab {
                 Tab::Tables => {
                     let row_count = self
@@ -2078,14 +2166,12 @@ impl App {
                         .unwrap_or(0);
                     self.sql_grid.next_row(row_count);
                 }
-                Tab::Logs => {
-                    if !self.state.log_follow {
-                        self.state.log_scroll = self
-                            .state
-                            .log_scroll
-                            .saturating_add(1)
-                            .min(self.state.log_buffer.len().saturating_sub(1));
-                    }
+                Tab::Logs if !self.state.log_follow => {
+                    self.state.log_scroll = self
+                        .state
+                        .log_scroll
+                        .saturating_add(1)
+                        .min(self.state.log_buffer.len().saturating_sub(1));
                 }
                 Tab::Module => {
                     let count = self
@@ -2107,22 +2193,9 @@ impl App {
 
     async fn nav_up(&mut self) {
         match self.state.focus {
-            FocusPanel::Sidebar => match self.state.sidebar_focus {
-                SidebarFocus::Databases => {
-                    if database_nav_up_transition_requires_schema_reload(&mut self.state) {
-                        self.bump_database_generation();
-                        self.load_schema().await;
-                    }
-                }
-                SidebarFocus::Tables => {
-                    let old = self.state.selected_table_idx;
-                    self.state.table_prev();
-                    if self.state.selected_table_idx != old {
-                        self.bump_table_generation();
-                        self.clear_table_browse_for_selection_change();
-                    }
-                }
-            },
+            FocusPanel::Sidebar => {
+                self.nav_sidebar_delta(-1).await;
+            }
             FocusPanel::Main => match self.state.current_tab {
                 Tab::Tables => {
                     self.tables_grid.prev_row();
@@ -2130,10 +2203,8 @@ impl App {
                 Tab::Sql => {
                     self.sql_grid.prev_row();
                 }
-                Tab::Logs => {
-                    if !self.state.log_follow {
-                        self.state.log_scroll = self.state.log_scroll.saturating_sub(1);
-                    }
+                Tab::Logs if !self.state.log_follow => {
+                    self.state.log_scroll = self.state.log_scroll.saturating_sub(1);
                 }
                 Tab::Module => {
                     self.state.module_selected_reducer =
@@ -2145,20 +2216,12 @@ impl App {
         }
     }
 
-    fn nav_home(&mut self) {
+    async fn nav_home(&mut self) {
         match self.state.focus {
             FocusPanel::Sidebar => {
-                if let SidebarFocus::Tables = self.state.sidebar_focus {
-                    let old = self.state.selected_table_idx;
-                    self.state.selected_table_idx = if self.state.tables.is_empty() {
-                        None
-                    } else {
-                        Some(0)
-                    };
-                    if self.state.selected_table_idx != old {
-                        self.bump_table_generation();
-                        self.clear_table_browse_for_selection_change();
-                    }
+                let items = nav_items(&self.state);
+                if let Some(item) = items.first().copied() {
+                    self.apply_sidebar_nav_item(item).await;
                 }
             }
             FocusPanel::Main => match self.state.current_tab {
@@ -2180,7 +2243,14 @@ impl App {
         }
     }
 
-    fn nav_end(&mut self) {
+    async fn nav_end(&mut self) {
+        if self.state.focus == FocusPanel::Sidebar {
+            let items = nav_items(&self.state);
+            if let Some(item) = items.last().copied() {
+                self.apply_sidebar_nav_item(item).await;
+            }
+            return;
+        }
         if self.state.focus == FocusPanel::Main {
             match self.state.current_tab {
                 Tab::Tables => {
@@ -2208,16 +2278,21 @@ impl App {
             FocusPanel::Sidebar => {
                 match self.state.sidebar_focus {
                     SidebarFocus::Databases => {
-                        // Move focus to tables
+                        // Descend into the expanded database's tables.
                         self.state.sidebar_focus = SidebarFocus::Tables;
-                        if !self.state.tables.is_empty() && self.state.selected_table_idx.is_none()
+                        if self.state.selected_table_idx.is_none() {
+                            self.state.selected_table_idx = self.state.preferred_table_index(None);
+                        }
+                        if self.state.selected_table_idx.is_some()
+                            && self.state.table_browse_result.is_none()
                         {
-                            self.state.selected_table_idx = Some(0);
+                            self.load_table_data(TableBrowseOrigin::Navigation).await;
+                            self.ensure_live_subscription().await;
                         }
                     }
                     SidebarFocus::Tables => {
-                        // Load the selected table's data
                         self.load_table_data(TableBrowseOrigin::Navigation).await;
+                        self.ensure_live_subscription().await;
                         self.state.focus = FocusPanel::Main;
                         self.state.current_tab = Tab::Tables;
                         self.tables_grid = TableGridState::new();
@@ -2301,7 +2376,15 @@ impl App {
         self.state.query_loading = true;
         self.state.table_browse_result = None;
 
-        let sql = format!("SELECT * FROM {table} LIMIT 200");
+        let sql = match table_browse_sql(&table) {
+            Ok(sql) => sql,
+            Err(error) => {
+                self.state.query_loading = false;
+                self.state
+                    .set_error(format!("Cannot browse table: {error}"));
+                return;
+            }
+        };
         let client = self.client.clone();
         let tx = self.event_tx.clone();
         let context = self.current_table_browse_request_context(db.clone(), table.clone(), origin);
@@ -3380,19 +3463,15 @@ impl App {
                     self.dispatch_modal_action(modal).await;
                     return;
                 }
-                KeyCode::Tab | KeyCode::Down => {
-                    if !fields.is_empty() {
-                        *focus = (*focus + 1) % fields.len();
-                    }
+                KeyCode::Tab | KeyCode::Down if !fields.is_empty() => {
+                    *focus = (*focus + 1) % fields.len();
                 }
-                KeyCode::BackTab | KeyCode::Up => {
-                    if !fields.is_empty() {
-                        *focus = if *focus == 0 {
-                            fields.len() - 1
-                        } else {
-                            *focus - 1
-                        };
-                    }
+                KeyCode::BackTab | KeyCode::Up if !fields.is_empty() => {
+                    *focus = if *focus == 0 {
+                        fields.len() - 1
+                    } else {
+                        *focus - 1
+                    };
                 }
                 KeyCode::Left => {
                     if let Some(f) = fields.get_mut(*focus) {
@@ -4795,6 +4874,8 @@ impl App {
         self.ws_handle = None;
         self.state.ws_connected = false;
         self.state.live_table_data.clear();
+        self.live_subscribed = None;
+        self.live_query_ids.clear();
 
         let db = match self.state.selected_database() {
             Some(d) => d.to_string(),
@@ -4903,9 +4984,7 @@ impl App {
                 self.state.ws_connected = true;
                 self.state.ws_reconnect_deadline = None;
                 self.state.ws_reconnect_attempt = 0;
-                // No automatic all-table subscription. The Live
-                // tab shows a disabled notice; bounded scoped Live will
-                // return later.
+                self.ensure_live_subscription().await;
             }
             WsEvent::ServerMessage(msg) => {
                 self.handle_ws_server_message(msg);
@@ -4940,6 +5019,23 @@ impl App {
             }
             WsEvent::Error(e) => {
                 tracing::warn!("WebSocket error: {e}");
+                if e.contains("smaller window") || e.contains("size limit") {
+                    let previous = self.live_time_window_us;
+                    self.live_time_window_us = (self.live_time_window_us / 4).max(0);
+                    self.live_subscribed = None;
+                    if previous == 0 {
+                        self.state.set_notification(
+                            "Live snapshot is too large even for new rows; live paused for this table"
+                                .to_string(),
+                        );
+                    } else {
+                        self.state.set_notification(format!(
+                            "Live window shrunk to {}ms to stay under the WebSocket size limit",
+                            self.live_time_window_us / 1000
+                        ));
+                        self.ensure_live_subscription().await;
+                    }
+                }
             }
             WsEvent::RawText(text) => {
                 // Raw frames we can't decode as structured messages — log for diagnostics
@@ -4953,48 +5049,270 @@ impl App {
         use crate::api::types::WsServerMessage;
         match msg {
             WsServerMessage::InitialSubscription(payload) => {
-                self.bump_table_generation();
-                // Initial snapshot — replace any existing live data for each table.
-                let mut total_rows = 0usize;
-                for table_update in payload.database_update.tables {
-                    total_rows += table_update.inserts.len();
-                    self.state
-                        .live_table_data
-                        .insert(table_update.table_name, table_update.inserts);
+                self.apply_live_table_updates(payload.database_update.tables, true);
+            }
+            WsServerMessage::SubscribeMultiApplied(payload) => {
+                self.apply_live_table_updates(payload.update.tables, true);
+            }
+            WsServerMessage::SubscribeApplied(payload) => {
+                if let Some(rows) = payload.rows.and_then(|r| r.table_rows) {
+                    self.apply_live_table_updates(vec![rows], true);
                 }
-                send_event(
-                    &self.event_tx,
-                    AppEvent::Notification(format!("Live subscription active — {total_rows} rows")),
-                );
             }
             WsServerMessage::TransactionUpdate(payload) => {
-                self.bump_table_generation();
-                // Incremental update — apply inserts/deletes to the cached
-                // live data. Deletes are matched by exact JSON value equality
-                // (the server's row identity model isn't exposed in the JSON
-                // protocol, so this is a best-effort match).
-                let mut total_changes = 0usize;
-                for table_update in payload.database_update.tables {
-                    let inserts_n = table_update.inserts.len();
-                    let deletes_n = table_update.deletes.len();
-                    total_changes += inserts_n + deletes_n;
-                    let entry = self
-                        .state
-                        .live_table_data
-                        .entry(table_update.table_name)
-                        .or_default();
-                    if !table_update.deletes.is_empty() {
-                        entry.retain(|row| !table_update.deletes.contains(row));
-                    }
-                    entry.extend(table_update.inserts);
-                }
-                if total_changes > 0 {
-                    tracing::debug!("Transaction update: {total_changes} row changes");
-                }
+                self.apply_live_table_updates(payload.table_updates(), false);
+            }
+            WsServerMessage::TransactionUpdateLight(payload) => {
+                self.apply_live_table_updates(payload.update.tables, false);
+            }
+            WsServerMessage::SubscriptionError(payload) => {
+                let error = if payload.error.is_empty() {
+                    "Live subscription error".to_string()
+                } else {
+                    payload.error
+                };
+                tracing::warn!("Live subscription error: {error}");
+                self.state
+                    .set_notification(format!("Live subscription error: {error}"));
             }
             WsServerMessage::IdentityToken(payload) => {
                 tracing::info!("WebSocket identity confirmed: {:?}", payload.identity);
             }
+        }
+    }
+
+    async fn toggle_live(&mut self) {
+        self.state.live_enabled = !self.state.live_enabled;
+        if self.state.live_enabled {
+            self.live_time_window_us = crate::api::live_subscribe::DEFAULT_LIVE_WINDOW_US;
+            self.state
+                .set_notification("Live updates on — scoped to the selected table".to_string());
+            self.ensure_live_subscription().await;
+        } else {
+            self.state.live_table_data.clear();
+            self.live_subscribed = None;
+            self.state
+                .set_notification("Live updates off — use r to refresh".to_string());
+            if let Some(handle) = self.ws_handle.as_ref() {
+                for query_id in self.live_query_ids.drain(..) {
+                    self.live_request_id = self.live_request_id.wrapping_add(1);
+                    let _ = handle.unsubscribe(self.live_request_id, query_id).await;
+                }
+            }
+        }
+    }
+
+    async fn ensure_live_subscription(&mut self) {
+        if !self.state.live_enabled || !self.state.ws_connected {
+            return;
+        }
+        let Some(table) = self.state.selected_table().cloned() else {
+            return;
+        };
+        let table_name = table.table_name.clone();
+        let window = self.live_time_window_us;
+        if self.live_subscribed.as_ref() == Some(&(table_name.clone(), window)) {
+            return;
+        }
+
+        let now_us = chrono::Utc::now().timestamp_micros();
+        let browse = self.state.table_browse_result.clone();
+        let plan = crate::api::live_subscribe::plan_live_subscribe(
+            &table,
+            now_us,
+            window,
+            browse.as_ref(),
+        );
+        let queries = match plan {
+            crate::api::live_subscribe::LiveSubscribePlan::Queries(queries)
+                if !queries.is_empty() =>
+            {
+                queries
+            }
+            crate::api::live_subscribe::LiveSubscribePlan::Queries(_)
+            | crate::api::live_subscribe::LiveSubscribePlan::NotReady { .. } => {
+                // Wait for browse (integer PK tail) or skip unbounded tables.
+                return;
+            }
+        };
+
+        let Some(handle) = self.ws_handle.as_ref() else {
+            return;
+        };
+        for query_id in self.live_query_ids.drain(..) {
+            self.live_request_id = self.live_request_id.wrapping_add(1);
+            if let Err(error) = handle.unsubscribe(self.live_request_id, query_id).await {
+                tracing::warn!("Live unsubscribe failed: {error}");
+            }
+        }
+        self.live_request_id = self.live_request_id.wrapping_add(1);
+        let _ = handle.subscribe(Vec::new(), self.live_request_id).await;
+        for query in queries {
+            self.next_live_query_id = self.next_live_query_id.wrapping_add(1);
+            self.live_request_id = self.live_request_id.wrapping_add(1);
+            let query_id = self.next_live_query_id;
+            if let Err(error) = handle
+                .subscribe_single(query, self.live_request_id, query_id)
+                .await
+            {
+                tracing::warn!("Live subscribe failed: {error}");
+                self.state
+                    .set_notification(format!("Live subscribe failed: {error}"));
+                return;
+            }
+            self.live_query_ids.push(query_id);
+        }
+        self.live_subscribed = Some((table_name.clone(), window));
+        self.state.set_notification(format!(
+            "Live watching recent rows in {} chunk(s) — not the full table",
+            self.live_query_ids.len()
+        ));
+    }
+
+    fn apply_live_table_updates(
+        &mut self,
+        tables: Vec<crate::api::types::TableUpdate>,
+        snapshot: bool,
+    ) {
+        if !self.state.live_enabled || tables.is_empty() {
+            return;
+        }
+        let selected = self
+            .state
+            .selected_table()
+            .map(|table| table.table_name.clone());
+        let mut total_inserts = 0usize;
+        let mut total_deletes = 0usize;
+
+        for table_update in tables {
+            let inserts = table_update.insert_rows();
+            let deletes = table_update.delete_rows();
+            total_inserts += inserts.len();
+            total_deletes += deletes.len();
+            let name = table_update.table_name;
+
+            self.state
+                .push_live_event(crate::state::app_state::LiveEvent {
+                    at: chrono::Utc::now(),
+                    table_name: name.clone(),
+                    inserts: inserts.len(),
+                    deletes: deletes.len(),
+                    snapshot,
+                });
+
+            let entry = self.state.live_table_data.entry(name.clone()).or_default();
+            if snapshot {
+                *entry = inserts.clone();
+            } else {
+                if !deletes.is_empty() {
+                    entry
+                        .retain(|row| !deletes.iter().any(|deleted| live_rows_match(row, deleted)));
+                }
+                entry.extend(inserts.iter().cloned());
+            }
+            if entry.len() > LIVE_TABLE_ROW_LIMIT {
+                let drop_n = entry.len() - LIVE_TABLE_ROW_LIMIT;
+                entry.drain(0..drop_n);
+            }
+
+            if selected.as_deref() == Some(name.as_str()) {
+                self.merge_live_into_browse(&name, &inserts, &deletes, snapshot);
+            }
+        }
+
+        if snapshot {
+            tracing::debug!("Live snapshot chunk: {total_inserts} rows");
+        } else if total_inserts + total_deletes > 0 {
+            tracing::debug!("Live update: +{total_inserts} -{total_deletes} row changes");
+        }
+    }
+
+    fn merge_live_into_browse(
+        &mut self,
+        table_name: &str,
+        inserts: &[serde_json::Value],
+        deletes: &[serde_json::Value],
+        snapshot: bool,
+    ) {
+        if self.state.edit_mode.is_some() {
+            return;
+        }
+        let columns: Vec<String> = if let Some(result) = self.state.table_browse_result.as_ref() {
+            result
+                .column_names()
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        } else if let Some(table) = self
+            .state
+            .tables
+            .iter()
+            .find(|table| table.table_name == table_name)
+        {
+            table
+                .columns
+                .iter()
+                .map(|col| col.col_name.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if columns.is_empty() && self.state.table_browse_result.is_none() {
+            return;
+        }
+
+        let delete_cells: Vec<Vec<serde_json::Value>> = deletes
+            .iter()
+            .map(|row| crate::api::types::ws_row_to_cells(row, &columns))
+            .collect();
+        let insert_cells: Vec<Vec<serde_json::Value>> = inserts
+            .iter()
+            .map(|row| crate::api::types::ws_row_to_cells(row, &columns))
+            .collect();
+
+        if let Some(result) = self.state.table_browse_result.as_mut() {
+            if !snapshot {
+                if !delete_cells.is_empty() {
+                    result
+                        .rows
+                        .retain(|row| !delete_cells.iter().any(|deleted| deleted == row));
+                }
+                result.rows.extend(insert_cells);
+                if result.rows.len() > LIVE_BROWSE_ROW_LIMIT {
+                    let drop_n = result.rows.len() - LIVE_BROWSE_ROW_LIMIT;
+                    result.rows.drain(0..drop_n);
+                }
+            }
+            return;
+        }
+
+        if snapshot && !self.state.query_loading {
+            let schema: Vec<crate::api::types::SchemaElement> = self
+                .state
+                .tables
+                .iter()
+                .find(|table| table.table_name == table_name)
+                .map(|table| {
+                    table
+                        .columns
+                        .iter()
+                        .map(|col| crate::api::types::SchemaElement {
+                            name: col.col_name.clone(),
+                            algebraic_type: col.col_type.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if schema.is_empty() {
+                return;
+            }
+            let mut rows = insert_cells;
+            rows.truncate(LIVE_BROWSE_ROW_LIMIT);
+            self.state.table_browse_result = Some(crate::api::types::QueryResult {
+                schema,
+                rows,
+                total_duration_micros: 0,
+            });
         }
     }
 
@@ -5071,11 +5389,11 @@ impl App {
                     let restored = self
                         .pending_session
                         .as_ref()
-                        .and_then(|s| s.last_table.as_deref())
-                        .and_then(|name| {
-                            self.state.tables.iter().position(|t| t.table_name == name)
-                        });
-                    self.state.selected_table_idx = Some(restored.unwrap_or(0));
+                        .and_then(|s| s.last_table.as_deref());
+                    self.state.selected_table_idx = self.state.preferred_table_index(restored);
+                }
+                if self.state.selected_table_idx.is_some() {
+                    self.state.sidebar_focus = SidebarFocus::Tables;
                 }
                 // Session restore is one-shot — don't keep firing it
                 // every time the user navigates to a new database.
@@ -5088,6 +5406,11 @@ impl App {
                 );
                 // Establish WebSocket subscription for live data
                 self.connect_ws().await;
+                if self.state.selected_table_idx.is_some()
+                    && self.state.table_browse_result.is_none()
+                {
+                    self.load_table_data(TableBrowseOrigin::Navigation).await;
+                }
                 if let Some(refresh) = deferred_refresh_before_connect {
                     if self.selected_table_matches(&refresh.table) {
                         self.deferred_guided_refresh =
@@ -5172,6 +5495,9 @@ impl App {
                 self.state
                     .set_notification(format!("{row_count} rows loaded"));
                 self.flush_deferred_guided_refresh_if_unowned().await;
+                // Integer-PK tables wait for browse before opening a live
+                // tail (`WHERE pk > max`). Timestamp tables already subscribed.
+                self.ensure_live_subscription().await;
             }
 
             AppEvent::TableBrowseError { context, error } => {
@@ -8414,7 +8740,8 @@ mod modal_helper_tests {
         app.state.current_tab = Tab::Tables;
         queue_users_refresh(&mut app);
 
-        app.state.sidebar_focus = SidebarFocus::Databases;
+        app.state.sidebar_focus = SidebarFocus::Tables;
+        app.state.selected_table_idx = Some(0);
         app.nav_down().await;
         app.state.tables = schema_with_table("users").tables;
         app.state.selected_table_idx = Some(0);
@@ -9536,8 +9863,10 @@ mod modal_helper_tests {
 
         app.state.table_browse_result = Some(query_result("old"));
         app.tables_grid.selected_row = 1;
-        app.state.sidebar_focus = SidebarFocus::Databases;
+        app.state.sidebar_focus = SidebarFocus::Tables;
+        app.state.selected_table_idx = Some(1);
         app.nav_down().await;
+        assert_eq!(app.state.selected_database(), Some("b"));
         assert!(app.state.table_browse_result.is_none());
         assert_eq!(app.tables_grid.selected_row, 0);
     }
@@ -9568,6 +9897,149 @@ mod modal_helper_tests {
             &mut state
         ));
         assert_eq!(state.selected_database(), Some("alpha"));
+    }
+
+    #[test]
+    fn table_browse_sql_quotes_identifiers() {
+        assert_eq!(
+            table_browse_sql("source_status").unwrap(),
+            r#"SELECT * FROM "source_status" LIMIT 200"#
+        );
+        assert_eq!(
+            table_browse_sql(r#"we"ird"#).unwrap(),
+            r#"SELECT * FROM "we""ird" LIMIT 200"#
+        );
+    }
+
+    #[tokio::test]
+    async fn sidebar_j_from_database_walks_nested_tables() {
+        let mut app = test_app();
+        app.state.databases = vec!["sitdeck".to_string()];
+        app.state.selected_database_idx = Some(0);
+        app.state.tables = vec![
+            make_table_with_pk("annotation", vec![typed_col_at(0, "id", "String")], vec![0]),
+            make_table_with_pk(
+                "source_status",
+                vec![typed_col_at(0, "key", "String")],
+                vec![0],
+            ),
+        ];
+        app.state.selected_table_idx = Some(0);
+        app.state.focus = FocusPanel::Sidebar;
+        app.state.sidebar_focus = SidebarFocus::Databases;
+
+        app.nav_down().await;
+        assert_eq!(app.state.sidebar_focus, SidebarFocus::Tables);
+        assert_eq!(
+            app.state.selected_table().map(|t| t.table_name.as_str()),
+            Some("annotation")
+        );
+
+        app.nav_down().await;
+        assert_eq!(
+            app.state.selected_table().map(|t| t.table_name.as_str()),
+            Some("source_status")
+        );
+    }
+
+    #[tokio::test]
+    async fn key_release_does_not_advance_sidebar_selection() {
+        let mut app = test_app();
+        app.state.databases = vec!["sitdeck".to_string()];
+        app.state.selected_database_idx = Some(0);
+        app.state.tables = vec![
+            make_table_with_pk("annotation", vec![typed_col_at(0, "id", "String")], vec![0]),
+            make_table_with_pk(
+                "source_status",
+                vec![typed_col_at(0, "key", "String")],
+                vec![0],
+            ),
+            make_table_with_pk(
+                "user_account",
+                vec![typed_col_at(0, "id", "String")],
+                vec![0],
+            ),
+        ];
+        app.state.selected_table_idx = Some(0);
+        app.state.focus = FocusPanel::Sidebar;
+        app.state.sidebar_focus = SidebarFocus::Tables;
+
+        let mut release = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        release.kind = KeyEventKind::Release;
+        app.handle_key(release).await;
+        assert_eq!(
+            app.state.selected_table().map(|t| t.table_name.as_str()),
+            Some("annotation"),
+            "Windows key-release must not move the cursor"
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await;
+        assert_eq!(
+            app.state.selected_table().map(|t| t.table_name.as_str()),
+            Some("source_status")
+        );
+    }
+
+    #[test]
+    fn live_light_update_applies_without_bumping_table_generation() {
+        let mut app = test_app();
+        app.state.databases = vec!["sitdeck".to_string()];
+        app.state.selected_database_idx = Some(0);
+        app.state.tables = vec![make_table_with_pk(
+            "source_status",
+            vec![
+                typed_col_at(0, "key", "String"),
+                typed_col_at(1, "healthy", "Bool"),
+            ],
+            vec![0],
+        )];
+        app.state.selected_table_idx = Some(0);
+        app.state.table_browse_result = Some(crate::api::types::QueryResult {
+            schema: vec![
+                crate::api::types::SchemaElement {
+                    name: "key".to_string(),
+                    algebraic_type: serde_json::json!("String"),
+                },
+                crate::api::types::SchemaElement {
+                    name: "healthy".to_string(),
+                    algebraic_type: serde_json::json!("Bool"),
+                },
+            ],
+            rows: vec![vec![serde_json::json!("AIS"), serde_json::json!(true)]],
+            total_duration_micros: 0,
+        });
+        let generation = app.table_generation;
+
+        let message: crate::api::types::WsServerMessage = serde_json::from_str(
+            r#"{
+                "TransactionUpdateLight": {
+                    "request_id": 0,
+                    "update": {
+                        "tables": [{
+                            "table_id": 1,
+                            "table_name": "source_status",
+                            "num_rows": 2,
+                            "updates": [{
+                                "deletes": ["[\"AIS\", true]"],
+                                "inserts": ["[\"AIS\", false]"]
+                            }]
+                        }]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        app.handle_ws_server_message(message);
+
+        assert_eq!(app.table_generation, generation);
+        let rows = &app.state.table_browse_result.as_ref().unwrap().rows;
+        assert_eq!(
+            rows,
+            &vec![vec![serde_json::json!("AIS"), serde_json::json!(false)]]
+        );
+        assert_eq!(app.state.live_events.len(), 1);
+        assert!(!app.state.live_events[0].snapshot);
     }
 
     #[test]

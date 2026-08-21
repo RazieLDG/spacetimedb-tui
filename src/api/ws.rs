@@ -9,9 +9,10 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{
-    connect_async,
+    connect_async, connect_async_with_config,
     tungstenite::{
         handshake::client::{generate_key, Request},
+        protocol::WebSocketConfig,
         Error as TungError, Message,
     },
 };
@@ -84,6 +85,56 @@ impl SubscribeEnvelope {
     }
 }
 
+/// Additive single-query subscribe. Each query gets its own snapshot
+/// message (`SubscribeApplied`), which is how Live chunks a large table
+/// across several WebSocket frames instead of one 64 MiB payload.
+#[derive(Debug, Serialize)]
+struct SubscribeSingleEnvelope {
+    #[serde(rename = "SubscribeSingle")]
+    subscribe_single: SubscribeSinglePayload,
+}
+
+#[derive(Debug, Serialize)]
+struct SubscribeSinglePayload {
+    query: String,
+    request_id: u32,
+    query_id: QueryIdPayload,
+}
+
+#[derive(Debug, Serialize)]
+struct UnsubscribeEnvelope {
+    #[serde(rename = "Unsubscribe")]
+    unsubscribe: UnsubscribePayload,
+}
+
+#[derive(Debug, Serialize)]
+struct UnsubscribePayload {
+    request_id: u32,
+    query_id: QueryIdPayload,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct QueryIdPayload {
+    id: u32,
+}
+
+/// Incoming JSON message size cap. SpacetimeDB / tungstenite default is
+/// 64 MiB; Live never asks for a snapshot that large. 8 MiB still fits a
+/// bounded chunk and fails fast if a query is too wide.
+pub const WS_MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
+pub const WS_MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
+
+fn ws_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(WS_MAX_MESSAGE_SIZE))
+        .max_frame_size(Some(WS_MAX_FRAME_SIZE))
+}
+
+fn is_message_too_long(error: &TungError) -> bool {
+    let text = error.to_string();
+    text.contains("Message too long") || text.contains("Space limit exceeded")
+}
+
 /// A reducer call request (reserved for future use).
 #[derive(Debug, Serialize)]
 #[allow(dead_code)]
@@ -147,14 +198,41 @@ pub struct WsHandle {
 impl WsHandle {
     /// Send a subscription request to the server.
     ///
-    /// Scoped-subscription infrastructure; not yet called from
-    /// production code.
-    #[allow(dead_code)]
+    /// A `Subscribe` replaces the connection's query set. Callers must
+    /// pass a single-table query (or an empty list to clear Live).
     pub async fn subscribe(&self, queries: Vec<String>, request_id: u32) -> Result<()> {
         self.cmd_tx
             .send(WsCommand::Subscribe {
                 queries,
                 request_id,
+            })
+            .await
+            .context("WebSocket task has shut down")
+    }
+
+    /// Subscribe to one bounded SQL query. Unlike [`Self::subscribe`],
+    /// this does not replace other queries on the connection.
+    pub async fn subscribe_single(
+        &self,
+        query: String,
+        request_id: u32,
+        query_id: u32,
+    ) -> Result<()> {
+        self.cmd_tx
+            .send(WsCommand::SubscribeSingle {
+                query,
+                request_id,
+                query_id,
+            })
+            .await
+            .context("WebSocket task has shut down")
+    }
+
+    pub async fn unsubscribe(&self, request_id: u32, query_id: u32) -> Result<()> {
+        self.cmd_tx
+            .send(WsCommand::Unsubscribe {
+                request_id,
+                query_id,
             })
             .await
             .context("WebSocket task has shut down")
@@ -171,13 +249,27 @@ impl WsHandle {
 /// Commands sent from the TUI to the WebSocket background task.
 #[derive(Debug)]
 enum WsCommand {
-    /// Scoped-subscription command; not yet issued from production.
-    #[allow(dead_code)]
     Subscribe {
         queries: Vec<String>,
         request_id: u32,
     },
+    SubscribeSingle {
+        query: String,
+        request_id: u32,
+        query_id: u32,
+    },
+    Unsubscribe {
+        request_id: u32,
+        query_id: u32,
+    },
     Close,
+}
+
+#[derive(Debug, Clone)]
+struct SingleSub {
+    query: String,
+    request_id: u32,
+    query_id: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -295,9 +387,10 @@ async fn subscription_task(
 ) {
     let mut backoff = RECONNECT_INITIAL_DELAY;
     let mut attempt: u32 = 0;
-    // Re-applied after every reconnect so the user doesn't have to manually
-    // re-subscribe when the server bounces.
-    let mut last_subscription: Option<(Vec<String>, u32)> = None;
+    // Re-applied after every reconnect. Live uses SubscribeSingle chunks
+    // rather than one unbounded Subscribe, so a huge snapshot is not
+    // replayed after a size-limit disconnect.
+    let mut last_singles: Vec<SingleSub> = Vec::new();
 
     loop {
         attempt += 1;
@@ -306,7 +399,7 @@ async fn subscription_task(
             auth_token.as_deref(),
             &mut cmd_rx,
             &event_tx,
-            &mut last_subscription,
+            &mut last_singles,
         )
         .await
         {
@@ -359,7 +452,7 @@ async fn connect_subscription_once(
     auth_token: Option<&str>,
     cmd_rx: &mut mpsc::Receiver<WsCommand>,
     event_tx: &mpsc::Sender<WsEvent>,
-    last_subscription: &mut Option<(Vec<String>, u32)>,
+    last_singles: &mut Vec<SingleSub>,
 ) -> ConnectOutcome {
     info!("Connecting to subscription WebSocket: {}", url);
 
@@ -368,7 +461,7 @@ async fn connect_subscription_once(
         Err(e) => return ConnectOutcome::Lost(format!("Request build error: {e}")),
     };
 
-    let (ws_stream, _) = match connect_async(request).await {
+    let (ws_stream, _) = match connect_async_with_config(request, Some(ws_config()), false).await {
         Ok(pair) => pair,
         Err(e) => {
             // Classify the handshake failure. A server-side HTTP error
@@ -395,10 +488,16 @@ async fn connect_subscription_once(
 
     let (mut sink, mut stream) = ws_stream.split();
 
-    // After a reconnect, automatically re-subscribe with the queries the
-    // user issued before the connection dropped.
-    if let Some((queries, request_id)) = last_subscription.clone() {
-        let msg = SubscribeEnvelope::new(queries, request_id);
+    // After a reconnect, replay each bounded SubscribeSingle. Do not
+    // replay an unbounded `SELECT *` snapshot.
+    for sub in last_singles.clone() {
+        let msg = SubscribeSingleEnvelope {
+            subscribe_single: SubscribeSinglePayload {
+                query: sub.query,
+                request_id: sub.request_id,
+                query_id: QueryIdPayload { id: sub.query_id },
+            },
+        };
         if let Ok(json) = serde_json::to_string(&msg) {
             if let Err(e) = sink.send(Message::Text(json.into())).await {
                 return ConnectOutcome::Lost(format!("Re-subscribe send error: {e}"));
@@ -421,12 +520,22 @@ async fn connect_subscription_once(
                     }
                     Some(Err(e)) => {
                         warn!("WebSocket frame error: {e}");
+                        if is_message_too_long(&e) {
+                            last_singles.clear();
+                            let _ = event_tx
+                                .send(WsEvent::Error(
+                                    "Live snapshot exceeded the WebSocket size limit; retrying a smaller window"
+                                        .to_string(),
+                                ))
+                                .await;
+                            return ConnectOutcome::Lost(
+                                "message too long (live window will shrink)".to_string(),
+                            );
+                        }
                         if event_tx.send(WsEvent::Error(e.to_string())).await.is_err() {
                             debug!("WS error event dropped — receiver gone");
                             return ConnectOutcome::Closed;
                         }
-                        // A fatal error will surface as `None` on the next
-                        // iteration; transient frame errors are tolerated.
                     }
                     None => {
                         info!("WebSocket stream closed by server");
@@ -441,8 +550,10 @@ async fn connect_subscription_once(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(WsCommand::Subscribe { queries, request_id }) => {
-                        let msg = SubscribeEnvelope::new(queries.clone(), request_id);
-                        *last_subscription = Some((queries, request_id));
+                        if queries.is_empty() {
+                            last_singles.clear();
+                        }
+                        let msg = SubscribeEnvelope::new(queries, request_id);
                         let json = match serde_json::to_string(&msg) {
                             Ok(j) => j,
                             Err(e) => {
@@ -453,6 +564,53 @@ async fn connect_subscription_once(
                         if let Err(e) = sink.send(Message::Text(json.into())).await {
                             error!("Failed to send Subscribe frame: {e}");
                             return ConnectOutcome::Lost(format!("Send error: {e}"));
+                        }
+                    }
+                    Some(WsCommand::SubscribeSingle {
+                        query,
+                        request_id,
+                        query_id,
+                    }) => {
+                        last_singles.retain(|sub| sub.query_id != query_id);
+                        last_singles.push(SingleSub {
+                            query: query.clone(),
+                            request_id,
+                            query_id,
+                        });
+                        let msg = SubscribeSingleEnvelope {
+                            subscribe_single: SubscribeSinglePayload {
+                                query,
+                                request_id,
+                                query_id: QueryIdPayload { id: query_id },
+                            },
+                        };
+                        let json = match serde_json::to_string(&msg) {
+                            Ok(j) => j,
+                            Err(e) => {
+                                warn!("Failed to serialise SubscribeSingle: {e}");
+                                continue;
+                            }
+                        };
+                        if let Err(e) = sink.send(Message::Text(json.into())).await {
+                            error!("Failed to send SubscribeSingle frame: {e}");
+                            return ConnectOutcome::Lost(format!("Send error: {e}"));
+                        }
+                    }
+                    Some(WsCommand::Unsubscribe {
+                        request_id,
+                        query_id,
+                    }) => {
+                        last_singles.retain(|sub| sub.query_id != query_id);
+                        let msg = UnsubscribeEnvelope {
+                            unsubscribe: UnsubscribePayload {
+                                request_id,
+                                query_id: QueryIdPayload { id: query_id },
+                            },
+                        };
+                        if let Ok(json) = serde_json::to_string(&msg) {
+                            if let Err(e) = sink.send(Message::Text(json.into())).await {
+                                return ConnectOutcome::Lost(format!("Send error: {e}"));
+                            }
                         }
                     }
                     Some(WsCommand::Close) | None => {
@@ -706,6 +864,22 @@ mod tests {
         assert_eq!(
             json,
             r#"{"Subscribe":{"query_strings":["SELECT * FROM users"],"request_id":7}}"#
+        );
+    }
+
+    #[test]
+    fn test_subscribe_single_envelope_json_format() {
+        let env = SubscribeSingleEnvelope {
+            subscribe_single: SubscribeSinglePayload {
+                query: r#"SELECT * FROM "live_event" WHERE "created_at_us" > 1"#.to_string(),
+                request_id: 3,
+                query_id: QueryIdPayload { id: 9 },
+            },
+        };
+        let json = serde_json::to_string(&env).unwrap();
+        assert_eq!(
+            json,
+            r#"{"SubscribeSingle":{"query":"SELECT * FROM \"live_event\" WHERE \"created_at_us\" > 1","request_id":3,"query_id":{"id":9}}}"#
         );
     }
 

@@ -1,15 +1,10 @@
 //! Live tab — database activity overview.
 //!
 //! Splits the content area into two panes:
-//! - **Disabled notice** (top): explains that automatic Live
-//!   subscriptions are temporarily unavailable.
+//! - **Transaction feed** (top): scoped live inserts/deletes for the
+//!   selected table, driven by the WebSocket subscription.
 //! - **Connected clients** (bottom): a periodically-refreshed list of
-//!   identities pulled from `st_client` via a background SQL query
-//!   (metadata polling, not row-level Live).
-//!
-//! Both panels read from `AppState` and therefore need no local state
-//! of their own — hitting `1`..`6` to switch tabs always returns to
-//! the latest snapshot.
+//!   identities pulled from `st_client` via a background SQL query.
 
 use ratatui::{
     buffer::Buffer,
@@ -23,22 +18,21 @@ use crate::state::{AppState, FocusPanel};
 
 /// Whether automatic Live subscriptions are available in this build.
 ///
-/// Unbounded all-table subscriptions while the safety
-/// controls are tightened. Bounded, scoped Live will return later.
+/// Live is always scoped to the selected table. All-table subscribe
+/// is not offered.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LiveAvailability {
-    TemporarilyUnavailable,
+    ScopedToSelectedTable,
 }
 
 /// Report the current availability of automatic Live subscriptions.
 pub fn live_subscription_availability() -> LiveAvailability {
-    LiveAvailability::TemporarilyUnavailable
+    LiveAvailability::ScopedToSelectedTable
 }
 
-/// User-facing explanation shown in place of the Live feed while
-/// automatic subscriptions are disabled.
-pub fn live_disabled_message() -> &'static str {
-    "Live updates are temporarily unavailable while safety controls are tightened. Use manual refresh for table data. Bounded scoped Live will return later; broad automatic subscriptions are currently unavailable."
+/// User-facing explanation of the Live contract.
+pub fn live_status_message() -> &'static str {
+    "Live updates are scoped to the selected table. Ctrl+L toggles them. Broad automatic all-table subscriptions are unavailable."
 }
 
 fn rgb((r, g, b): (u8, u8, u8)) -> Color {
@@ -47,10 +41,7 @@ fn rgb((r, g, b): (u8, u8, u8)) -> Color {
 
 /// Render the Live tab — disabled notice on top, clients below.
 ///
-/// The top pane branches on [`live_subscription_availability`]: while
-/// subscriptions are [`LiveAvailability::TemporarilyUnavailable`] it draws
-/// the disabled notice; a future `Available` variant would restore
-/// the transaction feed.
+/// The top pane is the scoped transaction feed for the selected table.
 pub fn render_live(area: Rect, buf: &mut Buffer, app: &AppState) {
     let theme = &app.theme;
     let accent = rgb(theme.accent);
@@ -85,26 +76,41 @@ pub fn render_live(area: Rect, buf: &mut Buffer, app: &AppState) {
         .split(inner);
 
     match live_subscription_availability() {
-        LiveAvailability::TemporarilyUnavailable => {
-            render_disabled_notice(sections[0], buf, app);
+        LiveAvailability::ScopedToSelectedTable => {
+            render_transaction_feed(sections[0], buf, app);
         }
     }
     render_client_list(sections[1], buf, app);
 }
 
-// ── Disabled notice ──────────────────────────────────────────────────────────
+// ── Transaction feed ─────────────────────────────────────────────────────────
 
-fn render_disabled_notice(area: Rect, buf: &mut Buffer, app: &AppState) {
+fn render_transaction_feed(area: Rect, buf: &mut Buffer, app: &AppState) {
     let theme = &app.theme;
     let accent = rgb(theme.accent);
     let fg_muted = rgb(theme.fg_muted);
+    let fg_primary = rgb(theme.fg_primary);
     let border_normal = rgb(theme.border_normal);
+    let success = rgb(theme.success);
+    let warning = rgb(theme.warning);
+
+    let status = if !app.live_enabled {
+        "off"
+    } else if app.ws_connected {
+        "live"
+    } else {
+        "connecting"
+    };
+    let table = app
+        .selected_table()
+        .map(|t| t.table_name.as_str())
+        .unwrap_or("no table");
 
     let block = Block::default()
         .borders(Borders::BOTTOM)
         .border_style(Style::default().fg(border_normal))
         .title(Span::styled(
-            " 🔁 Transactions  ",
+            format!(" 🔁 Transactions  [{status}]  {table}  "),
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
@@ -114,13 +120,59 @@ fn render_disabled_notice(area: Rect, buf: &mut Buffer, app: &AppState) {
         return;
     }
 
-    let msg = live_disabled_message();
-    let y = inner.y + inner.height / 2;
-    let line = Line::from(Span::styled(
-        format!("  {msg}"),
-        Style::default().fg(fg_muted),
-    ));
-    buf.set_line(inner.x, y, &line, inner.width);
+    if app.live_events.is_empty() {
+        let msg = if !app.live_enabled {
+            "  Live is off — press Ctrl+L to subscribe to the selected table."
+        } else if app.selected_table().is_none() {
+            "  Select a table in the sidebar to start scoped live updates."
+        } else {
+            "  Waiting for live events… row changes on the selected table appear here."
+        };
+        let y = inner.y + inner.height.saturating_sub(2) / 2;
+        buf.set_line(
+            inner.x,
+            y,
+            &Line::from(Span::styled(msg, Style::default().fg(fg_muted))),
+            inner.width,
+        );
+        if inner.height > 2 {
+            buf.set_line(
+                inner.x,
+                y.saturating_add(1),
+                &Line::from(Span::styled(
+                    format!("  {}", live_status_message()),
+                    Style::default().fg(fg_muted),
+                )),
+                inner.width,
+            );
+        }
+        return;
+    }
+
+    let visible = inner.height as usize;
+    let skip = app.live_events.len().saturating_sub(visible);
+    for (row, event) in app.live_events.iter().skip(skip).enumerate() {
+        let y = inner.y + row as u16;
+        if y >= inner.y + inner.height {
+            break;
+        }
+        let ts = event.at.format("%H:%M:%S").to_string();
+        let kind = if event.snapshot { "snapshot" } else { "update" };
+        let line = Line::from(vec![
+            Span::styled(format!(" {ts} "), Style::default().fg(fg_muted)),
+            Span::styled(
+                format!("{kind:<8} "),
+                Style::default().fg(if event.snapshot { accent } else { fg_primary }),
+            ),
+            Span::styled(
+                format!("{}  ", event.table_name),
+                Style::default().fg(fg_primary),
+            ),
+            Span::styled(format!("+{} ", event.inserts), Style::default().fg(success)),
+            Span::styled(format!("-{}", event.deletes), Style::default().fg(warning)),
+        ]);
+        buf.set_line(inner.x, y, &line, inner.width);
+    }
 }
 
 // ── Client list ───────────────────────────────────────────────────────────────
@@ -196,19 +248,19 @@ mod live_tab_tests {
     use super::*;
 
     #[test]
-    fn live_surface_explains_disabled_state() {
-        let text = live_disabled_message();
+    fn live_surface_explains_scoped_state() {
+        let text = live_status_message();
 
-        assert!(text.contains("Live updates are temporarily unavailable"));
-        assert!(text.contains("manual refresh"));
-        assert!(text.contains("Bounded scoped Live will return later"));
+        assert!(text.contains("scoped to the selected table"));
+        assert!(text.contains("Ctrl+L"));
+        assert!(text.contains("all-table subscriptions are unavailable"));
     }
 
     #[test]
     fn all_table_subscribe_command_is_not_available() {
         assert_eq!(
             live_subscription_availability(),
-            LiveAvailability::TemporarilyUnavailable
+            LiveAvailability::ScopedToSelectedTable
         );
     }
 }

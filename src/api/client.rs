@@ -811,6 +811,10 @@ fn parse_schema_response(raw: Value) -> Result<SchemaResponse> {
         });
     }
 
+    // Keep user tables in schema order and park system tables at the
+    // end so the sidebar cursor lands on a user table, not `st_table`.
+    tables.sort_by_key(|table| table.table_type == "system");
+
     // ── Reducers ───────────────────────────────────────────────────────────
     let reducers_raw = raw
         .get("reducers")
@@ -1201,6 +1205,33 @@ mod tests {
         assert_eq!(schema.reducers[0].name, "set_status");
         assert_eq!(schema.reducers[0].params.len(), 1);
         assert_eq!(schema.reducers[0].params[0].name, "agent_id");
+    }
+
+    #[test]
+    fn parse_schema_parks_system_tables_after_user_tables() {
+        let raw = serde_json::json!({
+            "tables": [
+                {
+                    "name": "st_table",
+                    "product_type_ref": 0,
+                    "primary_key": [],
+                    "table_type": {"System": []},
+                    "table_access": {"Public": []}
+                },
+                {
+                    "name": "annotation",
+                    "product_type_ref": 0,
+                    "primary_key": [0],
+                    "table_type": {"User": []},
+                    "table_access": {"Public": []}
+                }
+            ],
+            "reducers": [],
+            "typespace": {"types": []}
+        });
+        let schema = parse_schema_response(raw).unwrap();
+        assert_eq!(schema.tables[0].table_name, "annotation");
+        assert_eq!(schema.tables[1].table_name, "st_table");
     }
 
     #[test]

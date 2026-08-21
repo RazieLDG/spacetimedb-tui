@@ -358,12 +358,22 @@ mod log_entry_tests {
 /// for the UI.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum WsServerMessage {
-    /// Initial data snapshot after subscribing to a query.
+    /// Initial data snapshot after a legacy `Subscribe` message.
     InitialSubscription(InitialSubscriptionPayload),
-    /// Incremental update pushed by the server.
+    /// Incremental update pushed by the server (full reducer metadata).
     TransactionUpdate(TransactionUpdatePayload),
+    /// Incremental update containing only row diffs. Current SpacetimeDB
+    /// servers emit this for successful committed transactions that
+    /// touch a subscription; ignoring it is why Live appeared idle.
+    TransactionUpdateLight(TransactionUpdateLightPayload),
     /// Server acknowledges an identity.
     IdentityToken(IdentityTokenPayload),
+    /// Initial snapshot after `SubscribeSingle`.
+    SubscribeApplied(SubscribeAppliedPayload),
+    /// Initial snapshot after `SubscribeMulti`.
+    SubscribeMultiApplied(SubscribeMultiAppliedPayload),
+    /// Subscription failed or was dropped.
+    SubscriptionError(SubscriptionErrorPayload),
 }
 
 /// Payload of [`WsServerMessage::InitialSubscription`].
@@ -382,17 +392,89 @@ pub struct InitialSubscriptionPayload {
 }
 
 /// Payload of [`WsServerMessage::TransactionUpdate`].
+///
+/// Current servers encode `status` as a SATS tagged enum, e.g.
+/// `{"Committed": {"tables": [...]}}`. Older experimental payloads
+/// used a top-level `database_update`. Both are accepted.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TransactionUpdatePayload {
     #[serde(default)]
-    pub status: Option<TransactionStatus>,
+    pub status: Option<Value>,
     #[serde(default)]
     pub database_update: DatabaseUpdate,
     /// Other fields (timestamp, caller identity, energy usage, …) are
     /// preserved as raw JSON so future server additions don't break
-    /// decoding. The UI only needs `database_update` today.
+    /// decoding.
     #[serde(flatten, default)]
     pub extra: std::collections::HashMap<String, Value>,
+}
+
+impl TransactionUpdatePayload {
+    /// Row diffs from either `database_update` or `status.Committed`.
+    pub fn table_updates(&self) -> Vec<TableUpdate> {
+        if !self.database_update.tables.is_empty() {
+            return self.database_update.tables.clone();
+        }
+        self.status
+            .as_ref()
+            .and_then(|status| status.get("Committed"))
+            .and_then(|committed| serde_json::from_value::<DatabaseUpdate>(committed.clone()).ok())
+            .map(|update| update.tables)
+            .unwrap_or_default()
+    }
+}
+
+/// Payload of [`WsServerMessage::TransactionUpdateLight`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TransactionUpdateLightPayload {
+    #[serde(default)]
+    pub request_id: u32,
+    #[serde(default)]
+    pub update: DatabaseUpdate,
+}
+
+/// Payload of [`WsServerMessage::SubscribeApplied`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SubscribeAppliedPayload {
+    #[serde(default)]
+    pub request_id: u32,
+    #[serde(default)]
+    pub query_id: Option<Value>,
+    #[serde(default)]
+    pub rows: Option<SubscribeRows>,
+}
+
+/// Payload of [`WsServerMessage::SubscribeMultiApplied`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SubscribeMultiAppliedPayload {
+    #[serde(default)]
+    pub request_id: u32,
+    #[serde(default)]
+    pub query_id: Option<Value>,
+    #[serde(default)]
+    pub update: DatabaseUpdate,
+}
+
+/// Matching rows for a single-query subscribe snapshot.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SubscribeRows {
+    #[serde(default)]
+    pub table_id: u32,
+    #[serde(default)]
+    pub table_name: String,
+    #[serde(default)]
+    pub table_rows: Option<TableUpdate>,
+}
+
+/// Payload of [`WsServerMessage::SubscriptionError`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SubscriptionErrorPayload {
+    #[serde(default)]
+    pub error: String,
+    #[serde(default)]
+    pub request_id: Option<u32>,
+    #[serde(default)]
+    pub query_id: Option<u32>,
 }
 
 /// Payload of [`WsServerMessage::IdentityToken`].
@@ -408,15 +490,6 @@ pub struct IdentityTokenPayload {
     pub extra: std::collections::HashMap<String, Value>,
 }
 
-/// Status of a committed transaction.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TransactionStatus {
-    Committed,
-    Failed,
-    OutOfEnergy,
-}
-
 /// A collection of table row updates within a transaction.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct DatabaseUpdate {
@@ -424,15 +497,173 @@ pub struct DatabaseUpdate {
     pub tables: Vec<TableUpdate>,
 }
 
-/// Row-level inserts/deletes for a single table.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct TableUpdate {
-    pub table_id: u32,
-    pub table_name: String,
-    #[serde(default)]
-    pub num_rows: u64,
+/// One insert/delete batch inside a [`TableUpdate`].
+///
+/// SpacetimeDB JSON rows are typically JSON *strings* containing the
+/// SATS-JSON encoding of a product value (object or array).
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct QueryUpdate {
     #[serde(default)]
     pub inserts: Vec<Value>,
     #[serde(default)]
     pub deletes: Vec<Value>,
+}
+
+/// Row-level inserts/deletes for a single table.
+///
+/// Current `v1.json.spacetimedb` encodes diffs under `updates`, not as
+/// top-level `inserts`/`deletes`. Both shapes are accepted so older
+/// fixtures keep working.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TableUpdate {
+    #[serde(default)]
+    pub table_id: u32,
+    #[serde(default)]
+    pub table_name: String,
+    #[serde(default)]
+    pub num_rows: u64,
+    #[serde(default)]
+    pub updates: Vec<QueryUpdate>,
+    #[serde(default)]
+    pub inserts: Vec<Value>,
+    #[serde(default)]
+    pub deletes: Vec<Value>,
+}
+
+impl TableUpdate {
+    /// Inserted rows with JSON-string payloads decoded.
+    pub fn insert_rows(&self) -> Vec<Value> {
+        let mut rows = Vec::new();
+        for update in &self.updates {
+            rows.extend(update.inserts.iter().cloned().map(decode_ws_row));
+        }
+        rows.extend(self.inserts.iter().cloned().map(decode_ws_row));
+        rows
+    }
+
+    /// Deleted rows with JSON-string payloads decoded.
+    pub fn delete_rows(&self) -> Vec<Value> {
+        let mut rows = Vec::new();
+        for update in &self.updates {
+            rows.extend(update.deletes.iter().cloned().map(decode_ws_row));
+        }
+        rows.extend(self.deletes.iter().cloned().map(decode_ws_row));
+        rows
+    }
+}
+
+/// Decode a WebSocket row value.
+///
+/// JSON protocol lists encode each row as a JSON string. HTTP SQL rows
+/// are already arrays/objects. Both are accepted.
+pub fn decode_ws_row(value: Value) -> Value {
+    match value {
+        Value::String(raw) => serde_json::from_str(&raw).unwrap_or(Value::String(raw)),
+        other => other,
+    }
+}
+
+/// Project a SATS-JSON product (object or array) onto `columns` in order.
+pub fn ws_row_to_cells(row: &Value, columns: &[String]) -> Vec<Value> {
+    match row {
+        Value::Array(cells) => {
+            if columns.is_empty() {
+                cells.clone()
+            } else {
+                let mut out = cells.clone();
+                out.resize(columns.len(), Value::Null);
+                out.truncate(columns.len());
+                out
+            }
+        }
+        Value::Object(map) => columns
+            .iter()
+            .map(|name| map.get(name).cloned().unwrap_or(Value::Null))
+            .collect(),
+        other => {
+            if columns.len() <= 1 {
+                vec![other.clone()]
+            } else {
+                let mut cells = vec![Value::Null; columns.len()];
+                if !cells.is_empty() {
+                    cells[0] = other.clone();
+                }
+                cells
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod ws_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn initial_subscription_reads_updates_array_of_json_strings() {
+        let payload = r#"{
+            "InitialSubscription": {
+                "database_update": {
+                    "tables": [{
+                        "table_id": 12,
+                        "table_name": "source_status",
+                        "num_rows": 1,
+                        "updates": [{
+                            "deletes": [],
+                            "inserts": ["{\"key\":\"AIS\",\"healthy\":true}"]
+                        }]
+                    }]
+                },
+                "request_id": 1
+            }
+        }"#;
+        let decoded: WsServerMessage = serde_json::from_str(payload).unwrap();
+        let WsServerMessage::InitialSubscription(body) = decoded else {
+            panic!("expected InitialSubscription");
+        };
+        let rows = body.database_update.tables[0].insert_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["key"], "AIS");
+    }
+
+    #[test]
+    fn transaction_update_light_parses_array_row_strings() {
+        let payload = r#"{
+            "TransactionUpdateLight": {
+                "request_id": 0,
+                "update": {
+                    "tables": [{
+                        "table_id": 12,
+                        "table_name": "source_status",
+                        "num_rows": 2,
+                        "updates": [{
+                            "deletes": ["[\"AIS\",true]"],
+                            "inserts": ["[\"AIS\",false]"]
+                        }]
+                    }]
+                }
+            }
+        }"#;
+        let decoded: WsServerMessage = serde_json::from_str(payload).unwrap();
+        let WsServerMessage::TransactionUpdateLight(body) = decoded else {
+            panic!("expected TransactionUpdateLight");
+        };
+        let table = &body.update.tables[0];
+        let inserts = table.insert_rows();
+        let deletes = table.delete_rows();
+        assert_eq!(inserts, vec![serde_json::json!(["AIS", false])]);
+        assert_eq!(deletes, vec![serde_json::json!(["AIS", true])]);
+    }
+
+    #[test]
+    fn ws_row_to_cells_accepts_object_and_array() {
+        let columns = vec!["key".to_string(), "healthy".to_string()];
+        assert_eq!(
+            ws_row_to_cells(&serde_json::json!({"key":"AIS","healthy":true}), &columns),
+            vec![serde_json::json!("AIS"), serde_json::json!(true)]
+        );
+        assert_eq!(
+            ws_row_to_cells(&serde_json::json!(["AIS", true]), &columns),
+            vec![serde_json::json!("AIS"), serde_json::json!(true)]
+        );
+    }
 }

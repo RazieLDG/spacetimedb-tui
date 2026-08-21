@@ -264,6 +264,54 @@ fn build_items(app: &AppState) -> Vec<TreeItem> {
     items
 }
 
+/// A selectable sidebar row (section headers and placeholders omitted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarNavItem {
+    Database(usize),
+    Table(usize),
+}
+
+/// Visible, selectable sidebar items in render order.
+///
+/// `j`/`k` walk this list so nested tables are reachable without an extra
+/// Enter on the parent database. A single-database catalog used to look
+/// like the first table was the only one that could be selected.
+pub fn nav_items(app: &AppState) -> Vec<SidebarNavItem> {
+    let mut items = Vec::new();
+    let search = app.search_query.to_lowercase();
+
+    for (di, db) in app.databases.iter().enumerate() {
+        if !search.is_empty() && !db.to_lowercase().contains(&search) {
+            continue;
+        }
+        items.push(SidebarNavItem::Database(di));
+        if app.selected_database_idx == Some(di) {
+            for (ti, table) in app.tables.iter().enumerate() {
+                if !search.is_empty()
+                    && !table.table_name.to_lowercase().contains(&search)
+                    && !db.to_lowercase().contains(&search)
+                {
+                    continue;
+                }
+                items.push(SidebarNavItem::Table(ti));
+            }
+        }
+    }
+    items
+}
+
+/// Index into [`nav_items`] for the current sidebar cursor.
+pub fn current_nav_index(app: &AppState, items: &[SidebarNavItem]) -> Option<usize> {
+    match app.sidebar_focus {
+        SidebarFocus::Databases => items.iter().position(|item| {
+            matches!(item, SidebarNavItem::Database(idx) if Some(*idx) == app.selected_database_idx)
+        }),
+        SidebarFocus::Tables => items.iter().position(|item| {
+            matches!(item, SidebarNavItem::Table(idx) if Some(*idx) == app.selected_table_idx)
+        }),
+    }
+}
+
 /// Find the flat index of the currently selected item.
 fn find_selected_idx(items: &[TreeItem], app: &AppState) -> Option<usize> {
     match app.sidebar_focus {
@@ -288,5 +336,54 @@ fn compute_scroll(selected: Option<usize>, visible_h: usize, total: usize) -> us
                 sel.saturating_sub(visible_h / 2)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::types::{ColumnInfo, TableInfo};
+
+    fn table(name: &str) -> TableInfo {
+        TableInfo {
+            table_name: name.to_string(),
+            product_type_ref: 0,
+            table_type: "user".to_string(),
+            table_access: "public".to_string(),
+            columns: vec![ColumnInfo {
+                col_id: 0,
+                col_name: "id".to_string(),
+                col_type: serde_json::json!("String"),
+                is_autoinc: false,
+            }],
+            primary_key_cols: vec![0],
+            indexes: vec![],
+            constraints: vec![],
+        }
+    }
+
+    #[test]
+    fn nav_items_include_nested_tables_of_the_selected_database() {
+        let mut app = AppState::new("http://localhost:10300");
+        app.databases = vec!["sitdeck".to_string(), "other".to_string()];
+        app.selected_database_idx = Some(0);
+        app.tables = vec![table("annotation"), table("source_status")];
+        app.selected_table_idx = Some(0);
+        app.sidebar_focus = SidebarFocus::Databases;
+
+        let items = nav_items(&app);
+        assert_eq!(
+            items,
+            vec![
+                SidebarNavItem::Database(0),
+                SidebarNavItem::Table(0),
+                SidebarNavItem::Table(1),
+                SidebarNavItem::Database(1),
+            ]
+        );
+        assert_eq!(current_nav_index(&app, &items), Some(0));
+
+        app.sidebar_focus = SidebarFocus::Tables;
+        assert_eq!(current_nav_index(&app, &items), Some(1));
     }
 }

@@ -38,7 +38,8 @@ pub fn command_context_from_state(state: &AppState) -> CommandContext {
             state.activity.connection,
             crate::state::activity::ConnectionState::Connected
         ),
-        live_available: false,
+        live_available: state.selected_table().is_some()
+            || state.navigation.active_resource.is_some(),
         write_plan_available: !state.safety.pending_write_plans.is_empty(),
     }
 }
@@ -67,7 +68,7 @@ mod tests {
     }
 
     #[test]
-    fn toggle_live_remains_disabled_until_capability_probe() {
+    fn toggle_live_is_available_with_an_active_table() {
         let mut state = AppState::new("http://localhost:3000".to_string());
         state.navigation.active_database = Some("inventory".to_string());
         state.navigation.active_resource = Some("items".to_string());
@@ -75,7 +76,7 @@ mod tests {
 
         assert_eq!(
             command_availability(CommandId::ToggleLive, &context),
-            Availability::Disabled(DisabledReason::LiveUnavailable)
+            Availability::Available
         );
     }
 

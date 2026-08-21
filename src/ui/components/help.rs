@@ -147,7 +147,8 @@ const SECTIONS: &[Section] = &[
     Section {
         title: "Live",
         bindings: &[
-            Binding { key: "6",               desc: "Jump to the Live tab (disabled notice + clients)" },
+            Binding { key: "6",               desc: "Jump to the Live tab (scoped feed + clients)" },
+            Binding { key: "Ctrl+L",          desc: "Toggle live updates for the selected table only" },
             Binding { key: "r",               desc: "Force refresh of the connected-clients metadata poll" },
         ],
     },
@@ -157,6 +158,7 @@ const SECTIONS: &[Section] = &[
             Binding { key: "q",               desc: "Quit the application" },
             Binding { key: "Ctrl+C",          desc: "Force quit" },
             Binding { key: "Ctrl+R",          desc: "Force WebSocket reconnect" },
+            Binding { key: "Ctrl+L",          desc: "Toggle scoped live updates (selected table)" },
             Binding { key: "Ctrl+P",          desc: "Open command palette (fuzzy search)" },
             Binding { key: "?",               desc: "Toggle this help overlay" },
             Binding { key: "r",               desc: "Refresh current view" },
@@ -315,7 +317,7 @@ impl Widget for HelpOverlay {
 /// Kept in sync with README.md and CHANGELOG.md by
 /// `safety_truth_gate_tests`.
 pub fn safety_help_text() -> &'static str {
-    "Safety: Live updates are temporarily unavailable while safety controls are tightened. Use manual refresh for table data. Bounded scoped Live will return later; broad automatic subscriptions are currently unavailable. Spreadsheet editing supports one-row spreadsheet Save only: changed cells in one row are saved as one guided WritePlan, and changing rows prompts Save, Discard, or Stay. Guided update/delete require declared primary keys and matching generations, with no unsafe override. Raw SQL is a separately labeled expert path; Raw SQL does not receive the guided CRUD guarantee and is never automatically retried. Unknown mutation outcomes are not automatically retried; refresh the affected scope before another guided attempt."
+    "Safety: Live updates are scoped to the selected table only; broad automatic all-table subscriptions are unavailable. Toggle with Ctrl+L. Use manual refresh if live is off. Spreadsheet editing supports one-row spreadsheet Save only: changed cells in one row are saved as one guided WritePlan, and changing rows prompts Save, Discard, or Stay. Guided update/delete require declared primary keys and matching generations, with no unsafe override. Raw SQL is a separately labeled expert path; Raw SQL does not receive the guided CRUD guarantee and is never automatically retried. Unknown mutation outcomes are not automatically retried; refresh the affected scope before another guided attempt."
 }
 
 /// Registry note: shortcuts, palette, and help share one command registry.
@@ -437,7 +439,8 @@ mod safety_truth_gate_tests {
         let help = safety_help_text();
 
         for text in [&readme, &changelog, help] {
-            assert!(text.contains("Live updates are temporarily unavailable"));
+            assert!(text.contains("Live updates are scoped to the selected table only"));
+            assert!(text.contains("broad automatic all-table subscriptions are unavailable"));
             assert!(text.contains("one-row spreadsheet Save"));
             assert!(text.contains("Unknown mutation outcomes are not automatically retried"));
             assert!(text.contains("Guided update/delete require declared primary keys and matching generations, with no unsafe override"));

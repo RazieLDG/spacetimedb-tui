@@ -2,7 +2,7 @@
 
 > **A blazing-fast, keyboard-driven terminal UI for managing, querying, editing, and monitoring SpacetimeDB 2.0 — right from your shell.**
 
-Browse databases, run SQL, edit rows in a spreadsheet, call reducers, and manage aliases — all with Vim-style key bindings and a command palette. (Live transaction streaming is temporarily disabled while safety controls are tightened; see [Safety behavior](#safety-behavior).)
+Browse databases, run SQL, edit rows in a spreadsheet, call reducers, and manage aliases — all with Vim-style key bindings and a command palette. Live updates are scoped to the selected table (`Ctrl+L` toggles them); see [Safety behavior](#safety-behavior).
 
 [![CI](https://github.com/RazieLDG/spacetimedb-tui/actions/workflows/ci.yml/badge.svg)](https://github.com/RazieLDG/spacetimedb-tui/actions/workflows/ci.yml)
 [![Release](https://github.com/RazieLDG/spacetimedb-tui/actions/workflows/release.yml/badge.svg)](https://github.com/RazieLDG/spacetimedb-tui/actions/workflows/release.yml)
@@ -37,7 +37,7 @@ Browse databases, run SQL, edit rows in a spreadsheet, call reducers, and manage
 | 📜 **Log Viewer** | Tail structured logs with level filtering (`f` cycles `Trace` → `Panic`), pause/resume (`Space`), and a live `visible / total` counter. Tolerates both RFC 3339 and u64-microsecond timestamps. |
 | 📈 **Metrics Dashboard** | Per-tick **delta sparklines** (not cumulative ramps) for reducer calls and energy use, plus stat cards for clients / tables / reducer count / memory. Auto-refresh every 10s while visible. |
 | 🔬 **Module Inspector** | Browse reducers with full parameter signatures, user tables, system tables, and columns. |
-| ⚡ **Live Tab** | Live updates are temporarily unavailable while safety controls are tightened. The tab shows a disabled notice and a connected-client list polled from `st_client` every 10s; use manual refresh for table data. Bounded scoped Live will return later. |
+| ⚡ **Live Tab** | Scoped live feed for the selected table (inserts/deletes over WebSocket) plus a connected-client list polled from `st_client` every 10s. `Ctrl+L` toggles the subscription. Broad all-table subscriptions are not used. |
 
 ### Write
 
@@ -52,7 +52,7 @@ Browse databases, run SQL, edit rows in a spreadsheet, call reducers, and manage
 
 ### Safety behavior
 
-Live updates are temporarily unavailable while safety controls are tightened. Use manual refresh for table data. Bounded scoped Live will return later; broad automatic subscriptions are currently unavailable. Spreadsheet editing supports one-row spreadsheet Save: multiple changed cells in one row are saved as one guided write, while moving to another row prompts Save, Discard, or Stay. Guided update/delete require declared primary keys and matching generations, with no unsafe override. Raw SQL is a separately labeled expert path; Raw SQL does not receive the guided CRUD guarantee and is never automatically retried. Unknown mutation outcomes are not automatically retried; refresh the affected scope before another guided attempt.
+Live updates are scoped to the selected table only; broad automatic all-table subscriptions are unavailable. Toggle with Ctrl+L. Use manual refresh if live is off. Spreadsheet editing supports one-row spreadsheet Save: multiple changed cells in one row are saved as one guided write, while moving to another row prompts Save, Discard, or Stay. Guided update/delete require declared primary keys and matching generations, with no unsafe override. Raw SQL is a separately labeled expert path; Raw SQL does not receive the guided CRUD guarantee and is never automatically retried. Unknown mutation outcomes are not automatically retried; refresh the affected scope before another guided attempt.
 
 ### Admin
 
@@ -265,6 +265,7 @@ Press `?` at any time to open a scrollable help overlay listing every binding. U
 | `q` / `Ctrl+C` | Quit |
 | `?` | Toggle help overlay |
 | `Ctrl+P` | Command palette (fuzzy search) |
+| `Ctrl+L` | Toggle live updates for the selected table |
 | `Ctrl+R` | Force WebSocket reconnect |
 | `r` | Refresh current view |
 | `:` | Jump into the SQL console input |
@@ -273,10 +274,10 @@ Press `?` at any time to open a scrollable help overlay listing every binding. U
 
 | Key | Action |
 |---|---|
-| `j` / `↓` | Move down |
-| `k` / `↑` | Move up |
+| `j` / `↓` | Move down (sidebar walks the visible database/table tree) |
+| `k` / `↑` | Move up (sidebar walks the visible database/table tree) |
 | `h` / `←` | Sidebar: step up (Tables → Databases) / focus sidebar from main |
-| `l` / `→` | Focus main pane (or move cell cursor right in Tables / SQL) |
+| `l` / `→` | Sidebar: open highlighted item; in Tables/SQL: move cell cursor right |
 | `g` / `Home` | First item |
 | `G` / `End` | Last item |
 | `Enter` | Select / open / confirm |
@@ -390,7 +391,7 @@ Built and tested against **SpacetimeDB 2.0** HTTP + WebSocket APIs.
 | Add alias | `POST /v1/database/{db}/names` |
 | Delete database | `DELETE /v1/database/{db}` |
 | Log streaming | `GET /v1/database/{db}/logs` |
-| Live subscription | `GET /v1/database/{db}/subscribe` (WebSocket) — **temporarily disabled**; manual refresh is used instead |
+| Live subscription | `GET /v1/database/{db}/subscribe` (WebSocket) — scoped to the selected table; toggle with `Ctrl+L` |
 | Metrics | `GET /metrics` (Prometheus format) |
 
 ### WebSocket Subprotocol

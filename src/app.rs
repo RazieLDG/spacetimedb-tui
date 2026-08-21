@@ -5338,7 +5338,7 @@ impl App {
                 }
                 self.state.connection.status = ConnectionStatus::Connected;
                 // Preserve any pre-selected DB
-                let existing: Vec<_> = self.state.databases.drain(..).collect();
+                let existing = std::mem::take(&mut self.state.databases);
                 self.state.databases = dbs;
                 for db in existing {
                     if !self.state.databases.contains(&db) {

@@ -109,7 +109,17 @@ Both scripts are idempotent — re-running upgrades the binary in place.
 
 ### Option 2 — Pre-built binaries (manual)
 
-Every tagged release ships pre-built archives for the three tier-1 desktop platforms. Grab the right archive for your machine from the [latest release](https://github.com/RazieLDG/spacetimedb-tui/releases/latest):
+Binaries are **not** built on every commit. They are produced only when someone runs the [Release](https://github.com/RazieLDG/spacetimedb-tui/actions/workflows/release.yml) workflow (Actions → Release → Run workflow) or pushes a `vX.Y.Z` tag.
+
+```bash
+# Artifact-only build (download from the Actions run; no GitHub Release)
+gh workflow run Release
+
+# Also attach archives to a GitHub Release
+gh workflow run Release -f tag=v0.1.1 -f publish=true
+```
+
+Without a tag, archives show up as artifacts on the workflow run (kept 14 days). With a tag they are also published under [Releases](https://github.com/RazieLDG/spacetimedb-tui/releases).
 
 | Platform | Archive |
 |---|---|

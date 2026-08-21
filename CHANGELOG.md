@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Manual Release workflow builds Linux / macOS / Windows binaries on demand (`gh workflow run Release` or a `vX.Y.Z` tag), not on every commit.
 - Typed command registry used by keyboard shortcuts, palette entries, contextual help, and future mouse actions.
 - Reducer and effect boundaries with deterministic runtime ports for tests.
 - Centralized navigation, resource, workbench, activity, and safety state under one `AppState` owner with no second mutable state owner.

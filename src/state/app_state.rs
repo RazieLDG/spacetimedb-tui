@@ -235,6 +235,10 @@ pub struct TableCache {
 /// Maximum log lines kept in memory.
 const LOG_BUFFER_LIMIT: usize = 10_000;
 
+/// Server-side page size for the Tables browser (`LIMIT` clause).
+/// One page = one `SELECT ... LIMIT n OFFSET m` round-trip.
+pub const BROWSE_PAGE_SIZE: u64 = 200;
+
 // ---------------------------------------------------------------------------
 // AppState
 // ---------------------------------------------------------------------------
@@ -295,6 +299,13 @@ pub struct AppState {
     /// (Tables tab only). Kept separate from `query_result` so that a SQL
     /// query in the SQL tab doesn't clobber the Tables view, and vice versa.
     pub table_browse_result: Option<QueryResult>,
+    /// Row offset of the current browse page (server-side pagination).
+    /// Reset to 0 whenever the selected table changes.
+    pub browse_offset: u64,
+    /// Total row count of the browsed table from a parallel
+    /// `SELECT COUNT(*)`. `None` = unknown (count failed or timed out —
+    /// the pager still works, just without an "of N" display).
+    pub browse_total_rows: Option<u64>,
     /// Live row data received over the WebSocket subscription, keyed by
     /// table name. Each entry is the latest set of rows the server has
     /// pushed for that table since the most recent `InitialSubscription`.
@@ -466,6 +477,8 @@ impl AppState {
 
             query_result: None,
             table_browse_result: None,
+            browse_offset: 0,
+            browse_total_rows: None,
             live_table_data: HashMap::new(),
             live_clients: Vec::new(),
             live_events: VecDeque::new(),

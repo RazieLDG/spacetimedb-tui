@@ -188,10 +188,21 @@ fn render_info_bar(area: Rect, buf: &mut Buffer, app: &AppState) {
     }
 
     if let Some(ref qr) = app.table_browse_result {
-        spans.push(Span::styled(
-            format!("  {} rows", qr.row_count()),
-            Style::default().fg(fg_muted),
-        ));
+        let n = qr.row_count() as u64;
+        let rows_info = if n == 0 {
+            "  rows 0".to_string()
+        } else {
+            format!("  rows {}–{}", app.browse_offset + 1, app.browse_offset + n)
+        };
+        spans.push(Span::styled(rows_info, Style::default().fg(fg_muted)));
+        if let Some(total) = app.browse_total_rows {
+            let page = app.browse_offset / crate::state::app_state::BROWSE_PAGE_SIZE + 1;
+            let last = total / crate::state::app_state::BROWSE_PAGE_SIZE + 1;
+            spans.push(Span::styled(
+                format!(" of {total} · p{page}/{last}"),
+                Style::default().fg(fg_muted),
+            ));
+        }
     }
 
     // Live subscription badge for the currently selected table.
@@ -212,7 +223,10 @@ fn render_info_bar(area: Rect, buf: &mut Buffer, app: &AppState) {
     }
 
     // Right-align hint
-    let hint = Span::styled(" r:refresh  n:next  p:prev ", Style::default().fg(fg_muted));
+    let hint = Span::styled(
+        " r:refresh  ,/.:page  Enter:edit  d:del ",
+        Style::default().fg(fg_muted),
+    );
     let hint_w = hint.content.len() as u16;
     let hint_x = area.x + area.width.saturating_sub(hint_w);
 

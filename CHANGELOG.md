@@ -4,18 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.1.3 — 2026-08-22
+
 ### Added
 - Typed command registry used by keyboard shortcuts, palette entries, contextual help, and future mouse actions.
 - Reducer and effect boundaries with deterministic runtime ports for tests.
 - Centralized navigation, resource, workbench, activity, and safety state under one `AppState` owner with no second mutable state owner.
 - Normalized configuration provenance so explicit CLI values win over environment and lower sources, including `--no-tls` and custom theme strings.
 - `restore_session` defaults to true for missing and partial user configuration.
+- Tables tab pagination: `,` / `.` (and PgUp / PgDn) page through rows one 200-row page at a time; the header shows `rows X–Y of N · p1/P`. Because SpacetimeDB SQL has no `OFFSET`, pages fetch the row prefix (`LIMIT offset + page`) and slice client-side; a parallel `COUNT(*) AS total` supplies the total.
+- Row edit popup on Enter in the Tables tab (alias of Shift+U), and Del as a discoverable alias for the `d` delete confirmation.
 
 ### Changed
 - Spreadsheet editing now uses one-row spreadsheet Save: multiple changed cells in one row form one guided `WritePlan`; moving to another row prompts Save, Discard, or Stay.
 - Guided update/delete require declared primary keys and matching generations, with no unsafe override.
 - Raw SQL is a separately labeled expert path; Raw SQL does not receive the guided CRUD guarantee and is never automatically retried.
 - Unknown mutation outcomes are not automatically retried after transport ownership begins. Refresh the affected scope before another guided attempt.
+- The 10k-line `app.rs` monolith is split into focused modules (`guided_write`, `write_pipeline`, `keys`, `modals`, `spreadsheet`, `data_access`, `live_sync`, `dispatch`, `sources`, `request_context`, `nav_actions`, `palette`, `tests`) with no behavior change.
 
 ### Validation
 - `cargo fmt --all -- --check` passes.
